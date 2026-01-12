@@ -23,9 +23,5 @@ twilight-http = { version = "0.14", default-features = false, features = ["simd-
 twilight-model = { version = "0.14", default-features = false }
 
 [profile.release]
-codegen-units = 1
-debug = false
-incremental = false
-lto = true
-opt-level = 3
+lto = "thin"
 panic = "abort"

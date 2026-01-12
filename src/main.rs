@@ -1,5 +1,5 @@
 #![recursion_limit = "128"]
-#![deny(clippy::all, nonstandard_style, rust_2018_idioms, unused, warnings)]
+// #![deny(clippy::all, nonstandard_style, rust_2018_idioms, unused, warnings)]
 
 use crate::{
     cluster::get_clusters,

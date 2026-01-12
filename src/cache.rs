@@ -155,10 +155,10 @@ where
         return Ok(());
     }
 
-    conn.set_multiple(keys.as_slice()).await?;
+    let _: () = conn.set_multiple(keys.as_slice()).await?;
 
     for (key, value) in members {
-        conn.sadd(key, value.as_slice()).await?;
+        let _: () = conn.sadd(key, value.as_slice()).await?;
     }
 
     Ok(())
@@ -194,7 +194,7 @@ where
         return Ok(());
     }
 
-    conn.hset_multiple(EXPIRY_KEYS, keys.as_slice()).await?;
+    let _: () = conn.hset_multiple(EXPIRY_KEYS, keys.as_slice()).await?;
 
     Ok(())
 }
@@ -247,10 +247,10 @@ where
         return Ok(());
     }
 
-    conn.del(keys).await?;
+    let _: () = conn.del(keys).await?;
 
     for (key, value) in members {
-        conn.srem(key, value).await?;
+        let _: () = conn.srem(key, value).await?;
     }
 
     Ok(())
@@ -274,7 +274,7 @@ where
         return Ok(());
     }
 
-    conn.hdel(key, keys).await?;
+    let _: () = conn.hdel(key, keys).await?;
 
     Ok(())
 }
