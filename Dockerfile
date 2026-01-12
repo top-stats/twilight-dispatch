@@ -2,6 +2,8 @@ FROM rust:1.86-bookworm AS builder
 
 WORKDIR /usr/build
 
+ENV RUSTFLAGS="-C target-cpu=haswell"
+
 COPY src ./src
 COPY Cargo.lock Cargo.toml ./
 
