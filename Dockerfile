@@ -1,32 +1,22 @@
-FROM rust:1.65-alpine AS builder
+FROM rust:1.86-bookworm AS builder
 
-ENV RUSTFLAGS="-C target-cpu=haswell"
-
-RUN apk add --no-cache gcc g++ musl-dev cmake make
-
-WORKDIR /build
-
-COPY .cargo ./.cargo
-COPY Cargo.toml Cargo.lock ./
-
-RUN mkdir src
-RUN echo 'fn main() {}' > ./src/main.rs
-RUN cargo build --release
-RUN rm -f target/release/deps/twilight_dispatch*
+WORKDIR /usr/build
 
 COPY src ./src
+COPY Cargo.lock Cargo.toml ./
+
+RUN apt update -y && apt upgrade -y && apt install -y g++ gcc cmake make
 
 RUN cargo build --release
 
-FROM alpine:3.17
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache dumb-init
+WORKDIR /usr/app
 
-WORKDIR /app
+RUN apt update -y && apt install -y ca-certificates libssl3
 
-COPY --from=builder /build/target/release/twilight-dispatch ./
+ENV RUST_LOG=info
 
-EXPOSE 8005
+COPY --from=builder /usr/build/target/release/twilight-dispatch /usr/app/twilight-dispatch
 
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["./twilight-dispatch"]
+ENTRYPOINT ["/usr/app/twilight-dispatch"]
