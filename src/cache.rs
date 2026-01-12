@@ -180,6 +180,7 @@ where
 {
     let keys = keys
         .into_iter()
+        .filter(|(_, expiry)| *expiry > 0)
         .map(|(key, value)| {
             let timestamp = FormattedDateTime::now() + time::Duration::milliseconds(value as i64);
 
