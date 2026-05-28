@@ -5,6 +5,7 @@ WORKDIR /usr/build
 ENV RUSTFLAGS="-C target-cpu=haswell -A warnings"
 
 COPY src ./src
+COPY vendor ./vendor
 COPY Cargo.lock Cargo.toml ./
 
 RUN apt update -y && apt upgrade -y && apt install -y g++ gcc cmake make

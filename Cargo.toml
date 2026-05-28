@@ -25,3 +25,6 @@ twilight-model = { version = "0.14", default-features = false }
 [profile.release]
 lto = "thin"
 panic = "abort"
+
+[patch.crates-io]
+twilight-model = { path = "vendor/twilight-model" }
