@@ -13,7 +13,60 @@ fn deserialize_nullable_application_id<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<u64>::deserialize(de)?.and_then(Id::new_checked))
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct NullableIdVisitor;
+
+    impl<'de> Visitor<'de> for NullableIdVisitor {
+        type Value = Option<Id<ApplicationMarker>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a discord snowflake (string or integer), zero, or null")
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            de: D,
+        ) -> Result<Self::Value, D::Error> {
+            de.deserialize_any(NullableIdVisitor)
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Id::new_checked(v))
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+            if v <= 0 {
+                Ok(None)
+            } else {
+                Ok(Id::new_checked(v as u64))
+            }
+        }
+
+        fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.is_empty() || v == "0" {
+                return Ok(None);
+            }
+            v.parse::<u64>()
+                .map(Id::new_checked)
+                .map_err(|_| E::custom(format!("invalid snowflake string: {}", v)))
+        }
+
+        fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+    }
+
+    de.deserialize_any(NullableIdVisitor)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
