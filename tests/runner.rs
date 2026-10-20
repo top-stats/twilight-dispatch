@@ -1528,10 +1528,11 @@ async fn shutdown_does_not_wait_for_readys_cache_update_past_the_close_timeout()
 
 /// The gateway drops the connection instead of answering the shutdown's
 /// close: nothing is left to wait for, so `run()` returns promptly and the
-/// shard does not resume a new connection during the shutdown.
+/// shard does not resume a new connection during the shutdown, nor counts
+/// one it abandons.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_does_not_resume_when_the_gateway_drops_the_connection() {
-    let _metrics = METRICS.read().await;
+    let _metrics = METRICS.write().await;
     let Some(redis) = common::redis(IDLE_DB).await else {
         return;
     };
@@ -1543,6 +1544,8 @@ async fn shutdown_does_not_resume_when_the_gateway_drops_the_connection() {
     let mut conn = identified(&fake, shard, "A", QUIET).await;
     send_typing(&conn, 2..=3).await;
     running.recorder.wait_published(3).await;
+    let kinds = ["Connecting", "Identifying", "Resuming"];
+    let before = kinds.map(shard_events);
 
     relay.hold(true);
     let stopping = Instant::now();
@@ -1567,6 +1570,8 @@ async fn shutdown_does_not_resume_when_the_gateway_drops_the_connection() {
     );
     // twilight 0.17 does reconnect; the runner drops that connection at HELLO.
     assert_eq!(reconnected, Some(Frame::Gone));
+    // twilight calls it Resuming by then, but nothing is resumed.
+    assert_eq!(kinds.map(shard_events), before, "{kinds:?}");
     assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
     assert_eq!(
         running.handle.session_info(),
