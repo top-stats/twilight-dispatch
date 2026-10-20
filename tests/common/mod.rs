@@ -2,16 +2,31 @@
 //!
 //! Tests that need services are skipped (they pass and print a notice) unless
 //! the service URL is set:
-//! - `TEST_REDIS_URL`, e.g. `redis://127.0.0.1:6379` (each test uses its own
-//!   database index, so up to 16 run in parallel)
+//! - `TEST_REDIS_URL`, e.g. `redis://127.0.0.1:6379` (each test of a binary
+//!   uses its own database index, so up to 16 run in parallel)
 //! - `TEST_AMQP_URL`, e.g. `amqp://guest:guest@127.0.0.1:5672/%2f`
 //!
 //! `scripts/test.sh` starts Redis and LavinMQ in Docker and runs everything.
+//!
+//! The binaries are only isolated from each other because `cargo test` runs
+//! them one at a time:
+//! - database indexes are only unique within a binary (cache.rs uses 1-15,
+//!   lifecycle.rs 1-6, pipeline.rs and sessions.rs 1-4, reconnect.rs 3-4...);
+//! - some tests use server-wide commands (CLIENT PAUSE, CLIENT KILL, CONFIG
+//!   RESETSTAT), and the broker tests share the durable `gateway.recv` and
+//!   `gateway.send` queues. Each binary serializes those tests with a static
+//!   mutex, which does not reach other processes.
+//!
+//! So do not run the suite with cargo-nextest (a process per test) unless
+//! every test that uses a service is in one test group with
+//! `max-threads = 1`, and do not point two runs at the same Redis or broker
+//! at the same time.
 
 #![allow(dead_code)]
 
 use redis::aio::ConnectionManager;
 use serde_json::{json, Value};
+use std::io::Write;
 use twilight_dispatch::{
     cache::{self, Outcome, UpdateContext},
     config::StateConfig,
@@ -31,11 +46,16 @@ pub fn bot_id() -> Id<UserMarker> {
 
 /// Missing services fail the test instead of skipping it when
 /// REQUIRE_SERVICES is set (scripts/test.sh and CI set it).
+///
+/// The notice is written to the real stderr: libtest captures `eprintln!`
+/// and only shows it for failing tests, so a skipped test looked like a pass.
 pub fn skip(variable: &str) {
     if std::env::var_os("REQUIRE_SERVICES").is_some() {
         panic!("{variable} is not set but REQUIRE_SERVICES is");
     }
-    eprintln!("{variable} not set, skipping");
+    // libtest names the thread of a test after it.
+    let test = std::thread::current().name().unwrap_or("a test").to_owned();
+    let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {variable} is not set");
 }
 
 /// A clean Redis database, or `None` when TEST_REDIS_URL is unset.
