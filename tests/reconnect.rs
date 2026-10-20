@@ -69,10 +69,14 @@ async fn connection_recovers_after_redis_drops_it() {
     }
 }
 
-/// Control: a plain multiplexed connection (what the old code used) stays
-/// broken after the same kill, which is the flood seen in production.
+/// Control: the kill really drops a connection, so the recovery above is not
+/// a kill that missed. A plain multiplexed connection (what the old code
+/// used) fails the next command. With redis 0.22 it then stayed broken
+/// forever, which was the flood seen in production; whether a later redis-rs
+/// reconnects it on its own is not checked, since the service does not rely
+/// on that (it uses a ConnectionManager).
 #[tokio::test]
-async fn plain_multiplexed_connection_stays_broken() {
+async fn the_kill_breaks_a_plain_multiplexed_connection() {
     let _serial = SERIAL.lock().await;
     let Some(_) = common::redis(4).await else {
         return;
@@ -89,13 +93,7 @@ async fn plain_multiplexed_connection_stays_broken() {
         .unwrap();
 
     kill_clients(&mut killer).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    for _ in 0..5 {
-        let result: redis::RedisResult<i64> =
-            redis::cmd("GET").arg("k").query_async(&mut plain).await;
-        let err = result.expect_err("a dead multiplexed connection never recovers");
-        assert!(err.is_connection_dropped() || err.is_io_error(), "{err}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let result: redis::RedisResult<i64> = redis::cmd("GET").arg("k").query_async(&mut plain).await;
+    let err = result.expect_err("the first command after the kill fails");
+    assert!(err.is_connection_dropped() || err.is_io_error(), "{err}");
 }
