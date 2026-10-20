@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 //! Worker pipeline: cache first, then publish, per guild in order; the Redis
-//! breaker (set TEST_REDIS_URL).
+//! breaker; jobs of a previous session (set TEST_REDIS_URL).
 
 mod common;
 
@@ -107,6 +107,31 @@ fn job(handle: &ShardHandle, kind: &str, seq: u64, d: Value, typed: bool) -> Job
         session: Some(Arc::from("s1")),
         json,
         event,
+    }
+}
+
+/// Reads the cached message `message:1003:1` when an event is published, as a
+/// consumer that looks it up on receipt does.
+struct CacheReader {
+    redis: ConnectionManager,
+    /// Routing key, cached message, published payload.
+    seen: Mutex<Vec<(String, Option<Value>, Value)>>,
+}
+
+impl Publisher for CacheReader {
+    async fn publish(
+        &self,
+        routing_key: &str,
+        payload: Vec<u8>,
+        _message_id: Option<String>,
+    ) -> ApiResult<()> {
+        let cached = get(&mut self.redis.clone(), "message:1003:1").await;
+        let payload = serde_json::from_slice(&payload)?;
+        self.seen
+            .lock()
+            .unwrap()
+            .push((routing_key.to_owned(), cached, payload));
+        Ok(())
     }
 }
 
@@ -231,6 +256,85 @@ async fn events_are_cached_before_they_are_published() {
     assert_eq!(handle.session_info(), None, "no session id yet");
     handle.update(|s| s.session_id = Some("abc".into()));
     assert_eq!(handle.session_info().unwrap().sequence, 7);
+}
+
+/// A consumer that reads the cache when it receives an event sees the event
+/// applied. With STATE_OLD off (the shipped default) nothing but the order
+/// ties the publish to the cache update, and payloads carry no `old`.
+#[tokio::test]
+async fn each_event_is_in_the_cache_when_it_is_published() {
+    let _serial = SERIAL.lock().await;
+    let Some(conn) = redis(5).await else { return };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let registry = Arc::new(Registry::new([handle.clone()]));
+    let reader = Arc::new(CacheReader {
+        redis: conn.clone(),
+        seen: Mutex::default(),
+    });
+    let mut ctx = context(conn, registry, reader.clone(), Duration::from_secs(5));
+    ctx.state.old = false;
+    let (queues, workers) = worker::spawn(4, Arc::new(ctx));
+
+    let guild_id = 1000u64;
+    let target = Route::Guild(guild_id).worker(4);
+    let jobs = vec![
+        job(&handle, "GUILD_CREATE", 2, guild(guild_id, "g"), true),
+        job(
+            &handle,
+            "MESSAGE_CREATE",
+            3,
+            message(1, 1003, Some(guild_id), "hello"),
+            true,
+        ),
+        job(
+            &handle,
+            "MESSAGE_UPDATE",
+            4,
+            message(1, 1003, Some(guild_id), "edited"),
+            true,
+        ),
+        job(
+            &handle,
+            "MESSAGE_DELETE",
+            5,
+            json!({"id": "1", "channel_id": "1003", "guild_id": "1000"}),
+            true,
+        ),
+        job(&handle, "GUILD_CREATE", 6, guild(guild_id, "g"), true),
+    ];
+    for job in jobs {
+        queues[target].send(job).await.unwrap();
+    }
+    drop(queues);
+    for worker in workers {
+        worker.await.unwrap();
+    }
+
+    let seen = reader.seen.lock().unwrap().clone();
+    let cached: Vec<(&str, Option<&str>)> = seen
+        .iter()
+        .map(|(kind, message, _)| {
+            let content = message.as_ref().map(|m| m["content"].as_str().unwrap());
+            (kind.as_str(), content)
+        })
+        .collect();
+    assert_eq!(
+        cached,
+        [
+            ("GUILD_CREATE", None),
+            ("MESSAGE_CREATE", Some("hello")),
+            ("MESSAGE_UPDATE", Some("edited")),
+            ("MESSAGE_DELETE", None),
+            ("GUILD_CREATE", None),
+        ]
+    );
+    // With STATE_OLD the update, the delete and the re-sent GUILD_CREATE
+    // would carry `old` (see events_are_cached_before_they_are_published).
+    for (kind, _, payload) in &seen {
+        assert!(payload.get("old").is_none(), "{kind} has old: {payload}");
+        assert_eq!(payload["op"], 0, "{kind}");
+    }
+    assert_eq!(handle.in_flight(), 0);
 }
 
 #[tokio::test]
@@ -488,4 +592,154 @@ async fn deletes_of_a_previous_session_are_still_applied() {
         3,
         "both are still published"
     );
+}
+
+/// Which jobs of a previous session (queued before READY of the new one) are
+/// still applied to the cache: only removals that nothing replays.
+#[test]
+fn jobs_of_a_previous_session_apply_only_removals() {
+    let mut archived = thread(1005, 1000, 1003);
+    archived["thread_metadata"]["archived"] = json!(true);
+    let mut member_add = member(20, &[]);
+    member_add["guild_id"] = json!("1000");
+    let mut member_update = member_add.clone();
+    member_update["joined_at"] = json!(null);
+    let mut guild_update = guild(1000, "renamed");
+    for field in [
+        "channels",
+        "threads",
+        "members",
+        "presences",
+        "voice_states",
+    ] {
+        guild_update.as_object_mut().unwrap().remove(field);
+    }
+    let bot_user = json!({
+        "id": BOT_ID.to_string(), "username": "bot", "discriminator": "0",
+        "global_name": null, "avatar": null, "bot": true, "mfa_enabled": false,
+        "verified": true, "flags": 0,
+    });
+
+    let cases = [
+        (
+            "MESSAGE_DELETE",
+            json!({"id": "1", "channel_id": "1003", "guild_id": "1000"}),
+            true,
+        ),
+        (
+            "MESSAGE_DELETE_BULK",
+            json!({"ids": ["1"], "channel_id": "1003", "guild_id": "1000"}),
+            true,
+        ),
+        ("CHANNEL_DELETE", channel(1003, Some(1000), "general"), true),
+        (
+            "THREAD_DELETE",
+            json!({"id": "1005", "guild_id": "1000", "parent_id": "1003", "type": 11}),
+            true,
+        ),
+        (
+            "GUILD_ROLE_DELETE",
+            json!({"guild_id": "1000", "role_id": "1001"}),
+            true,
+        ),
+        // The bot left the guild.
+        ("GUILD_DELETE", json!({"id": "1000"}), true),
+        (
+            "GUILD_DELETE",
+            json!({"id": "1000", "unavailable": false}),
+            true,
+        ),
+        // An outage writes an unavailable stub.
+        (
+            "GUILD_DELETE",
+            json!({"id": "1000", "unavailable": true}),
+            false,
+        ),
+        // Removals that also write (the member count), or that the new
+        // session's GUILD_CREATE repairs.
+        (
+            "GUILD_MEMBER_REMOVE",
+            json!({"guild_id": "1000", "user": user(10, "user10")}),
+            false,
+        ),
+        ("PRESENCE_UPDATE", presence(1000, 10, "offline"), false),
+        (
+            "VOICE_STATE_UPDATE",
+            voice_state(Some(1000), 10, None),
+            false,
+        ),
+        ("THREAD_UPDATE", archived, false),
+        // Writes could undo what READY reconciled; the new session resends
+        // the state.
+        ("READY", ready([0, 1], &[1000]), false),
+        ("GUILD_CREATE", guild(1000, "g"), false),
+        ("GUILD_UPDATE", guild_update, false),
+        ("CHANNEL_CREATE", channel(1006, Some(1000), "new"), false),
+        (
+            "CHANNEL_UPDATE",
+            channel(1003, Some(1000), "renamed"),
+            false,
+        ),
+        (
+            "CHANNEL_PINS_UPDATE",
+            json!({"guild_id": "1000", "channel_id": "1003", "last_pin_timestamp": null}),
+            false,
+        ),
+        ("THREAD_CREATE", thread(1007, 1000, 1003), false),
+        (
+            "THREAD_LIST_SYNC",
+            json!({"guild_id": "1000", "channel_ids": ["1003"], "threads": [], "members": []}),
+            false,
+        ),
+        (
+            "GUILD_ROLE_CREATE",
+            json!({"guild_id": "1000", "role": role(1008, "new")}),
+            false,
+        ),
+        (
+            "GUILD_ROLE_UPDATE",
+            json!({"guild_id": "1000", "role": role(1001, "admins")}),
+            false,
+        ),
+        (
+            "GUILD_EMOJIS_UPDATE",
+            json!({"guild_id": "1000", "emojis": [emoji(1002, "pog")]}),
+            false,
+        ),
+        (
+            "GUILD_STICKERS_UPDATE",
+            json!({"guild_id": "1000", "stickers": []}),
+            false,
+        ),
+        ("GUILD_MEMBER_ADD", member_add, false),
+        ("GUILD_MEMBER_UPDATE", member_update, false),
+        (
+            "GUILD_MEMBERS_CHUNK",
+            json!({"guild_id": "1000", "members": [member(10, &[])], "chunk_index": 0, "chunk_count": 1}),
+            false,
+        ),
+        ("PRESENCE_UPDATE", presence(1000, 10, "online"), false),
+        (
+            "VOICE_STATE_UPDATE",
+            voice_state(Some(1000), 10, Some(1003)),
+            false,
+        ),
+        ("USER_UPDATE", bot_user, false),
+        (
+            "MESSAGE_CREATE",
+            message(1, 1003, Some(1000), "hello"),
+            false,
+        ),
+        // Nothing resends messages either, but its read-then-write could
+        // bring back a message of a guild READY removed (see only_removes).
+        (
+            "MESSAGE_UPDATE",
+            message(1, 1003, Some(1000), "edited"),
+            false,
+        ),
+    ];
+    for (kind, d, applied) in cases {
+        let label = format!("{kind} {d}");
+        assert_eq!(worker::only_removes(&event(kind, d)), applied, "{label}");
+    }
 }

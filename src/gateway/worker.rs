@@ -257,7 +257,15 @@ where
 /// session (GUILD_CREATE keeps the messages of channels it lists), and they
 /// cannot bring back anything READY removed, so they are applied even when
 /// they belong to a previous session.
-fn only_removes(event: &Event) -> bool {
+///
+/// MESSAGE_UPDATE is not applied across sessions although nothing replays it
+/// either, so such an edit is missing from the cache until the message
+/// expires (a known limitation). It reads the message and writes it back
+/// later, while READY's reconcile runs in the shard runner, not in this
+/// worker (`Runner::ready_cache` -> `cache::ready` -> `clear_guild`). If that
+/// removes the guild in between, the write brings the message back, and with
+/// STATE_MESSAGE_TTL=0 it never expires. Deletes have no such race.
+pub fn only_removes(event: &Event) -> bool {
     match event {
         Event::MessageDelete(_)
         | Event::MessageDeleteBulk(_)
