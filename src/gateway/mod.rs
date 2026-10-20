@@ -57,11 +57,24 @@ pub fn presence(config: &Config) -> ApiResult<UpdatePresencePayload> {
 }
 
 /// Identify concurrency: Discord's value, lowered by SHARDS_CONCURRENCY if set.
+///
+/// Discord allows one identify per 5 s in each bucket `shard % max_concurrency`,
+/// and `InMemoryQueue` releases one shard per 5 s in each bucket `shard % c`.
+/// Only a divisor of Discord's value keeps the shards of one Discord bucket
+/// in one queue bucket: with 16 and 3, shards 0 and 16 share Discord's bucket
+/// 0 but would identify together from queue buckets 0 and 1, and Discord
+/// answers that with an invalid session. So a configured value is lowered to
+/// the largest divisor not above it.
 pub fn concurrency(discord: u16, configured: Option<u16>) -> u16 {
-    match configured {
-        Some(configured) if configured > 0 => configured.min(discord.max(1)),
-        _ => discord.max(1),
-    }
+    let discord = discord.max(1);
+    let wanted = match configured {
+        Some(configured) if configured > 0 => configured.min(discord),
+        _ => discord,
+    };
+    (1..=wanted)
+        .rev()
+        .find(|&c| discord.is_multiple_of(c))
+        .unwrap_or(1)
 }
 
 /// Create this process' shards, resuming saved sessions where possible.
@@ -106,6 +119,15 @@ pub async fn create(
     }
 
     let max_concurrency = concurrency(limit.max_concurrency, config.shards_concurrency);
+    if let Some(configured) = config
+        .shards_concurrency
+        .filter(|&configured| max_concurrency < configured.min(limit.max_concurrency))
+    {
+        warn!(
+            "SHARDS_CONCURRENCY={} does not divide Discord's max_concurrency {}; using {} so that shards Discord rate-limits together never identify together",
+            configured, limit.max_concurrency, max_concurrency
+        );
+    }
     info!(
         "Identify concurrency {} (Discord allows {}), {} identifies left today",
         max_concurrency, limit.max_concurrency, limit.remaining
@@ -163,6 +185,35 @@ mod tests {
         assert_eq!(concurrency(1, Some(16)), 1);
         assert_eq!(concurrency(0, None), 1);
         assert_eq!(concurrency(16, Some(0)), 16);
+    }
+
+    /// Every Discord bucket (`shard % discord`) maps into a single queue
+    /// bucket (`shard % c`) exactly when `c` divides `discord`.
+    #[test]
+    fn concurrency_is_the_largest_divisor_of_discords_not_above_the_configured_value() {
+        for discord in [1u16, 16, 32, 64, 128] {
+            assert_eq!(concurrency(discord, None), discord);
+            for configured in 0..=200u16 {
+                let c = concurrency(discord, Some(configured));
+                let wanted = if configured == 0 {
+                    discord
+                } else {
+                    configured.min(discord)
+                };
+                assert!(
+                    c >= 1 && c <= discord && c <= wanted && discord.is_multiple_of(c),
+                    "{discord}/{configured} -> {c}"
+                );
+                assert!(
+                    (c + 1..=wanted).all(|larger| !discord.is_multiple_of(larger)),
+                    "{discord}/{configured} -> {c}, a larger divisor fits"
+                );
+            }
+        }
+        assert_eq!(concurrency(16, Some(3)), 2);
+        assert_eq!(concurrency(16, Some(12)), 8);
+        assert_eq!(concurrency(12, Some(5)), 4);
+        assert_eq!(concurrency(7, Some(6)), 1);
     }
 
     #[test]
