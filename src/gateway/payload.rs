@@ -81,12 +81,21 @@ pub fn route(kind: Option<&str>, d: Option<&RawValue>) -> Route {
     };
     let parse = |id: Option<Cow<'_, str>>| id.and_then(|id| id.parse::<u64>().ok());
 
-    let guild = match kind {
-        Some("GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE") => parse(hint.id),
-        _ => parse(hint.guild_id),
+    let (guild, channel) = match kind {
+        Some("GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE") => {
+            (parse(hint.id), parse(hint.channel_id))
+        }
+        // A DM channel's own events carry it in `id` (and no guild), while its
+        // messages name it in `channel_id`: route both by the channel so they
+        // reach the same worker in order.
+        Some("CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE") => (
+            parse(hint.guild_id),
+            parse(hint.id).or_else(|| parse(hint.channel_id)),
+        ),
+        _ => (parse(hint.guild_id), parse(hint.channel_id)),
     };
 
-    match (guild, parse(hint.channel_id)) {
+    match (guild, channel) {
         (Some(guild), _) => Route::Guild(guild),
         (None, Some(channel)) => Route::Channel(channel),
         (None, None) => Route::Unrouted,
@@ -168,6 +177,89 @@ mod tests {
             route(Some("GUILD_ROLE_CREATE"), Some(&guild)),
             Route::Unrouted
         );
+    }
+
+    #[test]
+    fn dm_channel_events_route_with_the_channels_messages() {
+        let dm =
+            RawValue::from_string(r#"{"id":"3","type":1,"last_message_id":"5"}"#.into()).unwrap();
+        for kind in ["CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DELETE"] {
+            assert_eq!(route(Some(kind), Some(&dm)), Route::Channel(3), "{kind}");
+        }
+        let message = RawValue::from_string(r#"{"id":"5","channel_id":"3"}"#.into()).unwrap();
+        assert_eq!(
+            route(Some("MESSAGE_CREATE"), Some(&message)),
+            Route::Channel(3)
+        );
+        let pins = RawValue::from_string(r#"{"channel_id":"3"}"#.into()).unwrap();
+        assert_eq!(
+            route(Some("CHANNEL_PINS_UPDATE"), Some(&pins)),
+            Route::Channel(3)
+        );
+
+        // A guild's channels stay with the guild.
+        let text = RawValue::from_string(r#"{"id":"3","guild_id":"7","type":0}"#.into()).unwrap();
+        for kind in ["CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DELETE"] {
+            assert_eq!(route(Some(kind), Some(&text)), Route::Guild(7), "{kind}");
+        }
+
+        // Without `id` a channel id still counts, as for every other event.
+        assert_eq!(
+            route(Some("CHANNEL_UPDATE"), Some(&pins)),
+            Route::Channel(3)
+        );
+        let empty = RawValue::from_string("{}".into()).unwrap();
+        assert_eq!(route(Some("CHANNEL_DELETE"), Some(&empty)), Route::Unrouted);
+        // Only these three are channels themselves; other events' `id` is not one.
+        let deleted = RawValue::from_string(r#"{"id":"3"}"#.into()).unwrap();
+        assert_eq!(
+            route(Some("MESSAGE_DELETE"), Some(&deleted)),
+            Route::Unrouted
+        );
+        assert_eq!(
+            route(Some("THREAD_DELETE"), Some(&deleted)),
+            Route::Unrouted
+        );
+    }
+
+    #[test]
+    fn only_top_level_snowflakes_route() {
+        let cases = [
+            // A guild wins over a channel, and only top-level fields count.
+            (
+                Some("MESSAGE_CREATE"),
+                r#"{"guild_id":"7","channel_id":"3"}"#,
+                Route::Guild(7),
+            ),
+            (
+                Some("MESSAGE_CREATE"),
+                r#"{"channel_id":"3","message":{"guild_id":"9"}}"#,
+                Route::Channel(3),
+            ),
+            // Ids that are not snowflakes count as missing.
+            (
+                Some("MESSAGE_CREATE"),
+                r#"{"guild_id":"x","channel_id":"3"}"#,
+                Route::Channel(3),
+            ),
+            (
+                Some("TYPING_START"),
+                r#"{"guild_id":"","channel_id":"-3"}"#,
+                Route::Unrouted,
+            ),
+            // The guild events are routed by `id` only.
+            (Some("GUILD_UPDATE"), r#"{"guild_id":"7"}"#, Route::Unrouted),
+            // Without a dispatch type, `id` never counts.
+            (None, r#"{"id":"1","guild_id":"7"}"#, Route::Guild(7)),
+            (None, r#"{"id":"1"}"#, Route::Unrouted),
+            // `d` that is not an object.
+            (Some("MESSAGE_CREATE"), "null", Route::Unrouted),
+            (Some("MESSAGE_CREATE"), r#""3""#, Route::Unrouted),
+        ];
+        for (kind, d, expected) in cases {
+            let raw = RawValue::from_string(d.to_owned()).unwrap();
+            assert_eq!(route(kind, Some(&raw)), expected, "{kind:?} {d}");
+        }
     }
 
     #[test]
