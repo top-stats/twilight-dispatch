@@ -1456,11 +1456,20 @@ proptest! {
         channel_id.insert(&mut d, "channel_id");
         let raw = RawValue::from_string(Value::Object(d).to_string()).unwrap();
 
-        // GUILD_CREATE / UPDATE / DELETE carry the guild itself; everything
-        // else names its guild in `guild_id`, or else its (DM) channel.
+        // GUILD_CREATE / UPDATE / DELETE carry the guild itself, CHANNEL_CREATE
+        // / UPDATE / DELETE the channel itself (in `id`, a DM channel has no
+        // guild); everything else names its guild in `guild_id`, or else its
+        // (DM) channel in `channel_id`.
         let own_id = matches!(kind.as_str(), "GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE");
+        let own_channel =
+            matches!(kind.as_str(), "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE");
         let guild = if own_id { id.id() } else { guild_id.id() };
-        let lenient = match (guild, channel_id.id()) {
+        let channel = if own_channel {
+            id.id().or(channel_id.id())
+        } else {
+            channel_id.id()
+        };
+        let lenient = match (guild, channel) {
             (Some(guild), _) => Route::Guild(guild),
             (None, Some(channel)) => Route::Channel(channel),
             (None, None) => Route::Unrouted,
