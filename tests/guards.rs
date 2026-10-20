@@ -6,10 +6,10 @@
 //! place fails here until that place is updated (or the decision is recorded
 //! in one of the tables below).
 //!
-//! Most guards run [`universe`], one fixture per dispatch event twilight
-//! knows plus variants, through `runner::prepare` like the shard runner does.
-//! [`Recording`] shows what `cache::update` sends for each one, either to a
-//! [`Fake`] Redis (everything or nothing cached) or to a real one.
+//! Most guards run `universe()`, one fixture per dispatch event twilight knows
+//! plus variants, through `runner::prepare` like the shard runner does.
+//! `Recording` shows what `cache::update` sends for each one, either to a
+//! `Fake` Redis (everything or nothing cached) or to a real one.
 //!
 //! Redis tests (TEST_REDIS_URL) each use their own database index; the broker
 //! test needs TEST_AMQP_URL. Everything else needs no services.
@@ -29,7 +29,7 @@ use redis::{
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -553,15 +553,21 @@ enum Sent {
 }
 
 /// Commands that only read.
-const READS: [&str; 10] = [
+const READS: [&str; 16] = [
     "EXISTS",
     "GET",
+    "HEXISTS",
     "HGET",
     "HGETALL",
+    "HMGET",
     "MGET",
+    "PTTL",
     "SCARD",
     "SISMEMBER",
     "SMEMBERS",
+    "TTL",
+    "TYPE",
+    "ZRANGE",
     "ZRANGEBYSCORE",
     "ZSCORE",
 ];
@@ -944,7 +950,8 @@ fn deliberately_unparsed(kind: &str, state: &StateConfig) -> bool {
 #[tokio::test]
 async fn everything_the_cache_does_is_reachable_through_the_runner() {
     let fixtures = universe();
-    let mut dead = Vec::new();
+    // What the cache sends -> the STATE_* combinations it is unreachable in.
+    let mut dead: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, state) in cache_states() {
         for fixture in &fixtures {
             if runner_event(fixture, &state).is_some()
@@ -958,17 +965,20 @@ async fn everything_the_cache_does_is_reachable_through_the_runner() {
                 };
                 let changes = writes(&sent);
                 if !changes.is_empty() {
-                    dead.push(format!(
-                        "{} with {name}, {cache:?} cached: the cache sends {:?}, but the runner \
-                         does not parse the event",
+                    let sends = format!(
+                        "{} ({cache:?} cached): {:?}",
                         fixture.label,
                         names(&changes)
-                    ));
+                    );
+                    dead.entry(sends).or_default().push(name.clone());
                 }
             }
         }
     }
-    assert!(dead.is_empty(), "{dead:#?}");
+    assert!(
+        dead.is_empty(),
+        "the cache does this, but the runner does not parse the event: {dead:#?}"
+    );
 }
 
 /// Parsed with the cache off. GUILD_CREATE and GUILD_DELETE are for the
@@ -982,7 +992,8 @@ const PARSED_WITHOUT_THE_CACHE: [&str; 3] = ["GUILD_CREATE", "GUILD_DELETE", "RE
 #[tokio::test]
 async fn everything_the_runner_parses_is_used() {
     let fixtures = universe();
-    let mut unused = Vec::new();
+    // Event type -> the STATE_* combinations it is parsed for nothing in.
+    let mut unused: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for (name, state) in states() {
         let parsed: BTreeSet<&str> = fixtures
             .iter()
@@ -992,7 +1003,7 @@ async fn everything_the_runner_parses_is_used() {
         for kind in parsed {
             if !state.enabled {
                 if !PARSED_WITHOUT_THE_CACHE.contains(&kind) {
-                    unused.push(format!("{kind} with {name}: parsed but the cache is off"));
+                    unused.entry(kind).or_default().push(name.clone());
                 }
                 continue;
             }
@@ -1004,13 +1015,14 @@ async fn everything_the_runner_parses_is_used() {
                 }
             }
             if !used {
-                unused.push(format!(
-                    "{kind} with {name}: parsed for the cache, which does nothing with it"
-                ));
+                unused.entry(kind).or_default().push(name.clone());
             }
         }
     }
-    assert!(unused.is_empty(), "{unused:#?}");
+    assert!(
+        unused.is_empty(),
+        "parsed, but the cache does nothing with it: {unused:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,7 +1176,13 @@ async fn every_removal_has_a_stale_session_decision() {
         }
     }
     let decided: BTreeSet<&str> = STALE_REMOVALS.iter().map(|(label, _)| *label).collect();
-    assert_eq!(removals, decided);
+    let undecided: Vec<&&str> = removals.difference(&decided).collect();
+    let no_removals: Vec<&&str> = decided.difference(&removals).collect();
+    assert!(
+        undecided.is_empty() && no_removals.is_empty(),
+        "removals without a decision in STALE_REMOVALS: {undecided:?}; decided but no (pure) \
+         removals: {no_removals:?}"
+    );
 }
 
 struct Discard;
@@ -1233,9 +1251,13 @@ async fn stale_removals_follow_their_decision() {
         process(&ctx, &mut conn, &handle, fixture, true).await;
         let stale = dump(&mut conn).await;
         let expected = if applied { &current } else { &seeded };
-        assert_eq!(
-            &stale, expected,
-            "{label} applied in a stale session: {applied}"
+        let missing: Vec<&String> = expected.difference(&stale).collect();
+        let unexpected: Vec<&String> = stale.difference(expected).collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "{label} in a stale session should be {}; missing {missing:#?}, unexpected \
+             {unexpected:#?}",
+            if applied { "applied" } else { "skipped" }
         );
     }
 }
@@ -1294,10 +1316,15 @@ async fn leaving_a_guild_removes_everything_its_events_cached() {
 // ---------------------------------------------------------------------------
 // Every event is applied atomically
 
+/// Commands that run a Lua script, which Redis runs atomically as well (a
+/// NOSCRIPT retry sends EVALSHA, SCRIPT LOAD, EVALSHA for one script).
+const SCRIPTS: [&str; 3] = ["EVAL", "EVALSHA", "SCRIPT"];
+
 /// A connection error between two writes leaves keys that no index refers
-/// to, so each event writes in one MULTI/EXEC (`cache::batch`). READY is the
-/// exception: one transaction for the bot user and the guild stubs, then one
-/// per cached guild of the shard that READY no longer lists.
+/// to, so each event writes in one MULTI/EXEC (`cache::batch`, or one
+/// script). READY is the exception: one transaction for the bot user and the
+/// guild stubs, then one per cached guild of the shard that READY no longer
+/// lists.
 #[tokio::test]
 async fn every_event_is_one_transaction() {
     let Some(mut conn) = redis(3).await else {
@@ -1339,33 +1366,40 @@ async fn every_event_is_one_transaction() {
 
                 let at = format!("{} with {name} (seeded: {seeded})", fixture.label);
                 let mut transactions = Vec::new();
+                let mut scripted = false;
                 for sent in &recording.sent {
                     match sent {
                         Sent::Command(command) if READS.contains(&command[0].as_str()) => {}
+                        Sent::Command(command) if SCRIPTS.contains(&command[0].as_str()) => {
+                            scripted = true
+                        }
                         Sent::Command(command) => {
                             failures.push(format!("{at}: {command:?} outside a transaction"))
                         }
                         Sent::Pipeline {
                             atomic: false,
                             commands,
-                        } => failures.push(format!("{at}: pipeline without MULTI {commands:?}")),
+                        } => {
+                            let names: Vec<&str> = commands.iter().map(|c| c[0].as_str()).collect();
+                            failures.push(format!("{at}: {names:?} in a pipeline without MULTI"))
+                        }
                         Sent::Pipeline { commands, .. } => transactions.push(commands),
                     }
                 }
+                let atomic_writes = transactions.len() + usize::from(scripted);
                 if fixture.kind == "READY" {
                     let bot_user = transactions.first().is_some_and(|first| {
                         first.iter().any(|c| c[0] == "SET" && c[1] == "bot_user")
                     });
                     stale_readies += usize::from(stale > 0);
-                    if !bot_user || transactions.len() != 1 + stale {
+                    if !bot_user || atomic_writes != 1 + stale {
                         failures.push(format!(
-                            "{at}: {} transactions for {stale} stale guilds (bot user first: \
-                             {bot_user})",
-                            transactions.len()
+                            "{at}: {atomic_writes} atomic writes for {stale} stale guilds (bot \
+                             user first: {bot_user})"
                         ));
                     }
-                } else if transactions.len() > 1 {
-                    failures.push(format!("{at}: {} transactions", transactions.len()));
+                } else if atomic_writes > 1 {
+                    failures.push(format!("{at}: {atomic_writes} atomic writes"));
                 }
             }
         }
