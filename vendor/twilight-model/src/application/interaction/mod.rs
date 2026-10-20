@@ -8,29 +8,40 @@ pub mod application_command;
 pub mod message_component;
 pub mod modal;
 
+mod context_type;
 mod interaction_type;
+mod metadata;
+mod resolved;
 
-pub use self::interaction_type::InteractionType;
+pub use self::{
+    context_type::InteractionContextType,
+    interaction_type::InteractionType,
+    metadata::InteractionMetadata,
+    resolved::{InteractionChannel, InteractionDataResolved, InteractionMember},
+};
 
 use self::{
     application_command::CommandData, message_component::MessageComponentInteractionData,
     modal::ModalInteractionData,
 };
 use crate::{
-    channel::Message,
-    guild::{PartialMember, Permissions},
+    channel::{Channel, Message},
+    guild::{GuildFeature, PartialMember, Permissions},
     id::{
+        AnonymizableId, Id,
         marker::{ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, UserMarker},
-        Id,
     },
+    oauth::ApplicationIntegrationMap,
     user::User,
 };
 use serde::{
-    de::{Error as DeError, IgnoredAny, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{Error as DeError, IgnoredAny, MapAccess, Visitor},
 };
 use serde_value::{DeserializerError, Value};
 use std::fmt::{Formatter, Result as FmtResult};
+
+use super::monetization::Entitlement;
 
 /// Payload received when a user executes an interaction.
 ///
@@ -40,19 +51,34 @@ use std::fmt::{Formatter, Result as FmtResult};
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Interaction {
     /// App's permissions in the channel the interaction was sent from.
-    ///
-    /// Present when the interaction is invoked in a guild.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_permissions: Option<Permissions>,
     /// ID of the associated application.
     pub application_id: Id<ApplicationMarker>,
+    /// Mapping of installation contexts that the interaction was
+    /// authorized for to related user or guild IDs.
+    pub authorizing_integration_owners:
+        ApplicationIntegrationMap<AnonymizableId<GuildMarker>, Id<UserMarker>>,
+    /// The channel the interaction was invoked in.
+    ///
+    /// Present on all interactions types, except [`Ping`].
+    ///
+    /// [`Ping`]: InteractionType::Ping
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<Channel>,
     /// ID of the channel the interaction was invoked in.
     ///
     /// Present on all interactions types, except [`Ping`].
     ///
     /// [`Ping`]: InteractionType::Ping
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(
+        note = "channel_id is deprecated in the discord API and will no be sent in the future, users should use the channel field instead."
+    )]
     pub channel_id: Option<Id<ChannelMarker>>,
+    /// Context where the interaction was triggered from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<InteractionContextType>,
     /// Data from the interaction.
     ///
     /// This field present on [`ApplicationCommand`], [`MessageComponent`],
@@ -65,6 +91,11 @@ pub struct Interaction {
     /// [`ModalSubmit`]: InteractionType::ModalSubmit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<InteractionData>,
+    /// For monetized apps, any entitlements for the invoking user, representing access to premium SKUs
+    pub entitlements: Vec<Entitlement>,
+    /// Guild that the interaction was sent from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guild: Option<InteractionPartialGuild>,
     /// ID of the guild the interaction was invoked in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guild_id: Option<Id<GuildMarker>>,
@@ -116,17 +147,26 @@ impl Interaction {
     /// [`member`]: Self::member
     /// [`user`]: Self::user
     pub const fn author_id(&self) -> Option<Id<UserMarker>> {
-        if let Some(member) = &self.member {
-            if let Some(user) = &member.user {
-                return Some(user.id);
-            }
+        if let Some(user) = self.author() {
+            Some(user.id)
+        } else {
+            None
         }
+    }
 
-        if let Some(user) = &self.user {
-            return Some(user.id);
+    /// The user that invoked the interaction.
+    ///
+    /// This will first check for the [`member`]'s
+    /// [`user`][`PartialMember::user`] and then, if not present, check the
+    /// [`user`].
+    ///
+    /// [`member`]: Self::member
+    /// [`user`]: Self::user
+    pub const fn author(&self) -> Option<&User> {
+        match self.member.as_ref() {
+            Some(member) if member.user.is_some() => member.user.as_ref(),
+            _ => self.user.as_ref(),
         }
-
-        None
     }
 
     /// Whether the interaction was invoked in a DM.
@@ -151,8 +191,12 @@ impl<'de> Deserialize<'de> for Interaction {
 enum InteractionField {
     AppPermissions,
     ApplicationId,
+    Context,
+    Channel,
     ChannelId,
     Data,
+    Entitlements,
+    Guild,
     GuildId,
     GuildLocale,
     Id,
@@ -163,6 +207,7 @@ enum InteractionField {
     Type,
     User,
     Version,
+    AuthorizingIntegrationOwners,
 }
 
 struct InteractionVisitor;
@@ -174,12 +219,16 @@ impl<'de> Visitor<'de> for InteractionVisitor {
         f.write_str("enum Interaction")
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     fn visit_map<V: MapAccess<'de>>(self, mut map: V) -> Result<Self::Value, V::Error> {
         let mut app_permissions: Option<Permissions> = None;
         let mut application_id: Option<Id<ApplicationMarker>> = None;
+        let mut channel: Option<Channel> = None;
         let mut channel_id: Option<Id<ChannelMarker>> = None;
+        let mut context: Option<InteractionContextType> = None;
         let mut data: Option<Value> = None;
+        let mut entitlements: Option<Vec<Entitlement>> = None;
+        let mut guild: Option<InteractionPartialGuild> = None;
         let mut guild_id: Option<Id<GuildMarker>> = None;
         let mut guild_locale: Option<String> = None;
         let mut id: Option<Id<InteractionMarker>> = None;
@@ -189,26 +238,16 @@ impl<'de> Visitor<'de> for InteractionVisitor {
         let mut message: Option<Message> = None;
         let mut token: Option<String> = None;
         let mut user: Option<User> = None;
-
-        let span = tracing::trace_span!("deserializing interaction");
-        let _span_enter = span.enter();
+        let mut authorizing_integration_owners: Option<
+            ApplicationIntegrationMap<AnonymizableId<GuildMarker>, Id<UserMarker>>,
+        > = None;
 
         loop {
-            let span_child = tracing::trace_span!("iterating over interaction");
-            let _span_child_enter = span_child.enter();
-
             let key = match map.next_key() {
-                Ok(Some(key)) => {
-                    tracing::trace!(?key, "found key");
-
-                    key
-                }
+                Ok(Some(key)) => key,
                 Ok(None) => break,
-                Err(why) => {
-                    // Encountered when we run into an unknown key.
+                Err(_) => {
                     map.next_value::<IgnoredAny>()?;
-
-                    tracing::trace!("ran into an unknown key: {why:?}");
 
                     continue;
                 }
@@ -229,6 +268,20 @@ impl<'de> Visitor<'de> for InteractionVisitor {
 
                     application_id = Some(map.next_value()?);
                 }
+                InteractionField::Context => {
+                    if context.is_some() {
+                        return Err(DeError::duplicate_field("context"));
+                    }
+
+                    context = map.next_value()?;
+                }
+                InteractionField::Channel => {
+                    if channel.is_some() {
+                        return Err(DeError::duplicate_field("channel"));
+                    }
+
+                    channel = map.next_value()?;
+                }
                 InteractionField::ChannelId => {
                     if channel_id.is_some() {
                         return Err(DeError::duplicate_field("channel_id"));
@@ -242,6 +295,20 @@ impl<'de> Visitor<'de> for InteractionVisitor {
                     }
 
                     data = map.next_value()?;
+                }
+                InteractionField::Entitlements => {
+                    if entitlements.is_some() {
+                        return Err(DeError::duplicate_field("entitlements"));
+                    }
+
+                    entitlements = map.next_value()?;
+                }
+                InteractionField::Guild => {
+                    if guild.is_some() {
+                        return Err(DeError::duplicate_field("guild"));
+                    }
+
+                    guild = map.next_value()?;
                 }
                 InteractionField::GuildId => {
                     if guild_id.is_some() {
@@ -310,22 +377,23 @@ impl<'de> Visitor<'de> for InteractionVisitor {
                     // Ignoring the version field.
                     map.next_value::<IgnoredAny>()?;
                 }
+                InteractionField::AuthorizingIntegrationOwners => {
+                    if authorizing_integration_owners.is_some() {
+                        return Err(DeError::duplicate_field("authorizing_integration_owners"));
+                    }
+
+                    authorizing_integration_owners = map.next_value()?;
+                }
             }
         }
 
         let application_id =
             application_id.ok_or_else(|| DeError::missing_field("application_id"))?;
+        let authorizing_integration_owners = authorizing_integration_owners
+            .ok_or_else(|| DeError::missing_field("authorizing_integration_owners"))?;
         let id = id.ok_or_else(|| DeError::missing_field("id"))?;
         let token = token.ok_or_else(|| DeError::missing_field("token"))?;
         let kind = kind.ok_or_else(|| DeError::missing_field("kind"))?;
-
-        tracing::trace!(
-            %application_id,
-            %id,
-            %token,
-            ?kind,
-            "common fields of all variants exist"
-        );
 
         let data = match kind {
             InteractionType::Ping => None,
@@ -363,11 +431,18 @@ impl<'de> Visitor<'de> for InteractionVisitor {
             }
         };
 
+        let entitlements = entitlements.unwrap_or_default();
+
         Ok(Self::Value {
             app_permissions,
             application_id,
+            authorizing_integration_owners,
+            channel,
             channel_id,
+            context,
             data,
+            entitlements,
+            guild,
             guild_id,
             guild_locale,
             id,
@@ -395,26 +470,44 @@ pub enum InteractionData {
     /// Data received for the [`MessageComponent`] interaction type.
     ///
     /// [`MessageComponent`]: InteractionType::MessageComponent
-    MessageComponent(MessageComponentInteractionData),
+    MessageComponent(Box<MessageComponentInteractionData>),
     /// Data received for the [`ModalSubmit`] interaction type.
     ///
     /// [`ModalSubmit`]: InteractionType::ModalSubmit
-    ModalSubmit(ModalInteractionData),
+    ModalSubmit(Box<ModalInteractionData>),
+}
+
+/// Partial guild containing only the fields sent in the partial guild
+/// in interactions.
+///
+/// # Note that the field `locale` does not exists on the full guild
+/// object, and is only found here. See
+/// <https://github.com/discord/discord-api-docs/issues/6938> for more
+/// info.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Hash)]
+pub struct InteractionPartialGuild {
+    /// Id of the guild.
+    pub id: Option<Id<GuildMarker>>,
+    /// Enabled guild features
+    pub features: Option<Vec<GuildFeature>>,
+    pub locale: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        application_command::{
-            CommandData, CommandDataOption, CommandInteractionDataResolved, CommandOptionValue,
-            InteractionMember,
-        },
-        Interaction, InteractionData, InteractionType,
+        Interaction, InteractionData, InteractionDataResolved, InteractionMember, InteractionType,
+        application_command::{CommandData, CommandDataOption, CommandOptionValue},
     };
     use crate::{
-        application::command::{CommandOptionType, CommandType},
-        guild::{PartialMember, Permissions},
+        application::{
+            command::{CommandOptionType, CommandType},
+            monetization::{EntitlementType, entitlement::Entitlement},
+        },
+        channel::Channel,
+        guild::{MemberFlags, PartialMember, Permissions},
         id::Id,
+        oauth::ApplicationIntegrationMap,
         test::image_hash,
         user::User,
         util::datetime::{Timestamp, TimestampParseError},
@@ -423,14 +516,57 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     fn test_interaction_full() -> Result<(), TimestampParseError> {
-        let joined_at = Timestamp::from_str("2020-01-01T00:00:00.000000+00:00")?;
+        let joined_at = Some(Timestamp::from_str("2020-01-01T00:00:00.000000+00:00")?);
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let value = Interaction {
             app_permissions: Some(Permissions::SEND_MESSAGES),
             application_id: Id::new(100),
+            authorizing_integration_owners: ApplicationIntegrationMap {
+                guild: None,
+                user: None,
+            },
+            channel: Some(Channel {
+                bitrate: None,
+                guild_id: None,
+                id: Id::new(400),
+                kind: crate::channel::ChannelType::GuildText,
+                last_message_id: None,
+                last_pin_timestamp: None,
+                name: None,
+                nsfw: None,
+                owner_id: None,
+                parent_id: None,
+                permission_overwrites: None,
+                position: None,
+                rate_limit_per_user: None,
+                recipients: None,
+                rtc_region: None,
+                topic: None,
+                user_limit: None,
+                application_id: None,
+                applied_tags: None,
+                available_tags: None,
+                default_auto_archive_duration: None,
+                default_forum_layout: None,
+                default_reaction_emoji: None,
+                default_sort_order: None,
+                default_thread_rate_limit_per_user: None,
+                flags: None,
+                icon: None,
+                invitable: None,
+                managed: None,
+                member: None,
+                member_count: None,
+                message_count: None,
+                newly_created: None,
+                thread_metadata: None,
+                video_quality_mode: None,
+            }),
             channel_id: Some(Id::new(200)),
+            context: None,
             data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
                 guild_id: None,
                 id: Id::new(300),
@@ -440,14 +576,17 @@ mod tests {
                     name: "member".into(),
                     value: CommandOptionValue::User(Id::new(600)),
                 }]),
-                resolved: Some(CommandInteractionDataResolved {
+                resolved: Some(InteractionDataResolved {
                     attachments: HashMap::new(),
                     channels: HashMap::new(),
                     members: IntoIterator::into_iter([(
                         Id::new(600),
                         InteractionMember {
                             avatar: None,
+                            avatar_decoration_data: None,
+                            banner: None,
                             communication_disabled_until: None,
+                            flags,
                             joined_at,
                             nick: Some("nickname".into()),
                             pending: false,
@@ -464,16 +603,20 @@ mod tests {
                         User {
                             accent_color: None,
                             avatar: Some(image_hash::AVATAR),
+                            avatar_decoration: None,
+                            avatar_decoration_data: None,
                             banner: None,
                             bot: false,
                             discriminator: 1111,
                             email: None,
                             flags: None,
+                            global_name: Some("test".into()),
                             id: Id::new(600),
                             locale: None,
                             mfa_enabled: None,
                             name: "username".into(),
                             premium_type: None,
+                            primary_guild: None,
                             public_flags: None,
                             system: None,
                             verified: None,
@@ -483,6 +626,19 @@ mod tests {
                 }),
                 target_id: None,
             }))),
+            entitlements: vec![Entitlement {
+                application_id: Id::new(100),
+                consumed: Some(false),
+                deleted: false,
+                ends_at: None,
+                guild_id: None,
+                id: Id::new(200),
+                kind: EntitlementType::ApplicationSubscription,
+                sku_id: Id::new(300),
+                starts_at: None,
+                user_id: None,
+            }],
+            guild: None,
             guild_id: Some(Id::new(400)),
             guild_locale: Some("de".to_owned()),
             id: Id::new(500),
@@ -490,8 +646,11 @@ mod tests {
             locale: Some("en-GB".to_owned()),
             member: Some(PartialMember {
                 avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
                 communication_disabled_until: None,
                 deaf: false,
+                flags,
                 joined_at,
                 mute: false,
                 nick: Some("nickname".into()),
@@ -501,16 +660,20 @@ mod tests {
                 user: Some(User {
                     accent_color: None,
                     avatar: Some(image_hash::AVATAR),
+                    avatar_decoration: None,
+                    avatar_decoration_data: None,
                     banner: None,
                     bot: false,
                     discriminator: 1111,
                     email: None,
                     flags: None,
+                    global_name: Some("test".into()),
                     id: Id::new(600),
                     locale: None,
                     mfa_enabled: None,
                     name: "username".into(),
                     premium_type: None,
+                    primary_guild: None,
                     public_flags: None,
                     system: None,
                     verified: None,
@@ -521,12 +684,13 @@ mod tests {
             user: None,
         };
 
-        serde_test::assert_tokens(
+        // TODO: switch the `assert_tokens` see #2190
+        serde_test::assert_ser_tokens(
             &value,
             &[
                 Token::Struct {
                     name: "Interaction",
-                    len: 11,
+                    len: 14,
                 },
                 Token::Str("app_permissions"),
                 Token::Some,
@@ -534,6 +698,24 @@ mod tests {
                 Token::Str("application_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("100"),
+                Token::Str("authorizing_integration_owners"),
+                Token::Struct {
+                    name: "ApplicationIntegrationMap",
+                    len: 0,
+                },
+                Token::StructEnd,
+                Token::Str("channel"),
+                Token::Some,
+                Token::Struct {
+                    name: "Channel",
+                    len: 2,
+                },
+                Token::Str("id"),
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("400"),
+                Token::Str("type"),
+                Token::U8(0),
+                Token::StructEnd,
                 Token::Str("channel_id"),
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
@@ -569,7 +751,7 @@ mod tests {
                 Token::Str("resolved"),
                 Token::Some,
                 Token::Struct {
-                    name: "CommandInteractionDataResolved",
+                    name: "InteractionDataResolved",
                     len: 2,
                 },
                 Token::Str("members"),
@@ -578,11 +760,14 @@ mod tests {
                 Token::Str("600"),
                 Token::Struct {
                     name: "InteractionMember",
-                    len: 6,
+                    len: 7,
                 },
                 Token::Str("communication_disabled_until"),
                 Token::None,
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2020-01-01T00:00:00.000000+00:00"),
                 Token::Str("nick"),
                 Token::Some,
@@ -602,19 +787,26 @@ mod tests {
                 Token::Str("600"),
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::None,
                 Token::Str("bot"),
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("1111"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("600"),
@@ -624,6 +816,30 @@ mod tests {
                 Token::MapEnd,
                 Token::StructEnd,
                 Token::StructEnd,
+                Token::Str("entitlements"),
+                Token::Seq { len: Some(1) },
+                Token::Struct {
+                    name: "Entitlement",
+                    len: 6,
+                },
+                Token::Str("application_id"),
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("100"),
+                Token::Str("consumed"),
+                Token::Some,
+                Token::Bool(false),
+                Token::Str("deleted"),
+                Token::Bool(false),
+                Token::Str("id"),
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("200"),
+                Token::Str("type"),
+                Token::U8(8),
+                Token::Str("sku_id"),
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("300"),
+                Token::StructEnd,
+                Token::SeqEnd,
                 Token::Str("guild_id"),
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
@@ -643,13 +859,16 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "PartialMember",
-                    len: 8,
+                    len: 9,
                 },
                 Token::Str("communication_disabled_until"),
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2020-01-01T00:00:00.000000+00:00"),
                 Token::Str("mute"),
                 Token::Bool(false),
@@ -666,19 +885,26 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::None,
                 Token::Str("bot"),
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("1111"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("600"),

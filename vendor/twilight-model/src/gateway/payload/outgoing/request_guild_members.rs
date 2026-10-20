@@ -1,8 +1,8 @@
 use crate::{
     gateway::opcode::OpCode,
     id::{
-        marker::{GuildMarker, UserMarker},
         Id,
+        marker::{GuildMarker, UserMarker},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ impl UserIdsError {
         (self.kind, None)
     }
 
-    fn too_many(ids: Vec<Id<UserMarker>>) -> Self {
+    const fn too_many(ids: Vec<Id<UserMarker>>) -> Self {
         Self {
             kind: UserIdsErrorType::TooMany { ids },
         }
@@ -122,7 +122,7 @@ impl RequestGuildMembersBuilder {
     ///
     /// By default, this uses Discord's default.
     #[must_use = "has no effect if not built into a RequestGuildMembers"]
-    pub fn presences(mut self, presences: bool) -> Self {
+    pub const fn presences(mut self, presences: bool) -> Self {
         self.presences.replace(presences);
 
         self
@@ -135,8 +135,8 @@ impl RequestGuildMembersBuilder {
     /// If you specify no limit, then Discord's default will be used, which will
     /// be an unbounded number of members. Specifying 0 is also equivalent.
     ///
-    /// To request the entire member list, pass in a `None` query. You must also
-    /// have the `GUILD_MEMBERS` intent enabled.
+    /// To request the entire member list, pass in an empty string and no limit.
+    /// You must also have the `GUILD_MEMBERS` intent enabled.
     ///
     /// # Examples
     ///

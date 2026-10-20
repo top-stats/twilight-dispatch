@@ -85,6 +85,24 @@ pub struct CommandVersionMarker;
 #[non_exhaustive]
 pub struct EmojiMarker;
 
+/// Marker for entitlement IDs.
+///
+/// Types such as [`Entitlement`] use this ID marker.
+///
+/// [`Entitlement`]: crate::application::monetization::entitlement::Entitlement
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct EntitlementMarker;
+
+/// Marker for entitlement SKU IDs.
+///
+/// Types such as [`Sku`] use this ID marker.
+///
+/// [`Sku`]: crate::application::monetization::sku::Sku
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SkuMarker;
+
 /// Marker for generic IDs.
 ///
 /// Types such as [`AuditLogChange::Id`] or [`CommandOptionValue`] use this
@@ -155,6 +173,24 @@ pub struct OauthSkuMarker;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OauthTeamMarker;
+
+/// Marker for onboarding prompt IDs.
+///
+/// Types such as [`OnboardingPrompt`] use this ID marker.
+///
+/// [`OnboardingPrompt`]: crate::guild::onboarding::OnboardingPrompt
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OnboardingPromptMarker;
+
+/// Marker for onboarding prompt option IDs.
+///
+/// Types such as [`OnboardingPromptOption`] use this ID marker.
+///
+/// [`OnboardingPromptOption`]: crate::guild::onboarding::OnboardingPromptOption
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct OnboardingPromptOptionMarker;
 
 /// Marker for role IDs.
 ///
@@ -231,6 +267,15 @@ pub struct StickerPackMarker;
 #[non_exhaustive]
 pub struct StickerPackSkuMarker;
 
+/// Marker for SKU IDs.
+///
+/// Types such as [`RoleTags`] use this ID marker.
+///
+/// [`RoleTags`]: crate::guild::RoleTags
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RoleSubscriptionSkuMarker;
+
 /// Marker for forum tag IDs.
 ///
 /// Types such as [`ForumTag`] use this ID marker.
@@ -258,3 +303,12 @@ pub struct UserMarker;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct WebhookMarker;
+
+/// SKU ID marker for avatar decoration data.
+///
+/// Types such as [`AvatarDecorationData`] use this ID marker.
+///
+/// [`AvatarDecorationData`]: crate::user::AvatarDecorationData
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AvatarDecorationDataSkuMarker;

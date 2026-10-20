@@ -1,4 +1,6 @@
-use crate::{guild::UnavailableGuild, oauth::PartialApplication, user::CurrentUser};
+use crate::{
+    gateway::ShardId, guild::UnavailableGuild, oauth::PartialApplication, user::CurrentUser,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -8,7 +10,7 @@ pub struct Ready {
     pub resume_gateway_url: String,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub shard: Option<[u64; 2]>,
+    pub shard: Option<ShardId>,
     pub user: CurrentUser,
     #[serde(rename = "v")]
     pub version: u64,
@@ -18,6 +20,7 @@ pub struct Ready {
 mod tests {
     use super::Ready;
     use crate::{
+        gateway::ShardId,
         guild::UnavailableGuild,
         id::Id,
         oauth::{ApplicationFlags, PartialApplication},
@@ -27,7 +30,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn test_ready() {
+    fn ready() {
         let guilds = vec![
             UnavailableGuild {
                 id: Id::new(1),
@@ -45,8 +48,9 @@ mod tests {
                 id: Id::new(100),
             },
             guilds,
+            resume_gateway_url: "wss://gateway.discord.gg".into(),
             session_id: "foo".to_owned(),
-            shard: Some([4, 7]),
+            shard: Some(ShardId::new(4, 7)),
             user: CurrentUser {
                 accent_color: None,
                 avatar: None,
@@ -62,9 +66,9 @@ mod tests {
                 premium_type: None,
                 public_flags: None,
                 verified: None,
+                global_name: None,
             },
             version: 8,
-            resume_gateway_url: "wss://gateway.discord.gg/".to_owned(),
         };
 
         serde_test::assert_tokens(
@@ -109,14 +113,14 @@ mod tests {
                 Token::StructEnd,
                 Token::SeqEnd,
                 Token::Str("resume_gateway_url"),
-                Token::Str("wss://gateway.discord.gg/"),
+                Token::Str("wss://gateway.discord.gg"),
                 Token::Str("session_id"),
                 Token::Str("foo"),
                 Token::Str("shard"),
                 Token::Some,
                 Token::Tuple { len: 2 },
-                Token::U64(4),
-                Token::U64(7),
+                Token::U32(4),
+                Token::U32(7),
                 Token::TupleEnd,
                 Token::Str("user"),
                 Token::Struct {

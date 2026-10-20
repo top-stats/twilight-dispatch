@@ -1,7 +1,7 @@
 use super::{super::payload::incoming::*, Event, EventConversionError, EventType};
 use serde::{
-    de::{Deserialize, DeserializeSeed, Deserializer, Error as DeError, IgnoredAny},
     Serialize,
+    de::{Deserialize, DeserializeSeed, Deserializer, Error as DeError, IgnoredAny},
 };
 
 /// A dispatch event, containing information about a created guild, a member
@@ -15,9 +15,9 @@ use serde::{
 #[serde(untagged)]
 pub enum DispatchEvent {
     AutoModerationActionExecution(AutoModerationActionExecution),
-    AutoModerationRuleCreate(Box<AutoModerationRuleCreate>),
-    AutoModerationRuleDelete(Box<AutoModerationRuleDelete>),
-    AutoModerationRuleUpdate(Box<AutoModerationRuleUpdate>),
+    AutoModerationRuleCreate(AutoModerationRuleCreate),
+    AutoModerationRuleDelete(AutoModerationRuleDelete),
+    AutoModerationRuleUpdate(AutoModerationRuleUpdate),
     BanAdd(BanAdd),
     BanRemove(BanRemove),
     ChannelCreate(Box<ChannelCreate>),
@@ -25,7 +25,10 @@ pub enum DispatchEvent {
     ChannelPinsUpdate(ChannelPinsUpdate),
     ChannelUpdate(Box<ChannelUpdate>),
     CommandPermissionsUpdate(CommandPermissionsUpdate),
-    GiftCodeUpdate,
+    EntitlementCreate(EntitlementCreate),
+    EntitlementDelete(EntitlementDelete),
+    EntitlementUpdate(EntitlementUpdate),
+    GuildAuditLogEntryCreate(Box<GuildAuditLogEntryCreate>),
     GuildCreate(Box<GuildCreate>),
     GuildDelete(GuildDelete),
     GuildEmojisUpdate(GuildEmojisUpdate),
@@ -50,14 +53,16 @@ pub enum DispatchEvent {
     MessageCreate(Box<MessageCreate>),
     MessageDelete(MessageDelete),
     MessageDeleteBulk(MessageDeleteBulk),
+    MessagePollVoteAdd(MessagePollVoteAdd),
+    MessagePollVoteRemove(MessagePollVoteRemove),
     MessageUpdate(Box<MessageUpdate>),
     PresenceUpdate(Box<PresenceUpdate>),
-    PresencesReplace,
+    RateLimited(RateLimited),
     ReactionAdd(Box<ReactionAdd>),
     ReactionRemove(Box<ReactionRemove>),
     ReactionRemoveAll(ReactionRemoveAll),
     ReactionRemoveEmoji(ReactionRemoveEmoji),
-    Ready(Box<Ready>),
+    Ready(Ready),
     Resumed,
     RoleCreate(RoleCreate),
     RoleDelete(RoleDelete),
@@ -94,7 +99,10 @@ impl DispatchEvent {
             Self::ChannelPinsUpdate(_) => EventType::ChannelPinsUpdate,
             Self::ChannelUpdate(_) => EventType::ChannelUpdate,
             Self::CommandPermissionsUpdate(_) => EventType::CommandPermissionsUpdate,
-            Self::GiftCodeUpdate => EventType::GiftCodeUpdate,
+            Self::EntitlementCreate(_) => EventType::EntitlementCreate,
+            Self::EntitlementDelete(_) => EventType::EntitlementDelete,
+            Self::EntitlementUpdate(_) => EventType::EntitlementUpdate,
+            Self::GuildAuditLogEntryCreate(_) => EventType::GuildAuditLogEntryCreate,
             Self::GuildCreate(_) => EventType::GuildCreate,
             Self::GuildDelete(_) => EventType::GuildDelete,
             Self::GuildEmojisUpdate(_) => EventType::GuildEmojisUpdate,
@@ -119,9 +127,11 @@ impl DispatchEvent {
             Self::MessageCreate(_) => EventType::MessageCreate,
             Self::MessageDelete(_) => EventType::MessageDelete,
             Self::MessageDeleteBulk(_) => EventType::MessageDeleteBulk,
+            Self::MessagePollVoteAdd(_) => EventType::MessagePollVoteAdd,
+            Self::MessagePollVoteRemove(_) => EventType::MessagePollVoteRemove,
             Self::MessageUpdate(_) => EventType::MessageUpdate,
             Self::PresenceUpdate(_) => EventType::PresenceUpdate,
-            Self::PresencesReplace => EventType::PresencesReplace,
+            Self::RateLimited(_) => EventType::RateLimited,
             Self::ReactionAdd(_) => EventType::ReactionAdd,
             Self::ReactionRemove(_) => EventType::ReactionRemove,
             Self::ReactionRemoveAll(_) => EventType::ReactionRemoveAll,
@@ -166,7 +176,7 @@ impl TryFrom<Event> for DispatchEvent {
             Event::ChannelPinsUpdate(v) => Self::ChannelPinsUpdate(v),
             Event::ChannelUpdate(v) => Self::ChannelUpdate(v),
             Event::CommandPermissionsUpdate(v) => Self::CommandPermissionsUpdate(v),
-            Event::GiftCodeUpdate => Self::GiftCodeUpdate,
+            Event::GuildAuditLogEntryCreate(v) => Self::GuildAuditLogEntryCreate(v),
             Event::GuildCreate(v) => Self::GuildCreate(v),
             Event::GuildDelete(v) => Self::GuildDelete(v),
             Event::GuildEmojisUpdate(v) => Self::GuildEmojisUpdate(v),
@@ -190,9 +200,10 @@ impl TryFrom<Event> for DispatchEvent {
             Event::MessageCreate(v) => Self::MessageCreate(v),
             Event::MessageDelete(v) => Self::MessageDelete(v),
             Event::MessageDeleteBulk(v) => Self::MessageDeleteBulk(v),
+            Event::MessagePollVoteAdd(v) => Self::MessagePollVoteAdd(v),
+            Event::MessagePollVoteRemove(v) => Self::MessagePollVoteRemove(v),
             Event::MessageUpdate(v) => Self::MessageUpdate(v),
             Event::PresenceUpdate(v) => Self::PresenceUpdate(v),
-            Event::PresencesReplace => Self::PresencesReplace,
             Event::ReactionAdd(v) => Self::ReactionAdd(v),
             Event::ReactionRemove(v) => Self::ReactionRemove(v),
             Event::ReactionRemoveAll(v) => Self::ReactionRemoveAll(v),
@@ -236,7 +247,7 @@ impl<'a> DispatchEventWithTypeDeserializer<'a> {
     }
 }
 
-impl<'de, 'a> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'a> {
+impl<'de> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'_> {
     type Value = DispatchEvent;
 
     #[allow(clippy::too_many_lines)]
@@ -245,15 +256,15 @@ impl<'de, 'a> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'a> {
             "AUTO_MODERATION_ACTION_EXECUTION" => DispatchEvent::AutoModerationActionExecution(
                 AutoModerationActionExecution::deserialize(deserializer)?,
             ),
-            "AUTO_MODERATION_RULE_CREATE" => DispatchEvent::AutoModerationRuleCreate(Box::new(
+            "AUTO_MODERATION_RULE_CREATE" => DispatchEvent::AutoModerationRuleCreate(
                 AutoModerationRuleCreate::deserialize(deserializer)?,
-            )),
-            "AUTO_MODERATION_RULE_DELETE" => DispatchEvent::AutoModerationRuleDelete(Box::new(
+            ),
+            "AUTO_MODERATION_RULE_DELETE" => DispatchEvent::AutoModerationRuleDelete(
                 AutoModerationRuleDelete::deserialize(deserializer)?,
-            )),
-            "AUTO_MODERATION_RULE_UPDATE" => DispatchEvent::AutoModerationRuleUpdate(Box::new(
+            ),
+            "AUTO_MODERATION_RULE_UPDATE" => DispatchEvent::AutoModerationRuleUpdate(
                 AutoModerationRuleUpdate::deserialize(deserializer)?,
-            )),
+            ),
             "CHANNEL_CREATE" => {
                 DispatchEvent::ChannelCreate(Box::new(ChannelCreate::deserialize(deserializer)?))
             }
@@ -269,11 +280,12 @@ impl<'de, 'a> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'a> {
             "APPLICATION_COMMAND_PERMISSIONS_UPDATE" => DispatchEvent::CommandPermissionsUpdate(
                 CommandPermissionsUpdate::deserialize(deserializer)?,
             ),
-            "GIFT_CODE_UPDATE" => {
-                deserializer.deserialize_ignored_any(IgnoredAny)?;
-
-                DispatchEvent::GiftCodeUpdate
+            "ENTITLEMENT_CREATE" => {
+                DispatchEvent::EntitlementCreate(EntitlementCreate::deserialize(deserializer)?)
             }
+            "GUILD_AUDIT_LOG_ENTRY_CREATE" => DispatchEvent::GuildAuditLogEntryCreate(Box::new(
+                GuildAuditLogEntryCreate::deserialize(deserializer)?,
+            )),
             "GUILD_BAN_ADD" => DispatchEvent::BanAdd(BanAdd::deserialize(deserializer)?),
             "GUILD_BAN_REMOVE" => DispatchEvent::BanRemove(BanRemove::deserialize(deserializer)?),
             "GUILD_CREATE" => {
@@ -367,18 +379,20 @@ impl<'de, 'a> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'a> {
             "MESSAGE_REACTION_REMOVE_ALL" => {
                 DispatchEvent::ReactionRemoveAll(ReactionRemoveAll::deserialize(deserializer)?)
             }
+            "MESSAGE_POLL_VOTE_ADD" => {
+                DispatchEvent::MessagePollVoteAdd(MessagePollVoteAdd::deserialize(deserializer)?)
+            }
+            "MESSAGE_POLL_VOTE_REMOVE" => DispatchEvent::MessagePollVoteRemove(
+                MessagePollVoteRemove::deserialize(deserializer)?,
+            ),
             "MESSAGE_UPDATE" => {
                 DispatchEvent::MessageUpdate(Box::new(MessageUpdate::deserialize(deserializer)?))
             }
             "PRESENCE_UPDATE" => {
                 DispatchEvent::PresenceUpdate(Box::new(PresenceUpdate::deserialize(deserializer)?))
             }
-            "PRESENCES_REPLACE" => {
-                deserializer.deserialize_ignored_any(IgnoredAny)?;
-
-                DispatchEvent::PresencesReplace
-            }
-            "READY" => DispatchEvent::Ready(Box::new(Ready::deserialize(deserializer)?)),
+            "RATE_LIMITED" => DispatchEvent::RateLimited(RateLimited::deserialize(deserializer)?),
+            "READY" => DispatchEvent::Ready(Ready::deserialize(deserializer)?),
             "RESUMED" => {
                 deserializer.deserialize_ignored_any(IgnoredAny)?;
 
@@ -426,26 +440,5 @@ impl<'de, 'a> DeserializeSeed<'de> for DispatchEventWithTypeDeserializer<'a> {
             }
             other => return Err(DeError::unknown_variant(other, &[])),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DispatchEvent, DispatchEventWithTypeDeserializer};
-    use serde::de::DeserializeSeed;
-    use serde_json::Deserializer;
-
-    #[test]
-    fn gift_code_update() {
-        // Input will be ignored so long as it's valid JSON.
-        let input = r#"{
-            "a": "b"
-        }"#;
-
-        let deserializer = DispatchEventWithTypeDeserializer::new("GIFT_CODE_UPDATE");
-        let mut json_deserializer = Deserializer::from_str(input);
-        let event = deserializer.deserialize(&mut json_deserializer).unwrap();
-
-        assert_eq!(event, DispatchEvent::GiftCodeUpdate);
     }
 }

@@ -1,25 +1,37 @@
-FROM rust:1.80-bookworm AS builder
+FROM rust:1.98.1-trixie AS builder
 
 WORKDIR /usr/build
 
-ENV RUSTFLAGS="-C target-cpu=haswell -A warnings"
+# Build the dependencies first so code changes don't rebuild every crate.
+COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
 
 COPY src ./src
-COPY vendor ./vendor
-COPY Cargo.lock Cargo.toml ./
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
-RUN apt update -y && apt upgrade -y && apt install -y g++ gcc cmake make
+FROM debian:trixie-slim
 
-RUN cargo build --release
-
-FROM debian:bookworm-slim
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/app
-
-RUN apt update -y && apt install -y ca-certificates libssl3
 
 ENV RUST_LOG=info
 
 COPY --from=builder /usr/build/target/release/twilight-dispatch /usr/app/twilight-dispatch
+
+# SIGTERM closes the shards resumably and saves their sessions. Give it time
+# (stop_grace_period in Swarm / Compose; Docker's default is 10s).
+STOPSIGNAL SIGTERM
+
+# Unhealthy only when a connected shard is stuck (see /healthcheck).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
+    CMD ["/usr/app/twilight-dispatch", "healthcheck"]
 
 ENTRYPOINT ["/usr/app/twilight-dispatch"]

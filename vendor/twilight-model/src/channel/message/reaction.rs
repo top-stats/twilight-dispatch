@@ -1,21 +1,30 @@
-use crate::id::{marker::EmojiMarker, Id};
+use crate::{
+    id::{Id, marker::EmojiMarker},
+    util::HexColor,
+};
 use serde::{Deserialize, Serialize};
 
 /// Reaction below a message.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Reaction {
+    /// HEX colors used for super reaction.
+    pub burst_colors: Vec<HexColor>,
     /// Amount of reactions this emoji has.
     pub count: u64,
+    /// Reaction count details for each type of reaction.
+    pub count_details: ReactionCountDetails,
     /// Emoji of this reaction.
-    pub emoji: ReactionType,
+    pub emoji: EmojiReactionType,
     /// Whether the current user has reacted with this emoji.
     pub me: bool,
+    /// Whether the current user super-reacted using this emoji
+    pub me_burst: bool,
 }
 
-/// Type of [`Reaction`].
+/// Type of emoji in a [`Reaction`].
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum ReactionType {
+pub enum EmojiReactionType {
     /// Custom [`Emoji`].
     ///
     /// [`Emoji`]: crate::guild::Emoji
@@ -34,7 +43,10 @@ pub enum ReactionType {
         // example if the emoji have been deleted off the guild.
         name: Option<String>,
     },
-    /// Standard [Unicode] emoji.
+    /// Standard [Unicode] emoji value.
+    ///
+    /// Unicode reactions must be specified by their unicode value, and *not*
+    /// their Discord display name. Instead of using `:arrow_right:`, use "➡️".
     ///
     /// [Unicode]: https://unicode.org/emoji/
     Unicode {
@@ -43,20 +55,35 @@ pub enum ReactionType {
     },
 }
 
+/// Breakdown of normal and super reaction counts for the associated emoji.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub struct ReactionCountDetails {
+    /// Count of super reactions.
+    pub burst: u64,
+    /// Count of normal reactions.
+    pub normal: u64,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Reaction, ReactionType};
-    use crate::id::Id;
+    use super::{EmojiReactionType, Reaction, ReactionCountDetails};
+    use crate::{id::Id, util::HexColor};
     use serde_test::Token;
 
     #[test]
     fn message_reaction_unicode() {
         let value = Reaction {
+            burst_colors: Vec::from([HexColor(255, 255, 255)]),
             count: 7,
-            emoji: ReactionType::Unicode {
+            count_details: ReactionCountDetails {
+                burst: 0,
+                normal: 7,
+            },
+            emoji: EmojiReactionType::Unicode {
                 name: "a".to_owned(),
             },
             me: true,
+            me_burst: false,
         };
 
         serde_test::assert_tokens(
@@ -64,13 +91,27 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Reaction",
-                    len: 3,
+                    len: 6,
                 },
+                Token::Str("burst_colors"),
+                Token::Seq { len: Some(1) },
+                Token::Str("#FFFFFF"),
+                Token::SeqEnd,
                 Token::Str("count"),
                 Token::U64(7),
+                Token::Str("count_details"),
+                Token::Struct {
+                    name: "ReactionCountDetails",
+                    len: 2,
+                },
+                Token::Str("burst"),
+                Token::U64(0),
+                Token::Str("normal"),
+                Token::U64(7),
+                Token::StructEnd,
                 Token::Str("emoji"),
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 1,
                 },
                 Token::Str("name"),
@@ -78,6 +119,8 @@ mod tests {
                 Token::StructEnd,
                 Token::Str("me"),
                 Token::Bool(true),
+                Token::Str("me_burst"),
+                Token::Bool(false),
                 Token::StructEnd,
             ],
         );
@@ -85,7 +128,7 @@ mod tests {
 
     #[test]
     fn custom() {
-        let value = ReactionType::Custom {
+        let value = EmojiReactionType::Custom {
             animated: false,
             id: Id::new(1337),
             name: Some("foo".to_owned()),
@@ -95,7 +138,7 @@ mod tests {
             &value,
             &[
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 3,
                 },
                 Token::Str("animated"),
@@ -132,7 +175,7 @@ mod tests {
 
     #[test]
     fn unicode() {
-        let value = ReactionType::Unicode {
+        let value = EmojiReactionType::Unicode {
             name: "\u{1f643}".to_owned(),
         };
 
@@ -140,7 +183,7 @@ mod tests {
             &value,
             &[
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 1,
                 },
                 Token::Str("name"),

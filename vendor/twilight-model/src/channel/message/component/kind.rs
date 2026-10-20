@@ -16,14 +16,67 @@ pub enum ComponentType {
     ///
     /// [`Button`]: super::Button
     Button,
-    /// Component is an [`SelectMenu`].
+    /// Component is a [`SelectMenu`] with custom string options.
     ///
     /// [`SelectMenu`]: super::SelectMenu
-    SelectMenu,
+    TextSelectMenu,
     /// Component is an [`TextInput`].
     ///
     /// [`TextInput`]: super::TextInput
     TextInput,
+    /// Component is a [`SelectMenu`] for users.
+    ///
+    /// [`SelectMenu`]: super::SelectMenu
+    UserSelectMenu,
+    /// Component is a [`SelectMenu`] for roles.
+    ///
+    /// [`SelectMenu`]: super::SelectMenu
+    RoleSelectMenu,
+    /// Component is a [`SelectMenu`] for mentionables.
+    ///
+    /// [`SelectMenu`]: super::SelectMenu
+    MentionableSelectMenu,
+    /// Component is a [`SelectMenu`] for channels.
+    ///
+    /// [`SelectMenu`]: super::SelectMenu
+    ChannelSelectMenu,
+    /// Component is a [`Container`] to display text alongside an accessory component.
+    ///
+    /// [`Container`]: super::Container
+    Section,
+    /// Component is a [`TextDisplay`] containing markdown text.
+    ///
+    /// [`TextDisplay`]: super::TextDisplay
+    TextDisplay,
+    /// Component is a [`Thumbnail`] that can be used as an accessory.
+    ///
+    /// [`Thumbnail`]: super::Thumbnail
+    Thumbnail,
+    /// Component is a [`MediaGallery`] that displays images and other media.
+    ///
+    /// [`MediaGallery`]: super::MediaGallery
+    MediaGallery,
+    /// Component is a [`FileDisplay`] that displays an attached file.
+    ///
+    /// [`FileDisplay`]: super::FileDisplay
+    File,
+    /// Component is a [`Separator`] that adds vertical padding between other components.
+    ///
+    /// [`Separator`]: super::Separator
+    Separator,
+    /// Component is a [`Container`] that visually groups a set of components.
+    ///
+    /// [`Container`]: super::Container
+    Container,
+    /// Component is a [`Label`] that provides a label and an optional description
+    /// for modal components.
+    ///
+    /// [`Label`]: super::Label
+    Label,
+    /// Component is a [`FileUpload`] that allows uploading files in modals.
+    ///
+    /// [`FileUpload`]: super::FileUpload
+    FileUpload,
     /// Variant value is unknown to the library.
     Unknown(u8),
 }
@@ -33,8 +86,21 @@ impl From<u8> for ComponentType {
         match value {
             1 => ComponentType::ActionRow,
             2 => ComponentType::Button,
-            3 => ComponentType::SelectMenu,
+            3 => ComponentType::TextSelectMenu,
             4 => ComponentType::TextInput,
+            5 => ComponentType::UserSelectMenu,
+            6 => ComponentType::RoleSelectMenu,
+            7 => ComponentType::MentionableSelectMenu,
+            8 => ComponentType::ChannelSelectMenu,
+            9 => ComponentType::Section,
+            10 => ComponentType::TextDisplay,
+            11 => ComponentType::Thumbnail,
+            12 => ComponentType::MediaGallery,
+            13 => ComponentType::File,
+            14 => ComponentType::Separator,
+            17 => ComponentType::Container,
+            18 => ComponentType::Label,
+            19 => ComponentType::FileUpload,
             unknown => ComponentType::Unknown(unknown),
         }
     }
@@ -45,8 +111,21 @@ impl From<ComponentType> for u8 {
         match value {
             ComponentType::ActionRow => 1,
             ComponentType::Button => 2,
-            ComponentType::SelectMenu => 3,
+            ComponentType::TextSelectMenu => 3,
             ComponentType::TextInput => 4,
+            ComponentType::UserSelectMenu => 5,
+            ComponentType::RoleSelectMenu => 6,
+            ComponentType::MentionableSelectMenu => 7,
+            ComponentType::ChannelSelectMenu => 8,
+            ComponentType::Section => 9,
+            ComponentType::TextDisplay => 10,
+            ComponentType::Thumbnail => 11,
+            ComponentType::MediaGallery => 12,
+            ComponentType::File => 13,
+            ComponentType::Separator => 14,
+            ComponentType::Container => 17,
+            ComponentType::Label => 18,
+            ComponentType::FileUpload => 19,
             ComponentType::Unknown(unknown) => unknown,
         }
     }
@@ -70,11 +149,24 @@ impl ComponentType {
     /// [`ActionRow`]: Self::ActionRow
     pub const fn name(self) -> &'static str {
         match self {
-            Self::ActionRow => "ActionRow",
-            Self::Button => "Button",
-            Self::SelectMenu => "SelectMenu",
-            Self::TextInput => "TextInput",
-            Self::Unknown(_) => "Unknown",
+            ComponentType::ActionRow => "ActionRow",
+            ComponentType::Button => "Button",
+            ComponentType::TextSelectMenu
+            | ComponentType::UserSelectMenu
+            | ComponentType::RoleSelectMenu
+            | ComponentType::MentionableSelectMenu
+            | ComponentType::ChannelSelectMenu => "SelectMenu",
+            ComponentType::TextInput => "TextInput",
+            ComponentType::Section => "Section",
+            ComponentType::TextDisplay => "TextDisplay",
+            ComponentType::Thumbnail => "Thumbnail",
+            ComponentType::MediaGallery => "MediaGallery",
+            ComponentType::File => "File",
+            ComponentType::Separator => "Separator",
+            ComponentType::Container => "Container",
+            ComponentType::Label => "Label",
+            ComponentType::FileUpload => "FileUpload",
+            ComponentType::Unknown(_) => "Unknown",
         }
     }
 }
@@ -88,7 +180,6 @@ impl Display for ComponentType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
     use serde_test::Token;
     use static_assertions::assert_impl_all;
     use std::{fmt::Debug, hash::Hash};
@@ -110,8 +201,20 @@ mod tests {
     fn variants() {
         serde_test::assert_tokens(&ComponentType::ActionRow, &[Token::U8(1)]);
         serde_test::assert_tokens(&ComponentType::Button, &[Token::U8(2)]);
-        serde_test::assert_tokens(&ComponentType::SelectMenu, &[Token::U8(3)]);
+        serde_test::assert_tokens(&ComponentType::TextSelectMenu, &[Token::U8(3)]);
         serde_test::assert_tokens(&ComponentType::TextInput, &[Token::U8(4)]);
+        serde_test::assert_tokens(&ComponentType::UserSelectMenu, &[Token::U8(5)]);
+        serde_test::assert_tokens(&ComponentType::RoleSelectMenu, &[Token::U8(6)]);
+        serde_test::assert_tokens(&ComponentType::MentionableSelectMenu, &[Token::U8(7)]);
+        serde_test::assert_tokens(&ComponentType::ChannelSelectMenu, &[Token::U8(8)]);
+        serde_test::assert_tokens(&ComponentType::Section, &[Token::U8(9)]);
+        serde_test::assert_tokens(&ComponentType::TextDisplay, &[Token::U8(10)]);
+        serde_test::assert_tokens(&ComponentType::Thumbnail, &[Token::U8(11)]);
+        serde_test::assert_tokens(&ComponentType::MediaGallery, &[Token::U8(12)]);
+        serde_test::assert_tokens(&ComponentType::File, &[Token::U8(13)]);
+        serde_test::assert_tokens(&ComponentType::Separator, &[Token::U8(14)]);
+        serde_test::assert_tokens(&ComponentType::Container, &[Token::U8(17)]);
+        serde_test::assert_tokens(&ComponentType::Label, &[Token::U8(18)]);
         serde_test::assert_tokens(&ComponentType::Unknown(99), &[Token::U8(99)]);
     }
 
@@ -119,8 +222,20 @@ mod tests {
     fn names() {
         assert_eq!("ActionRow", ComponentType::ActionRow.name());
         assert_eq!("Button", ComponentType::Button.name());
-        assert_eq!("SelectMenu", ComponentType::SelectMenu.name());
+        assert_eq!("SelectMenu", ComponentType::TextSelectMenu.name());
+        assert_eq!("SelectMenu", ComponentType::UserSelectMenu.name());
+        assert_eq!("SelectMenu", ComponentType::RoleSelectMenu.name());
+        assert_eq!("SelectMenu", ComponentType::MentionableSelectMenu.name());
+        assert_eq!("SelectMenu", ComponentType::ChannelSelectMenu.name());
         assert_eq!("TextInput", ComponentType::TextInput.name());
+        assert_eq!("Section", ComponentType::Section.name());
+        assert_eq!("TextDisplay", ComponentType::TextDisplay.name());
+        assert_eq!("Thumbnail", ComponentType::Thumbnail.name());
+        assert_eq!("MediaGallery", ComponentType::MediaGallery.name());
+        assert_eq!("File", ComponentType::File.name());
+        assert_eq!("Separator", ComponentType::Separator.name());
+        assert_eq!("Container", ComponentType::Container.name());
+        assert_eq!("Label", ComponentType::Label.name());
         assert_eq!("Unknown", ComponentType::Unknown(99).name());
     }
 }

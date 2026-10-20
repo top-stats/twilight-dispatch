@@ -1,52 +1,67 @@
 //! Textual user communication method.
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 
-pub mod allowed_mentions;
 pub mod component;
 pub mod embed;
 pub mod sticker;
 
 mod activity;
+mod allowed_mentions;
 mod application;
+mod call;
 mod flags;
 mod interaction;
 mod kind;
 mod mention;
+mod message_pin;
+mod pins_listing;
 mod reaction;
+mod reaction_type;
 mod reference;
+mod reference_type;
+mod role_subscription_data;
+mod snapshot;
 
 pub use self::{
     activity::{MessageActivity, MessageActivityType},
-    allowed_mentions::AllowedMentions,
+    allowed_mentions::{AllowedMentions, MentionType},
     application::MessageApplication,
+    call::MessageCall,
     component::Component,
     embed::Embed,
     flags::MessageFlags,
     interaction::MessageInteraction,
     kind::MessageType,
     mention::Mention,
-    reaction::{Reaction, ReactionType},
+    message_pin::MessagePin,
+    pins_listing::PinsListing,
+    reaction::{EmojiReactionType, Reaction, ReactionCountDetails},
+    reaction_type::ReactionType,
     reference::MessageReference,
-    sticker::Sticker,
+    reference_type::MessageReferenceType,
+    role_subscription_data::RoleSubscriptionData,
+    snapshot::MessageSnapshot,
+    sticker::{MessageSticker, Sticker},
 };
 
-use self::sticker::MessageSticker;
 use crate::{
+    application::interaction::InteractionMetadata,
     channel::{Attachment, Channel, ChannelMention},
     guild::PartialMember,
     id::{
+        Id,
         marker::{
             ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, RoleMarker, WebhookMarker,
         },
-        Id,
     },
+    poll::Poll,
     user::User,
     util::Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
 /// Text message sent in a [`Channel`].
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Message {
     /// Present with Rich Presence-related chat embeds.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +91,8 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     /// Author of the message.
     pub author: User,
+    /// The call associated with the message.
+    pub call: Option<MessageCall>,
     /// ID of the [`Channel`] the message was sent in.
     pub channel_id: Id<ChannelMarker>,
     /// List of provided components, such as buttons.
@@ -131,8 +148,13 @@ pub struct Message {
     /// Id of the message.
     pub id: Id<MessageMarker>,
     /// Interaction the message was sent as a response to.
+    #[deprecated(note = "use interaction_metadata instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction: Option<MessageInteraction>,
+    /// Contains metadata related to the interacting if the message is
+    /// sent as a result of an interaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_metadata: Option<Box<InteractionMetadata>>,
     /// Type of message.
     #[serde(rename = "type")]
     pub kind: MessageType,
@@ -155,8 +177,15 @@ pub struct Message {
     pub mention_roles: Vec<Id<RoleMarker>>,
     /// Users mentioned in the message.
     pub mentions: Vec<Mention>,
+    /// The message associated with the [`MessageReference`]. This is a minimal subset
+    /// of fields in a message (e.g. author is excluded.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_snapshots: Vec<MessageSnapshot>,
     /// Whether the message is pinned.
     pub pinned: bool,
+    /// The poll associated with the message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
     /// List of reactions to the message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
@@ -168,6 +197,14 @@ pub struct Message {
     /// [`reference`]: Self::reference
     #[serde(skip_serializing_if = "Option::is_none")]
     pub referenced_message: Option<Box<Message>>,
+    /// Information about the role subscription purchase or renewal that
+    /// prompted this message.
+    ///
+    /// Applies to [`RoleSubscriptionPurchase`] messages.
+    ///
+    /// [`RoleSubscriptionPurchase`]: MessageType::RoleSubscriptionPurchase
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_subscription_data: Option<RoleSubscriptionData>,
     /// Stickers within the message.
     #[serde(default)]
     pub sticker_items: Vec<MessageSticker>,
@@ -186,26 +223,29 @@ pub struct Message {
 #[cfg(test)]
 mod tests {
     use super::{
+        EmojiReactionType, Message, MessageActivity, MessageActivityType, MessageApplication,
+        MessageCall, MessageFlags, MessageReference, MessageType, Reaction,
+        reaction::ReactionCountDetails,
+        reference_type::MessageReferenceType,
         sticker::{MessageSticker, StickerFormatType},
-        Message, MessageActivity, MessageActivityType, MessageApplication, MessageFlags,
-        MessageReference, MessageType, Reaction, ReactionType,
     };
     use crate::{
         channel::{ChannelMention, ChannelType},
-        guild::PartialMember,
+        guild::{MemberFlags, PartialMember},
         id::Id,
         test::image_hash,
         user::User,
-        util::{datetime::TimestampParseError, Timestamp},
+        util::{Timestamp, datetime::TimestampParseError},
     };
     use serde_test::Token;
     use std::str::FromStr;
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     #[test]
     fn message_deserialization() {
-        let joined_at = Timestamp::from_str("2020-01-01T00:00:00.000000+00:00").unwrap();
+        let joined_at = Some(Timestamp::from_str("2020-01-01T00:00:00.000000+00:00").unwrap());
         let timestamp = Timestamp::from_micros(1_580_608_922_020_000).expect("non zero");
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let value = Message {
             activity: None,
@@ -215,20 +255,28 @@ mod tests {
             author: User {
                 accent_color: None,
                 avatar: Some(image_hash::AVATAR),
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: None,
                 bot: false,
                 discriminator: 1,
                 email: None,
                 flags: None,
+                global_name: Some("test".to_owned()),
                 id: Id::new(3),
                 locale: None,
                 mfa_enabled: None,
                 name: "test".to_owned(),
                 premium_type: None,
+                primary_guild: None,
                 public_flags: None,
                 system: None,
                 verified: None,
             },
+            call: Some(MessageCall {
+                ended_timestamp: None,
+                participants: Vec::new(),
+            }),
             channel_id: Id::new(2),
             components: Vec::new(),
             content: "ping".to_owned(),
@@ -241,8 +289,11 @@ mod tests {
             kind: MessageType::Regular,
             member: Some(PartialMember {
                 avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
                 communication_disabled_until: None,
                 deaf: false,
+                flags,
                 joined_at,
                 mute: false,
                 nick: Some("member nick".to_owned()),
@@ -255,9 +306,12 @@ mod tests {
             mention_everyone: false,
             mention_roles: Vec::new(),
             mentions: Vec::new(),
+            message_snapshots: Vec::new(),
             pinned: false,
+            poll: None,
             reactions: Vec::new(),
             reference: None,
+            role_subscription_data: None,
             sticker_items: vec![MessageSticker {
                 format_type: StickerFormatType::Png,
                 id: Id::new(1),
@@ -268,6 +322,7 @@ mod tests {
             thread: None,
             tts: false,
             webhook_id: None,
+            interaction_metadata: None,
         };
 
         serde_test::assert_tokens(
@@ -275,7 +330,7 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Message",
-                    len: 18,
+                    len: 19,
                 },
                 Token::Str("attachments"),
                 Token::Seq { len: Some(0) },
@@ -283,24 +338,43 @@ mod tests {
                 Token::Str("author"),
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::None,
                 Token::Str("bot"),
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("3"),
                 Token::Str("username"),
                 Token::Str("test"),
+                Token::StructEnd,
+                Token::Str("call"),
+                Token::Some,
+                Token::Struct {
+                    name: "MessageCall",
+                    len: 2,
+                },
+                Token::Str("ended_timestamp"),
+                Token::None,
+                Token::Str("participants"),
+                Token::Seq { len: Some(0) },
+                Token::SeqEnd,
                 Token::StructEnd,
                 Token::Str("channel_id"),
                 Token::NewtypeStruct { name: "Id" },
@@ -328,13 +402,16 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "PartialMember",
-                    len: 7,
+                    len: 8,
                 },
                 Token::Str("communication_disabled_until"),
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2020-01-01T00:00:00.000000+00:00"),
                 Token::Str("mute"),
                 Token::Bool(false),
@@ -381,12 +458,13 @@ mod tests {
         );
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     #[test]
     fn message_deserialization_complete() -> Result<(), TimestampParseError> {
         let edited_timestamp = Timestamp::from_str("2021-08-10T12:41:51.602000+00:00")?;
-        let joined_at = Timestamp::from_str("2020-01-01T00:00:00.000000+00:00")?;
+        let joined_at = Some(Timestamp::from_str("2020-01-01T00:00:00.000000+00:00")?);
         let timestamp = Timestamp::from_micros(1_580_608_922_020_000).expect("non zero");
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let value = Message {
             activity: Some(MessageActivity {
@@ -405,20 +483,25 @@ mod tests {
             author: User {
                 accent_color: None,
                 avatar: Some(image_hash::AVATAR),
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: None,
                 bot: false,
                 discriminator: 1,
                 email: None,
                 flags: None,
+                global_name: Some("test".to_owned()),
                 id: Id::new(3),
                 locale: None,
                 mfa_enabled: None,
                 name: "test".to_owned(),
                 premium_type: None,
+                primary_guild: None,
                 public_flags: None,
                 system: None,
                 verified: None,
             },
+            call: None,
             channel_id: Id::new(2),
             components: Vec::new(),
             content: "ping".to_owned(),
@@ -431,8 +514,11 @@ mod tests {
             kind: MessageType::Regular,
             member: Some(PartialMember {
                 avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
                 communication_disabled_until: None,
                 deaf: false,
+                flags,
                 joined_at,
                 mute: false,
                 nick: Some("member nick".to_owned()),
@@ -450,20 +536,30 @@ mod tests {
             mention_everyone: false,
             mention_roles: Vec::new(),
             mentions: Vec::new(),
+            message_snapshots: Vec::new(),
             pinned: false,
+            poll: None,
             reactions: vec![Reaction {
+                burst_colors: Vec::new(),
                 count: 7,
-                emoji: ReactionType::Unicode {
+                count_details: ReactionCountDetails {
+                    burst: 0,
+                    normal: 7,
+                },
+                emoji: EmojiReactionType::Unicode {
                     name: "a".to_owned(),
                 },
                 me: true,
+                me_burst: false,
             }],
             reference: Some(MessageReference {
                 channel_id: Some(Id::new(1)),
                 guild_id: None,
+                kind: MessageReferenceType::Default,
                 message_id: None,
                 fail_if_not_exists: None,
             }),
+            role_subscription_data: None,
             sticker_items: vec![MessageSticker {
                 format_type: StickerFormatType::Png,
                 id: Id::new(1),
@@ -474,6 +570,7 @@ mod tests {
             thread: None,
             tts: false,
             webhook_id: Some(Id::new(1)),
+            interaction_metadata: None,
         };
 
         serde_test::assert_tokens(
@@ -481,7 +578,7 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Message",
-                    len: 25,
+                    len: 26,
                 },
                 Token::Str("activity"),
                 Token::Some,
@@ -522,25 +619,34 @@ mod tests {
                 Token::Str("author"),
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::None,
                 Token::Str("bot"),
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("3"),
                 Token::Str("username"),
                 Token::Str("test"),
                 Token::StructEnd,
+                Token::Str("call"),
+                Token::None,
                 Token::Str("channel_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
@@ -568,13 +674,16 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "PartialMember",
-                    len: 7,
+                    len: 8,
                 },
                 Token::Str("communication_disabled_until"),
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2020-01-01T00:00:00.000000+00:00"),
                 Token::Str("mute"),
                 Token::Bool(false),
@@ -619,13 +728,26 @@ mod tests {
                 Token::Seq { len: Some(1) },
                 Token::Struct {
                     name: "Reaction",
-                    len: 3,
+                    len: 6,
                 },
+                Token::Str("burst_colors"),
+                Token::Seq { len: Some(0) },
+                Token::SeqEnd,
                 Token::Str("count"),
                 Token::U64(7),
+                Token::Str("count_details"),
+                Token::Struct {
+                    name: "ReactionCountDetails",
+                    len: 2,
+                },
+                Token::Str("burst"),
+                Token::U64(0),
+                Token::Str("normal"),
+                Token::U64(7),
+                Token::StructEnd,
                 Token::Str("emoji"),
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 1,
                 },
                 Token::Str("name"),
@@ -633,18 +755,22 @@ mod tests {
                 Token::StructEnd,
                 Token::Str("me"),
                 Token::Bool(true),
+                Token::Str("me_burst"),
+                Token::Bool(false),
                 Token::StructEnd,
                 Token::SeqEnd,
                 Token::Str("message_reference"),
                 Token::Some,
                 Token::Struct {
                     name: "MessageReference",
-                    len: 1,
+                    len: 2,
                 },
                 Token::Str("channel_id"),
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("1"),
+                Token::Str("type"),
+                Token::U8(0),
                 Token::StructEnd,
                 Token::Str("sticker_items"),
                 Token::Seq { len: Some(1) },

@@ -12,7 +12,18 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Unit and integration tests against Redis and LavinMQ, all in Docker.
+      - name: Run tests
+        run: scripts/test.sh
+
   build-and-push:
+    needs: test
     runs-on: self-hosted
     permissions:
       contents: read

@@ -30,8 +30,8 @@
 //!
 //! ```
 //! use twilight_model::id::{
-//!     marker::{GuildMarker, RoleMarker},
 //!     Id,
+//!     marker::{GuildMarker, RoleMarker},
 //! };
 //!
 //! // Often Rust's type inference will be able to infer the type of ID.
@@ -43,6 +43,10 @@
 
 pub mod marker;
 
+mod anonymizable;
+
+pub use anonymizable::AnonymizableId;
+
 use serde::{
     de::{Deserialize, Deserializer, Error as DeError, Unexpected, Visitor},
     ser::{Serialize, Serializer},
@@ -53,7 +57,7 @@ use std::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     hash::{Hash, Hasher},
     marker::PhantomData,
-    num::{NonZeroI64, NonZeroU64, ParseIntError, TryFromIntError},
+    num::{NonZero, ParseIntError, TryFromIntError},
     str::FromStr,
 };
 
@@ -73,12 +77,12 @@ use std::{
 /// [user]: marker::UserMarker
 #[repr(transparent)]
 pub struct Id<T> {
-    phantom: PhantomData<T>,
-    value: NonZeroU64,
+    phantom: PhantomData<fn(T) -> T>,
+    value: NonZero<u64>,
 }
 
 impl<T> Id<T> {
-    const fn from_nonzero(value: NonZeroU64) -> Self {
+    const fn from_nonzero(value: NonZero<u64>) -> Self {
         Self {
             phantom: PhantomData,
             value,
@@ -94,7 +98,7 @@ impl<T> Id<T> {
     /// # Examples
     ///
     /// ```
-    /// use twilight_model::id::{marker::GenericMarker, Id};
+    /// use twilight_model::id::{Id, marker::GenericMarker};
     ///
     /// const ID: Id<GenericMarker> = Id::new(123);
     ///
@@ -124,7 +128,7 @@ impl<T> Id<T> {
     /// The value must not be zero.
     #[allow(unsafe_code)]
     pub const unsafe fn new_unchecked(n: u64) -> Self {
-        Self::from_nonzero(NonZeroU64::new_unchecked(n))
+        Self::from_nonzero(unsafe { NonZero::new_unchecked(n) })
     }
 
     /// Create an ID if the provided value is not zero.
@@ -132,7 +136,7 @@ impl<T> Id<T> {
     /// # Examples
     ///
     /// ```
-    /// use twilight_model::id::{marker::GenericMarker, Id};
+    /// use twilight_model::id::{Id, marker::GenericMarker};
     ///
     /// assert!(Id::<GenericMarker>::new_checked(123).is_some());
     /// assert!(Id::<GenericMarker>::new_checked(0).is_none());
@@ -140,7 +144,7 @@ impl<T> Id<T> {
     ///
     /// Equivalent to [`NonZeroU64::new`].
     pub const fn new_checked(n: u64) -> Option<Self> {
-        if let Some(n) = NonZeroU64::new(n) {
+        if let Some(n) = NonZero::new(n) {
             Some(Self::from_nonzero(n))
         } else {
             None
@@ -156,7 +160,7 @@ impl<T> Id<T> {
     /// Create an ID with a value and then confirm its inner value:
     ///
     /// ```
-    /// use twilight_model::id::{marker::ChannelMarker, Id};
+    /// use twilight_model::id::{Id, marker::ChannelMarker};
     ///
     /// let channel_id = Id::<ChannelMarker>::new(7);
     ///
@@ -174,13 +178,13 @@ impl<T> Id<T> {
     ///
     /// ```
     /// use std::num::NonZeroU64;
-    /// use twilight_model::id::{marker::ChannelMarker, Id};
+    /// use twilight_model::id::{Id, marker::ChannelMarker};
     ///
     /// let channel_id = Id::<ChannelMarker>::new(7);
     ///
     /// assert_eq!(NonZeroU64::new(7).unwrap(), channel_id.into_nonzero());
     /// ```
-    pub const fn into_nonzero(self) -> NonZeroU64 {
+    pub const fn into_nonzero(self) -> NonZero<u64> {
         self.value
     }
 
@@ -192,8 +196,8 @@ impl<T> Id<T> {
     ///
     /// ```
     /// use twilight_model::id::{
-    ///     marker::{GuildMarker, RoleMarker},
     ///     Id,
+    ///     marker::{GuildMarker, RoleMarker},
     /// };
     ///
     /// let role_id: Id<RoleMarker> = Id::new(1);
@@ -208,7 +212,7 @@ impl<T> Id<T> {
 
 impl<T> Clone for Id<T> {
     fn clone(&self) -> Self {
-        Self::from_nonzero(self.value)
+        *self
     }
 }
 
@@ -222,12 +226,12 @@ impl<T> Debug for Id<T> {
         // `any::type_name` will usually provide an FQN, so we'll do our best
         // (and simplest) method here of removing it to only get the type name
         // itself.
-        if let Some(position) = type_name.rfind("::") {
-            if let Some(slice) = type_name.get(position + 2..) {
-                f.write_str("<")?;
-                f.write_str(slice)?;
-                f.write_str(">")?;
-            }
+        if let Some(position) = type_name.rfind("::")
+            && let Some(slice) = type_name.get(position + 2..)
+        {
+            f.write_str("<")?;
+            f.write_str(slice)?;
+            f.write_str(">")?;
         }
 
         f.write_str("(")?;
@@ -259,11 +263,19 @@ impl<'de, T> Deserialize<'de> for Id<T> {
             }
 
             fn visit_u64<E: DeError>(self, value: u64) -> Result<Self::Value, E> {
-                let value = NonZeroU64::new(value).ok_or_else(|| {
+                let value = NonZero::new(value).ok_or_else(|| {
                     DeError::invalid_value(Unexpected::Unsigned(value), &"non zero u64")
                 })?;
 
                 Ok(Id::from(value))
+            }
+
+            fn visit_i64<E: DeError>(self, value: i64) -> Result<Self::Value, E> {
+                let unsigned = u64::try_from(value).map_err(|_| {
+                    DeError::invalid_value(Unexpected::Signed(value), &"non zero u64")
+                })?;
+
+                self.visit_u64(unsigned)
             }
 
             fn visit_newtype_struct<D: Deserializer<'de>>(
@@ -300,13 +312,13 @@ impl<T> From<Id<T>> for u64 {
     }
 }
 
-impl<T> From<NonZeroU64> for Id<T> {
-    fn from(id: NonZeroU64) -> Self {
+impl<T> From<NonZero<u64>> for Id<T> {
+    fn from(id: NonZero<u64>) -> Self {
         Self::from_nonzero(id)
     }
 }
 
-impl<T> From<Id<T>> for NonZeroU64 {
+impl<T> From<Id<T>> for NonZero<u64> {
     fn from(id: Id<T>) -> Self {
         id.into_nonzero()
     }
@@ -316,7 +328,7 @@ impl<T> FromStr for Id<T> {
     type Err = ParseIntError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        NonZeroU64::from_str(s).map(Self::from_nonzero)
+        NonZero::from_str(s).map(Self::from_nonzero)
     }
 }
 
@@ -342,17 +354,13 @@ impl<T> PartialEq for Id<T> {
 
 impl<T> PartialEq<i64> for Id<T> {
     fn eq(&self, other: &i64) -> bool {
-        u64::try_from(*other)
-            .map(|v| v == self.value.get())
-            .unwrap_or_default()
+        u64::try_from(*other).is_ok_and(|v| v == self.value.get())
     }
 }
 
 impl<T> PartialEq<Id<T>> for i64 {
     fn eq(&self, other: &Id<T>) -> bool {
-        u64::try_from(*self)
-            .map(|v| v == other.value.get())
-            .unwrap_or_default()
+        u64::try_from(*self).is_ok_and(|v| v == other.value.get())
     }
 }
 
@@ -370,7 +378,7 @@ impl<T> PartialEq<Id<T>> for u64 {
 
 impl<T> PartialOrd for Id<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.value.partial_cmp(&other.value)
+        Some(self.cmp(other))
     }
 }
 
@@ -384,8 +392,8 @@ impl<T> TryFrom<i64> for Id<T> {
     type Error = TryFromIntError;
 
     fn try_from(value: i64) -> Result<Self, Self::Error> {
-        let signed_nonzero = NonZeroI64::try_from(value)?;
-        let unsigned_nonzero = NonZeroU64::try_from(signed_nonzero)?;
+        let signed_nonzero = NonZero::try_from(value)?;
+        let unsigned_nonzero = NonZero::try_from(signed_nonzero)?;
 
         Ok(Self::from_nonzero(unsigned_nonzero))
     }
@@ -395,7 +403,7 @@ impl<T> TryFrom<u64> for Id<T> {
     type Error = TryFromIntError;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
-        let nonzero = NonZeroU64::try_from(value)?;
+        let nonzero = NonZero::try_from(value)?;
 
         Ok(Self::from_nonzero(nonzero))
     }
@@ -404,12 +412,13 @@ impl<T> TryFrom<u64> for Id<T> {
 #[cfg(test)]
 mod tests {
     use super::{
+        Id,
         marker::{
             ApplicationMarker, AttachmentMarker, AuditLogEntryMarker, ChannelMarker, CommandMarker,
-            CommandVersionMarker, EmojiMarker, GenericMarker, GuildMarker, IntegrationMarker,
-            InteractionMarker, MessageMarker, RoleMarker, StageMarker, UserMarker, WebhookMarker,
+            CommandVersionMarker, EmojiMarker, EntitlementMarker, GenericMarker, GuildMarker,
+            IntegrationMarker, InteractionMarker, MessageMarker, RoleMarker,
+            RoleSubscriptionSkuMarker, SkuMarker, StageMarker, UserMarker, WebhookMarker,
         },
-        Id,
     };
     use serde::{Deserialize, Serialize};
     use serde_test::Token;
@@ -430,12 +439,15 @@ mod tests {
     assert_impl_all!(CommandMarker: Debug, Send, Sync);
     assert_impl_all!(CommandVersionMarker: Debug, Send, Sync);
     assert_impl_all!(EmojiMarker: Debug, Send, Sync);
+    assert_impl_all!(EntitlementMarker: Debug, Send, Sync);
+    assert_impl_all!(SkuMarker: Debug, Send, Sync);
     assert_impl_all!(GenericMarker: Debug, Send, Sync);
     assert_impl_all!(GuildMarker: Debug, Send, Sync);
     assert_impl_all!(IntegrationMarker: Debug, Send, Sync);
     assert_impl_all!(InteractionMarker: Debug, Send, Sync);
     assert_impl_all!(MessageMarker: Debug, Send, Sync);
     assert_impl_all!(RoleMarker: Debug, Send, Sync);
+    assert_impl_all!(RoleSubscriptionSkuMarker: Debug, Send, Sync);
     assert_impl_all!(StageMarker: Debug, Send, Sync);
     assert_impl_all!(UserMarker: Debug, Send, Sync);
     assert_impl_all!(WebhookMarker: Debug, Send, Sync);
@@ -444,6 +456,8 @@ mod tests {
         FromStr, Hash, Into<NonZeroU64>, Into<u64>, Ord, PartialEq, PartialEq<i64>, PartialEq<u64>, PartialOrd, Send, Serialize, Sync,
         TryFrom<i64>, TryFrom<u64>
     );
+    // assert invariant
+    assert_impl_all!(Id<*const ()>: Send, Sync);
 
     /// Test that various methods of initializing IDs are correct, such as via
     /// [`Id::new`] or [`Id`]'s [`TryFrom`] implementations.
@@ -489,10 +503,10 @@ mod tests {
     }
 
     /// Test that creating an ID via [`Id::new`] with a value of zero panics.
-    #[should_panic]
+    #[should_panic(expected = "value is zero")]
     #[test]
     const fn test_new_checked_zero() {
-        let _ = Id::<GenericMarker>::new(0);
+        _ = Id::<GenericMarker>::new(0);
     }
 
     /// Test that casting IDs maintains the original value.
@@ -646,6 +660,34 @@ mod tests {
             ],
         );
         serde_test::assert_tokens(
+            &Id::<EntitlementMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("114941315417899012"),
+            ],
+        );
+        serde_test::assert_de_tokens(
+            &Id::<EntitlementMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("114941315417899012"),
+            ],
+        );
+        serde_test::assert_tokens(
+            &Id::<SkuMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("114941315417899012"),
+            ],
+        );
+        serde_test::assert_de_tokens(
+            &Id::<SkuMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("114941315417899012"),
+            ],
+        );
+        serde_test::assert_tokens(
             &Id::<GenericMarker>::new(114_941_315_417_899_012),
             &[
                 Token::NewtypeStruct { name: "Id" },
@@ -730,6 +772,13 @@ mod tests {
             ],
         );
         serde_test::assert_tokens(
+            &Id::<RoleSubscriptionSkuMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("114941315417899012"),
+            ],
+        );
+        serde_test::assert_tokens(
             &Id::<StageMarker>::new(114_941_315_417_899_012),
             &[
                 Token::NewtypeStruct { name: "Id" },
@@ -769,6 +818,13 @@ mod tests {
             &[
                 Token::NewtypeStruct { name: "Id" },
                 Token::U64(114_941_315_417_899_012),
+            ],
+        );
+        serde_test::assert_de_tokens(
+            &Id::<WebhookMarker>::new(114_941_315_417_899_012),
+            &[
+                Token::NewtypeStruct { name: "Id" },
+                Token::I64(114_941_315_417_899_012),
             ],
         );
     }

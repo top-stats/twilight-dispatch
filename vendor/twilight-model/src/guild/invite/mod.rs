@@ -1,11 +1,13 @@
 mod channel;
 mod guild;
+mod invite_type;
 mod target_type;
 mod welcome_screen;
 
 pub use self::{
     channel::InviteChannel,
     guild::InviteGuild,
+    invite_type::InviteType,
     target_type::TargetType,
     welcome_screen::{WelcomeScreen, WelcomeScreenChannel},
 };
@@ -39,6 +41,8 @@ pub struct Invite {
     pub target_user: Option<User>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temporary: Option<bool>,
+    #[serde(rename = "type")]
+    pub kind: InviteType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uses: Option<u64>,
 }
@@ -46,12 +50,12 @@ pub struct Invite {
 #[cfg(test)]
 mod tests {
     use super::{
-        welcome_screen::WelcomeScreenChannel, Invite, InviteChannel, InviteGuild, TargetType, User,
-        WelcomeScreen,
+        Invite, InviteChannel, InviteGuild, InviteType, TargetType, User, WelcomeScreen,
+        welcome_screen::WelcomeScreenChannel,
     };
     use crate::{
         channel::ChannelType,
-        guild::VerificationLevel,
+        guild::{GuildFeature, VerificationLevel},
         id::Id,
         test::image_hash,
         util::datetime::{Timestamp, TimestampParseError},
@@ -109,6 +113,7 @@ mod tests {
             target_type: Some(TargetType::Stream),
             target_user: None,
             temporary: None,
+            kind: InviteType::Guild,
             uses: None,
         };
 
@@ -117,7 +122,7 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Invite",
-                    len: 5,
+                    len: 6,
                 },
                 Token::Str("approximate_member_count"),
                 Token::Some,
@@ -142,6 +147,8 @@ mod tests {
                 Token::Str("target_type"),
                 Token::Some,
                 Token::U8(1),
+                Token::Str("type"),
+                Token::U8(0),
                 Token::StructEnd,
             ],
         );
@@ -167,7 +174,7 @@ mod tests {
             guild: Some(InviteGuild {
                 banner: Some(image_hash::BANNER),
                 description: Some("a description".to_owned()),
-                features: vec!["a feature".to_owned()],
+                features: Vec::from([GuildFeature::Discoverable]),
                 icon: Some(image_hash::ICON),
                 id: Id::new(1),
                 name: "guild name".to_owned(),
@@ -196,16 +203,20 @@ mod tests {
             inviter: Some(User {
                 accent_color: None,
                 avatar: None,
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: None,
                 bot: false,
                 discriminator: 1,
                 email: None,
                 flags: None,
+                global_name: Some("test".to_owned()),
                 id: Id::new(2),
                 locale: None,
                 mfa_enabled: None,
                 name: "test".to_owned(),
                 premium_type: None,
+                primary_guild: None,
                 public_flags: None,
                 system: None,
                 verified: None,
@@ -216,21 +227,26 @@ mod tests {
             target_user: Some(User {
                 accent_color: None,
                 avatar: None,
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: None,
                 bot: false,
                 discriminator: 1,
                 email: None,
                 flags: None,
+                global_name: Some("test".to_owned()),
                 id: Id::new(2),
                 locale: None,
                 mfa_enabled: None,
                 name: "test".to_owned(),
                 premium_type: None,
+                primary_guild: None,
                 public_flags: None,
                 system: None,
                 verified: None,
             }),
             temporary: Some(false),
+            kind: InviteType::Guild,
             uses: Some(3),
         };
 
@@ -239,7 +255,7 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Invite",
-                    len: 14,
+                    len: 15,
                 },
                 Token::Str("approximate_member_count"),
                 Token::Some,
@@ -281,7 +297,7 @@ mod tests {
                 Token::Str("a description"),
                 Token::Str("features"),
                 Token::Seq { len: Some(1) },
-                Token::Str("a feature"),
+                Token::Str("DISCOVERABLE"),
                 Token::SeqEnd,
                 Token::Str("icon"),
                 Token::Some,
@@ -351,11 +367,15 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
+                Token::None,
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
                 Token::None,
                 Token::Str("banner"),
                 Token::None,
@@ -363,6 +383,9 @@ mod tests {
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
@@ -382,11 +405,15 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
+                Token::None,
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
                 Token::None,
                 Token::Str("banner"),
                 Token::None,
@@ -394,6 +421,9 @@ mod tests {
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
@@ -403,6 +433,8 @@ mod tests {
                 Token::Str("temporary"),
                 Token::Some,
                 Token::Bool(false),
+                Token::Str("type"),
+                Token::U8(0),
                 Token::Str("uses"),
                 Token::Some,
                 Token::U64(3),

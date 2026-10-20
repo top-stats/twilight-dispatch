@@ -3,10 +3,13 @@ use crate::{
         ActivityAssets, ActivityButton, ActivityEmoji, ActivityFlags, ActivityParty,
         ActivitySecrets, ActivityTimestamps, ActivityType,
     },
-    id::{marker::ApplicationMarker, Id},
+    id::{Id, marker::ApplicationMarker},
 };
 use serde::{Deserialize, Serialize};
 
+/// Discord sometimes sends `application_id: 0` (or `"0"`) for activities
+/// without an application, which a non-zero [`Id`] cannot represent. Treat
+/// zero and empty values as absent. (twilight-dispatch patch)
 fn deserialize_nullable_application_id<'de, D>(
     de: D,
 ) -> Result<Option<Id<ApplicationMarker>>, D::Error>
@@ -33,10 +36,7 @@ where
             Ok(None)
         }
 
-        fn visit_some<D: serde::Deserializer<'de>>(
-            self,
-            de: D,
-        ) -> Result<Self::Value, D::Error> {
+        fn visit_some<D: serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
             de.deserialize_any(NullableIdVisitor)
         }
 
@@ -45,11 +45,7 @@ where
         }
 
         fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
-            if v <= 0 {
-                Ok(None)
-            } else {
-                Ok(Id::new_checked(v as u64))
-            }
+            Ok(u64::try_from(v).ok().and_then(Id::new_checked))
         }
 
         fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -58,16 +54,13 @@ where
             }
             v.parse::<u64>()
                 .map(Id::new_checked)
-                .map_err(|_| E::custom(format!("invalid snowflake string: {}", v)))
-        }
-
-        fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
-            self.visit_str(&v)
+                .map_err(|_| E::custom(format!("invalid snowflake string: {v}")))
         }
     }
 
     de.deserialize_any(NullableIdVisitor)
 }
+
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Activity {
@@ -81,7 +74,8 @@ pub struct Activity {
     pub assets: Option<ActivityAssets>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<ActivityButton>,
-    // Introduced with custom statuses.
+    /// Unix timestamp of when the activity was added to the user's session, in
+    /// milliseconds.
     pub created_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
@@ -89,7 +83,6 @@ pub struct Activity {
     pub emoji: Option<ActivityEmoji>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flags: Option<ActivityFlags>,
-    // Introduced with custom statuses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,4 +105,5 @@ pub struct Activity {
 #[cfg(test)]
 mod tests {
     // Custom activities is tested by the custom presence test.
+    // The application_id patch is tested in twilight-dispatch (src/model_patches.rs).
 }

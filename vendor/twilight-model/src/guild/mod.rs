@@ -3,18 +3,17 @@
 //! [`Guild`]s allow, for example, assigning [`Role`]s to [`Member`]s to limit
 //! their [`Permissions`] globally, or per [`Channel`].
 //!
-//! Advanced user's may look inside the [`member`] module for custom
-//! [`Member`] deserializers.
-//!
 //! [`User`]: super::user::User
 
 pub mod audit_log;
 pub mod auto_moderation;
 pub mod invite;
-pub mod member;
+pub mod onboarding;
 pub mod scheduled_event;
 pub mod template;
+pub mod widget;
 
+mod afk_timeout;
 mod ban;
 mod default_message_notification_level;
 mod emoji;
@@ -25,6 +24,9 @@ mod integration;
 mod integration_account;
 mod integration_application;
 mod integration_expire_behavior;
+mod integration_type;
+mod member;
+mod member_flags;
 mod mfa_level;
 mod nsfw_level;
 mod partial_guild;
@@ -34,52 +36,53 @@ mod premium_tier;
 mod preview;
 mod prune;
 mod role;
+mod role_colors;
+mod role_flags;
+mod role_position;
 mod role_tags;
 mod system_channel_flags;
 mod unavailable_guild;
 mod vanity_url;
 mod verification_level;
-mod widget;
 
-// `Member` should appear inline, as the `member` module is only for advanced
-// use. Public documentation is not available for re-exports.
-#[doc(inline)]
-pub use self::member::Member;
+pub use self::nsfw_level::NSFWLevel;
+pub use self::permissions::Permissions;
 pub use self::{
-    ban::Ban, default_message_notification_level::DefaultMessageNotificationLevel, emoji::Emoji,
+    afk_timeout::AfkTimeout, ban::Ban,
+    default_message_notification_level::DefaultMessageNotificationLevel, emoji::Emoji,
     explicit_content_filter::ExplicitContentFilter, feature::GuildFeature, info::GuildInfo,
     integration::GuildIntegration, integration_account::IntegrationAccount,
     integration_application::IntegrationApplication,
-    integration_expire_behavior::IntegrationExpireBehavior, mfa_level::MfaLevel,
-    nsfw_level::NSFWLevel, partial_guild::PartialGuild, partial_member::PartialMember,
-    permissions::Permissions, premium_tier::PremiumTier, preview::GuildPreview, prune::GuildPrune,
-    role::Role, role_tags::RoleTags, system_channel_flags::SystemChannelFlags,
+    integration_expire_behavior::IntegrationExpireBehavior, integration_type::GuildIntegrationType,
+    member::Member, member_flags::MemberFlags, mfa_level::MfaLevel, partial_guild::PartialGuild,
+    partial_member::PartialMember, premium_tier::PremiumTier, preview::GuildPreview,
+    prune::GuildPrune, role::Role, role_colors::RoleColors, role_flags::RoleFlags,
+    role_position::RolePosition, role_tags::RoleTags, system_channel_flags::SystemChannelFlags,
     unavailable_guild::UnavailableGuild, vanity_url::VanityUrl,
     verification_level::VerificationLevel, widget::GuildWidget,
 };
 
-use self::member::MemberListDeserializer;
 use super::gateway::presence::PresenceListDeserializer;
 use crate::{
-    channel::{message::sticker::Sticker, Channel, StageInstance},
+    channel::{Channel, StageInstance, message::sticker::Sticker},
     gateway::presence::Presence,
     id::{
-        marker::{ApplicationMarker, ChannelMarker, GuildMarker, UserMarker},
         Id,
+        marker::{ApplicationMarker, ChannelMarker, GuildMarker, UserMarker},
     },
     util::{ImageHash, Timestamp},
     voice::VoiceState,
 };
 use serde::{
-    de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
     Deserialize, Serialize,
+    de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
 };
 use std::fmt::{Formatter, Result as FmtResult};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Hash)]
 pub struct Guild {
     pub afk_channel_id: Option<Id<ChannelMarker>>,
-    pub afk_timeout: u64,
+    pub afk_timeout: AfkTimeout,
     pub application_id: Option<Id<ApplicationMarker>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approximate_member_count: Option<u64>,
@@ -95,6 +98,9 @@ pub struct Guild {
     pub explicit_content_filter: ExplicitContentFilter,
     /// Enabled guild features
     pub features: Vec<GuildFeature>,
+    /// Scheduled guild events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guild_scheduled_events: Vec<scheduled_event::GuildScheduledEvent>,
     pub icon: Option<ImageHash>,
     pub id: Id<GuildMarker>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +110,9 @@ pub struct Guild {
     pub max_members: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_presences: Option<u64>,
+    /// Maximum number of users in a stage video channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_stage_video_channel_users: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_video_channel_users: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,8 +136,14 @@ pub struct Guild {
     pub premium_tier: PremiumTier,
     #[serde(default)]
     pub presences: Vec<Presence>,
+    /// ID of the where moderators of Community guilds receive notices from
+    /// Discord.
+    pub public_updates_channel_id: Option<Id<ChannelMarker>>,
     pub roles: Vec<Role>,
     pub rules_channel_id: Option<Id<ChannelMarker>>,
+    /// The ID of the channel where admins and moderators of Community guilds receive safety alerts from Discord.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_alerts_channel_id: Option<Id<ChannelMarker>>,
     pub splash: Option<ImageHash>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stage_instances: Vec<StageInstance>,
@@ -138,8 +153,15 @@ pub struct Guild {
     pub system_channel_id: Option<Id<ChannelMarker>>,
     #[serde(default)]
     pub threads: Vec<Channel>,
-    #[serde(default)]
-    pub unavailable: bool,
+    /// If the guild is unavailable.
+    ///
+    /// # Note:
+    ///
+    /// While it is not documented and may change in the future if
+    /// this field is not sent it is because the user joined a new
+    /// guild.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<bool>,
     pub vanity_url_code: Option<String>,
     pub verification_level: VerificationLevel,
     #[serde(default)]
@@ -169,12 +191,14 @@ impl<'de> Deserialize<'de> for Guild {
             Emojis,
             ExplicitContentFilter,
             Features,
+            GuildScheduledEvents,
             Icon,
             Id,
             JoinedAt,
             Large,
             MaxMembers,
             MaxPresences,
+            MaxStageVideoChannelUsers,
             MaxVideoChannelUsers,
             MemberCount,
             Members,
@@ -189,7 +213,9 @@ impl<'de> Deserialize<'de> for Guild {
             PremiumSubscriptionCount,
             PremiumTier,
             Presences,
+            PublicUpdatesChannelId,
             Roles,
+            SafetyAlertsChannelId,
             Splash,
             StageInstances,
             Stickers,
@@ -229,12 +255,14 @@ impl<'de> Deserialize<'de> for Guild {
                 let mut emojis = None;
                 let mut explicit_content_filter = None;
                 let mut features = None;
+                let mut guild_scheduled_events = None;
                 let mut icon = None::<Option<_>>;
                 let mut id = None;
                 let mut joined_at = None::<Option<_>>;
                 let mut large = None;
                 let mut max_members = None::<Option<_>>;
                 let mut max_presences = None::<Option<_>>;
+                let mut max_stage_video_channel_users = None::<Option<_>>;
                 let mut max_video_channel_users = None::<Option<_>>;
                 let mut member_count = None::<Option<_>>;
                 let mut members = None;
@@ -249,40 +277,29 @@ impl<'de> Deserialize<'de> for Guild {
                 let mut premium_subscription_count = None::<Option<_>>;
                 let mut premium_tier = None;
                 let mut presences = None;
+                let mut public_updates_channel_id = None::<Option<_>>;
                 let mut roles = None;
+                let mut rules_channel_id = None::<Option<_>>;
+                let mut safety_alerts_channel_id = None::<Option<_>>;
                 let mut splash = None::<Option<_>>;
                 let mut stage_instances = None::<Vec<StageInstance>>;
                 let mut stickers = None::<Vec<Sticker>>;
-                let mut system_channel_id = None::<Option<_>>;
                 let mut system_channel_flags = None;
+                let mut system_channel_id = None::<Option<_>>;
                 let mut threads = None::<Vec<Channel>>;
-                let mut rules_channel_id = None::<Option<_>>;
                 let mut unavailable = None;
+                let mut vanity_url_code = None::<Option<_>>;
                 let mut verification_level = None;
                 let mut voice_states = None::<Vec<VoiceState>>;
-                let mut vanity_url_code = None::<Option<_>>;
                 let mut widget_channel_id = None::<Option<_>>;
                 let mut widget_enabled = None::<Option<_>>;
 
-                let span = tracing::trace_span!("deserializing guild");
-                let _span_enter = span.enter();
-
                 loop {
-                    let span_child = tracing::trace_span!("iterating over element");
-                    let _span_child_enter = span_child.enter();
-
                     let key = match map.next_key() {
-                        Ok(Some(key)) => {
-                            tracing::trace!(?key, "found key");
-
-                            key
-                        }
+                        Ok(Some(key)) => key,
                         Ok(None) => break,
-                        Err(why) => {
-                            // Encountered when we run into an unknown key.
+                        Err(_) => {
                             map.next_value::<IgnoredAny>()?;
-
-                            tracing::trace!("ran into an unknown key: {why:?}");
 
                             continue;
                         }
@@ -382,6 +399,13 @@ impl<'de> Deserialize<'de> for Guild {
 
                             features = Some(map.next_value()?);
                         }
+                        Field::GuildScheduledEvents => {
+                            if guild_scheduled_events.is_some() {
+                                return Err(DeError::duplicate_field("guild_scheduled_events"));
+                            }
+
+                            guild_scheduled_events = Some(map.next_value()?);
+                        }
                         Field::Icon => {
                             if icon.is_some() {
                                 return Err(DeError::duplicate_field("icon"));
@@ -424,6 +448,15 @@ impl<'de> Deserialize<'de> for Guild {
 
                             max_presences = Some(map.next_value()?);
                         }
+                        Field::MaxStageVideoChannelUsers => {
+                            if max_stage_video_channel_users.is_some() {
+                                return Err(DeError::duplicate_field(
+                                    "max_stage_video_channel_users",
+                                ));
+                            }
+
+                            max_stage_video_channel_users = Some(map.next_value()?);
+                        }
                         Field::MaxVideoChannelUsers => {
                             if max_video_channel_users.is_some() {
                                 return Err(DeError::duplicate_field("max_video_channel_users"));
@@ -443,9 +476,7 @@ impl<'de> Deserialize<'de> for Guild {
                                 return Err(DeError::duplicate_field("members"));
                             }
 
-                            let deserializer = MemberListDeserializer::new(Id::new(1));
-
-                            members = Some(map.next_value_seed(deserializer)?);
+                            members = Some(map.next_value()?);
                         }
                         Field::MfaLevel => {
                             if mfa_level.is_some() {
@@ -528,12 +559,26 @@ impl<'de> Deserialize<'de> for Guild {
 
                             presences = Some(map.next_value_seed(deserializer)?);
                         }
+                        Field::PublicUpdatesChannelId => {
+                            if public_updates_channel_id.is_some() {
+                                return Err(DeError::duplicate_field("public_updates_channel_id"));
+                            }
+
+                            public_updates_channel_id = Some(map.next_value()?);
+                        }
                         Field::Roles => {
                             if roles.is_some() {
                                 return Err(DeError::duplicate_field("roles"));
                             }
 
                             roles = Some(map.next_value()?);
+                        }
+                        Field::SafetyAlertsChannelId => {
+                            if safety_alerts_channel_id.is_some() {
+                                return Err(DeError::duplicate_field("safety_alerts_channel_id"));
+                            }
+
+                            safety_alerts_channel_id = Some(map.next_value()?);
                         }
                         Field::Splash => {
                             if splash.is_some() {
@@ -659,91 +704,38 @@ impl<'de> Deserialize<'de> for Guild {
                 let description = description.unwrap_or_default();
                 let discovery_splash = discovery_splash.unwrap_or_default();
                 let emojis = emojis.unwrap_or_default();
+                let guild_scheduled_events = guild_scheduled_events.unwrap_or_default();
                 let icon = icon.unwrap_or_default();
                 let large = large.unwrap_or_default();
                 let joined_at = joined_at.unwrap_or_default();
                 let max_members = max_members.unwrap_or_default();
                 let max_presences = max_presences.unwrap_or_default();
+                let max_stage_video_channel_users =
+                    max_stage_video_channel_users.unwrap_or_default();
                 let max_video_channel_users = max_video_channel_users.unwrap_or_default();
                 let member_count = member_count.unwrap_or_default();
-                let mut members = members.unwrap_or_default();
+                let members = members.unwrap_or_default();
                 let nsfw_level = nsfw_level.ok_or_else(|| DeError::missing_field("nsfw_level"))?;
                 let owner = owner.unwrap_or_default();
                 let permissions = permissions.unwrap_or_default();
                 let premium_subscription_count = premium_subscription_count.unwrap_or_default();
                 let premium_tier = premium_tier.unwrap_or_default();
                 let mut presences = presences.unwrap_or_default();
+                let public_updates_channel_id = public_updates_channel_id.unwrap_or_default();
                 let rules_channel_id = rules_channel_id.unwrap_or_default();
+                let safety_alerts_channel_id = safety_alerts_channel_id.unwrap_or_default();
                 let splash = splash.unwrap_or_default();
                 let stage_instances = stage_instances.unwrap_or_default();
                 let stickers = stickers.unwrap_or_default();
                 let system_channel_id = system_channel_id.unwrap_or_default();
                 let mut threads = threads.unwrap_or_default();
-                let unavailable = unavailable.unwrap_or_default();
                 let vanity_url_code = vanity_url_code.unwrap_or_default();
                 let mut voice_states = voice_states.unwrap_or_default();
                 let widget_channel_id = widget_channel_id.unwrap_or_default();
                 let widget_enabled = widget_enabled.unwrap_or_default();
 
-                tracing::trace!(
-                    ?afk_channel_id,
-                    %afk_timeout,
-                    ?application_id,
-                    ?approximate_member_count,
-                    ?approximate_presence_count,
-                    ?banner,
-                    ?channels,
-                    ?default_message_notifications,
-                    ?description,
-                    ?discovery_splash,
-                    ?emojis,
-                    ?explicit_content_filter,
-                    ?features,
-                    ?icon,
-                    %id,
-                    ?large,
-                    ?joined_at,
-                    ?max_members,
-                    ?max_presences,
-                    ?max_video_channel_users,
-                    ?member_count,
-                    ?members,
-                    ?mfa_level,
-                    %name,
-                    %owner_id,
-                    ?owner,
-                    ?permissions,
-                    ?preferred_locale,
-                    ?premium_progress_bar_enabled,
-                );
-
-                // Split in two due to generic impl only going up to 32.
-                tracing::trace!(
-                    ?premium_subscription_count,
-                    ?premium_tier,
-                    ?presences,
-                    ?rules_channel_id,
-                    ?roles,
-                    ?splash,
-                    ?stage_instances,
-                    ?stickers,
-                    ?system_channel_flags,
-                    ?system_channel_id,
-                    ?threads,
-                    ?unavailable,
-                    ?vanity_url_code,
-                    ?voice_states,
-                    ?widget_channel_id,
-                    ?widget_enabled,
-                    ?verification_level,
-                );
-
                 for channel in &mut channels {
                     channel.guild_id = Some(id);
-                }
-
-                for member in &mut members {
-                    member.guild_id = id;
                 }
 
                 for presence in &mut presences {
@@ -772,12 +764,14 @@ impl<'de> Deserialize<'de> for Guild {
                     emojis,
                     explicit_content_filter,
                     features,
+                    guild_scheduled_events,
                     icon,
                     id,
                     joined_at,
                     large,
                     max_members,
                     max_presences,
+                    max_stage_video_channel_users,
                     max_video_channel_users,
                     member_count,
                     members,
@@ -792,8 +786,10 @@ impl<'de> Deserialize<'de> for Guild {
                     premium_subscription_count,
                     premium_tier,
                     presences,
+                    public_updates_channel_id,
                     roles,
                     rules_channel_id,
+                    safety_alerts_channel_id,
                     splash,
                     stage_instances,
                     stickers,
@@ -844,6 +840,7 @@ impl<'de> Deserialize<'de> for Guild {
             "premium_subscription_count",
             "premium_tier",
             "presences",
+            "public_updates_channel_id",
             "roles",
             "splash",
             "system_channel_id",
@@ -865,8 +862,8 @@ impl<'de> Deserialize<'de> for Guild {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultMessageNotificationLevel, ExplicitContentFilter, Guild, GuildFeature, MfaLevel,
-        NSFWLevel, Permissions, PremiumTier, SystemChannelFlags, VerificationLevel,
+        AfkTimeout, DefaultMessageNotificationLevel, ExplicitContentFilter, Guild, GuildFeature,
+        MfaLevel, NSFWLevel, Permissions, PremiumTier, SystemChannelFlags, VerificationLevel,
     };
     use crate::{
         id::Id,
@@ -879,11 +876,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn guild() -> Result<(), TimestampParseError> {
-        let joined_at = Timestamp::from_str("2015-04-26T06:26:56.936000+00:00")?;
+        let joined_at = Some(Timestamp::from_str("2015-04-26T06:26:56.936000+00:00")?);
 
         let value = Guild {
             afk_channel_id: Some(Id::new(2)),
-            afk_timeout: 900,
+            afk_timeout: AfkTimeout::FIFTEEN_MINUTES,
             application_id: Some(Id::new(3)),
             approximate_member_count: Some(1_200),
             approximate_presence_count: Some(900),
@@ -895,12 +892,14 @@ mod tests {
             emojis: Vec::new(),
             explicit_content_filter: ExplicitContentFilter::MembersWithoutRole,
             features: Vec::from([GuildFeature::Banner]),
+            guild_scheduled_events: Vec::new(),
             icon: Some(image_hash::ICON),
             id: Id::new(1),
-            joined_at: Some(joined_at),
+            joined_at,
             large: true,
             max_members: Some(25_000),
             max_presences: Some(10_000),
+            max_stage_video_channel_users: Some(10),
             max_video_channel_users: Some(10),
             member_count: Some(12_000),
             members: Vec::new(),
@@ -915,15 +914,17 @@ mod tests {
             premium_subscription_count: Some(3),
             premium_tier: PremiumTier::Tier1,
             presences: Vec::new(),
+            public_updates_channel_id: None,
             roles: Vec::new(),
             rules_channel_id: Some(Id::new(6)),
+            safety_alerts_channel_id: Some(Id::new(9)),
             splash: Some(image_hash::SPLASH),
             stage_instances: Vec::new(),
             stickers: Vec::new(),
             system_channel_flags: SystemChannelFlags::SUPPRESS_PREMIUM_SUBSCRIPTIONS,
             system_channel_id: Some(Id::new(7)),
             threads: Vec::new(),
-            unavailable: false,
+            unavailable: None,
             vanity_url_code: Some("twilight".to_owned()),
             verification_level: VerificationLevel::Medium,
             voice_states: Vec::new(),
@@ -936,14 +937,15 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Guild",
-                    len: 45,
+                    len: 47,
                 },
                 Token::Str("afk_channel_id"),
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
                 Token::Str("afk_timeout"),
-                Token::U64(900),
+                Token::NewtypeStruct { name: "AfkTimeout" },
+                Token::U16(900),
                 Token::Str("application_id"),
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
@@ -994,6 +996,9 @@ mod tests {
                 Token::Str("max_presences"),
                 Token::Some,
                 Token::U64(10_000),
+                Token::Str("max_stage_video_channel_users"),
+                Token::Some,
+                Token::U64(10),
                 Token::Str("max_video_channel_users"),
                 Token::Some,
                 Token::U64(10),
@@ -1030,6 +1035,8 @@ mod tests {
                 Token::Str("presences"),
                 Token::Seq { len: Some(0) },
                 Token::SeqEnd,
+                Token::Str("public_updates_channel_id"),
+                Token::None,
                 Token::Str("roles"),
                 Token::Seq { len: Some(0) },
                 Token::SeqEnd,
@@ -1037,6 +1044,10 @@ mod tests {
                 Token::Some,
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("6"),
+                Token::Str("safety_alerts_channel_id"),
+                Token::Some,
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("9"),
                 Token::Str("splash"),
                 Token::Some,
                 Token::Str(image_hash::SPLASH_INPUT),
@@ -1049,8 +1060,6 @@ mod tests {
                 Token::Str("threads"),
                 Token::Seq { len: Some(0) },
                 Token::SeqEnd,
-                Token::Str("unavailable"),
-                Token::Bool(false),
                 Token::Str("vanity_url_code"),
                 Token::Some,
                 Token::Str("twilight"),

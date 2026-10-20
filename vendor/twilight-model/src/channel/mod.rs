@@ -6,6 +6,7 @@ pub mod thread;
 pub mod webhook;
 
 mod attachment;
+mod attachment_flags;
 mod channel_mention;
 mod channel_type;
 mod flags;
@@ -14,6 +15,7 @@ mod video_quality_mode;
 
 pub use self::{
     attachment::Attachment,
+    attachment_flags::AttachmentFlags,
     channel_mention::ChannelMention,
     channel_type::ChannelType,
     flags::ChannelFlags,
@@ -26,15 +28,15 @@ pub use self::{
 
 use crate::{
     channel::{
-        forum::{DefaultReaction, ForumTag},
+        forum::{DefaultReaction, ForumLayout, ForumSortOrder, ForumTag},
         permission_overwrite::PermissionOverwrite,
         thread::{AutoArchiveDuration, ThreadMember, ThreadMetadata},
     },
     id::{
+        Id,
         marker::{
             ApplicationMarker, ChannelMarker, GenericMarker, GuildMarker, TagMarker, UserMarker,
         },
-        Id,
     },
     user::User,
     util::{ImageHash, Timestamp},
@@ -72,8 +74,14 @@ pub struct Channel {
     /// level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_auto_archive_duration: Option<AutoArchiveDuration>,
+    /// Default forum layout view used to display posts in forum channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_forum_layout: Option<ForumLayout>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_reaction_emoji: Option<DefaultReaction>,
+    /// Default sort order used to display posts in forum channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_sort_order: Option<ForumSortOrder>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_thread_rate_limit_per_user: Option<u16>,
     /// Flags of the channel.
@@ -105,6 +113,15 @@ pub struct Channel {
     /// ID of the last message pinned in the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_pin_timestamp: Option<Timestamp>,
+    /// Whether the channel is managed by an application via the [`gdm.join`]
+    /// oauth scope.
+    ///
+    /// This is only applicable to [group channels].
+    ///
+    /// [`gdm.join`]: crate::oauth::scope::GDM_JOIN
+    /// [group channels]: ChannelType::Group
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
     /// Member that created the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member: Option<ThreadMember>,
@@ -113,7 +130,7 @@ pub struct Channel {
     /// At most a value of 50 is provided although the real number may be
     /// higher.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub member_count: Option<u8>,
+    pub member_count: Option<i8>,
     /// Number of messages in the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_count: Option<u32>,
@@ -218,7 +235,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: None,
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(1)),
@@ -228,6 +247,7 @@ mod tests {
             kind: ChannelType::GuildText,
             last_message_id: Some(Id::new(3)),
             last_pin_timestamp: None,
+            managed: None,
             member: None,
             member_count: None,
             message_count: None,
@@ -258,7 +278,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: None,
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(2)),
@@ -268,6 +290,7 @@ mod tests {
             kind: ChannelType::GuildCategory,
             last_message_id: None,
             last_pin_timestamp: None,
+            managed: None,
             member: None,
             member_count: None,
             message_count: None,
@@ -310,7 +333,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: None,
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(2)),
@@ -320,6 +345,7 @@ mod tests {
             kind: ChannelType::GuildAnnouncement,
             last_message_id: Some(Id::new(4)),
             last_pin_timestamp: None,
+            managed: None,
             member: None,
             member_count: None,
             message_count: None,
@@ -369,7 +395,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: Some(AutoArchiveDuration::Hour),
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(1)),
@@ -379,6 +407,7 @@ mod tests {
             kind: ChannelType::AnnouncementThread,
             last_message_id: Some(Id::new(3)),
             last_pin_timestamp: None,
+            managed: Some(true),
             member: Some(ThreadMember {
                 flags: 0_u64,
                 id: Some(Id::new(4)),
@@ -387,7 +416,7 @@ mod tests {
                 presence: None,
                 user_id: Some(Id::new(5)),
             }),
-            member_count: Some(50_u8),
+            member_count: Some(50),
             message_count: Some(50),
             name: Some("newsthread".into()),
             newly_created: Some(true),
@@ -426,6 +455,7 @@ mod tests {
                     "user_id": "5",
                 },
                 "default_auto_archive_duration": 60,
+                "managed": true,
                 "member_count": 50,
                 "message_count": 50,
                 "name": "newsthread",
@@ -455,7 +485,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: Some(AutoArchiveDuration::Hour),
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(1)),
@@ -465,6 +497,7 @@ mod tests {
             kind: ChannelType::PublicThread,
             last_message_id: Some(Id::new(3)),
             last_pin_timestamp: None,
+            managed: Some(true),
             member: Some(ThreadMember {
                 flags: 0_u64,
                 id: Some(Id::new(4)),
@@ -473,7 +506,7 @@ mod tests {
                 presence: None,
                 user_id: Some(Id::new(5)),
             }),
-            member_count: Some(50_u8),
+            member_count: Some(50),
             message_count: Some(50),
             name: Some("publicthread".into()),
             newly_created: Some(true),
@@ -512,6 +545,7 @@ mod tests {
                     "user_id": "5",
                 },
                 "default_auto_archive_duration": 60,
+                "managed": true,
                 "member_count": 50,
                 "message_count": 50,
                 "name": "publicthread",
@@ -542,7 +576,9 @@ mod tests {
             available_tags: None,
             bitrate: None,
             default_auto_archive_duration: Some(AutoArchiveDuration::Hour),
+            default_forum_layout: None,
             default_reaction_emoji: None,
+            default_sort_order: None,
             default_thread_rate_limit_per_user: None,
             flags: None,
             guild_id: Some(Id::new(1)),
@@ -552,6 +588,7 @@ mod tests {
             kind: ChannelType::PrivateThread,
             last_message_id: Some(Id::new(3)),
             last_pin_timestamp: None,
+            managed: Some(true),
             member: Some(ThreadMember {
                 flags: 0_u64,
                 id: Some(Id::new(4)),
@@ -560,7 +597,9 @@ mod tests {
                 presence: None,
                 user_id: Some(Id::new(5)),
             }),
-            member_count: Some(50_u8),
+            // Old threads can have negative member counts, so we need to ensure
+            // we keep negative member counts around.
+            member_count: Some(-1),
             message_count: Some(50),
             name: Some("privatethread".into()),
             newly_created: Some(true),
@@ -605,7 +644,8 @@ mod tests {
                 },
                 "default_auto_archive_duration": 60,
                 "invitable": true,
-                "member_count": 50,
+                "managed": true,
+                "member_count": -1,
                 "message_count": 50,
                 "name": "privatethread",
                 "newly_created": true,

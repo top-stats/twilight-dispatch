@@ -1,13 +1,13 @@
 //! Limit who and where commands can be executed.
 
 use crate::id::{
+    Id,
     marker::{
         ApplicationMarker, ChannelMarker, CommandMarker, GenericMarker, GuildMarker, RoleMarker,
         UserMarker,
     },
-    Id,
 };
-use serde::{de::Deserializer, ser::Serializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer, ser::Serializer};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
 /// List of [`CommandPermission`]s for a command in a guild.
@@ -93,16 +93,11 @@ impl<'de> Deserialize<'de> for CommandPermission {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let data = CommandPermissionData::deserialize(deserializer)?;
 
-        let span = tracing::trace_span!("deserializing command permission");
-        let _span_enter = span.enter();
-
         let id = match data.kind {
             CommandPermissionDataType::Role => CommandPermissionType::Role(data.id.cast()),
             CommandPermissionDataType::User => CommandPermissionType::User(data.id.cast()),
             CommandPermissionDataType::Channel => CommandPermissionType::Channel(data.id.cast()),
         };
-
-        tracing::trace!(id = %data.id, kind = ?data.kind);
 
         Ok(Self {
             id,

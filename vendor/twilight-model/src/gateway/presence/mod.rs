@@ -22,16 +22,16 @@ pub use self::{
 
 use crate::{
     id::{
-        marker::{GuildMarker, UserMarker},
         Id,
+        marker::{GuildMarker, UserMarker},
     },
     user::User,
 };
 use serde::{
-    de::{
-        value::MapAccessDeserializer, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
-    },
     Deserialize, Serialize,
+    de::{
+        DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer,
+    },
 };
 use std::fmt::{Formatter, Result as FmtResult};
 
@@ -45,6 +45,7 @@ pub struct Presence {
     pub user: UserOrId,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum UserOrId {
@@ -180,7 +181,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn test_custom() {
+    fn custom() {
         let activity = Activity {
             application_id: None,
             assets: None,

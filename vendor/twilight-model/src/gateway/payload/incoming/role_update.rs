@@ -1,6 +1,6 @@
 use crate::{
     guild::Role,
-    id::{marker::GuildMarker, Id},
+    id::{Id, marker::GuildMarker},
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,10 @@ pub struct RoleUpdate {
 #[cfg(test)]
 mod tests {
     use super::{Role, RoleUpdate};
-    use crate::{guild::Permissions, id::Id};
+    use crate::{
+        guild::{Permissions, RoleColors, RoleFlags},
+        id::Id,
+    };
     use serde_test::Token;
 
     #[test]
@@ -21,7 +24,13 @@ mod tests {
         let value = RoleUpdate {
             guild_id: Id::new(1),
             role: Role {
+                #[allow(deprecated)]
                 color: 0,
+                colors: RoleColors {
+                    primary_color: 0,
+                    secondary_color: None,
+                    tertiary_color: None,
+                },
                 hoist: true,
                 icon: None,
                 id: Id::new(1),
@@ -30,6 +39,7 @@ mod tests {
                 name: "a role".to_owned(),
                 permissions: Permissions::SEND_MESSAGES,
                 position: 12,
+                flags: RoleFlags::empty(),
                 tags: None,
                 unicode_emoji: None,
             },
@@ -48,10 +58,22 @@ mod tests {
                 Token::Str("role"),
                 Token::Struct {
                     name: "Role",
-                    len: 8,
+                    len: 10,
                 },
                 Token::Str("color"),
                 Token::U32(0),
+                Token::Str("colors"),
+                Token::Struct {
+                    name: "RoleColors",
+                    len: 3,
+                },
+                Token::Str("primary_color"),
+                Token::U32(0),
+                Token::Str("secondary_color"),
+                Token::None,
+                Token::Str("tertiary_color"),
+                Token::None,
+                Token::StructEnd,
                 Token::Str("hoist"),
                 Token::Bool(true),
                 Token::Str("id"),
@@ -67,6 +89,8 @@ mod tests {
                 Token::Str("2048"),
                 Token::Str("position"),
                 Token::I64(12),
+                Token::Str("flags"),
+                Token::U64(0),
                 Token::StructEnd,
                 Token::StructEnd,
             ],

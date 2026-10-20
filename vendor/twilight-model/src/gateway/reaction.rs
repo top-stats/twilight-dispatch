@@ -1,172 +1,44 @@
 use crate::{
-    channel::message::ReactionType,
-    guild::member::{Member, MemberIntermediary},
+    channel::message::EmojiReactionType,
+    guild::Member,
     id::{
-        marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker},
         Id,
+        marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker},
     },
+    util::HexColor,
 };
-use serde::{
-    de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
-    Deserialize, Serialize,
-};
-use std::fmt::{Formatter, Result as FmtResult};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct GatewayReaction {
+    /// True if this is a super-reaction.
+    pub burst: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Colors used for super-reaction animation in hex format.
+    ///
+    /// This is only present when super-reactions are added.
+    pub burst_colors: Vec<HexColor>,
     pub channel_id: Id<ChannelMarker>,
-    pub emoji: ReactionType,
+    pub emoji: EmojiReactionType,
     pub guild_id: Option<Id<GuildMarker>>,
     pub member: Option<Member>,
+    /// ID of the user who authored the message which was reacted to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_author_id: Option<Id<UserMarker>>,
     pub message_id: Id<MessageMarker>,
     pub user_id: Id<UserMarker>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(field_identifier, rename_all = "snake_case")]
-enum Field {
-    ChannelId,
-    Emoji,
-    GuildId,
-    Member,
-    MessageId,
-    UserId,
-}
-
-struct ReactionVisitor;
-
-impl<'de> Visitor<'de> for ReactionVisitor {
-    type Value = GatewayReaction;
-
-    fn expecting(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.write_str("struct Reaction")
-    }
-
-    fn visit_map<V: MapAccess<'de>>(self, mut map: V) -> Result<Self::Value, V::Error> {
-        let mut channel_id = None;
-        let mut emoji = None;
-        let mut guild_id = None;
-        let mut member: Option<MemberIntermediary> = None;
-        let mut message_id = None;
-        let mut user_id = None;
-
-        let span = tracing::trace_span!("deserializing reaction");
-        let _span_enter = span.enter();
-
-        loop {
-            let span_child = tracing::trace_span!("iterating over element");
-            let _span_child_enter = span_child.enter();
-
-            let key = match map.next_key() {
-                Ok(Some(key)) => {
-                    tracing::trace!(?key, "found key");
-
-                    key
-                }
-                Ok(None) => break,
-                Err(why) => {
-                    // Encountered when we run into an unknown key.
-                    map.next_value::<IgnoredAny>()?;
-
-                    tracing::trace!("ran into an unknown key: {why:?}");
-
-                    continue;
-                }
-            };
-
-            match key {
-                Field::ChannelId => {
-                    if channel_id.is_some() {
-                        return Err(DeError::duplicate_field("channel_id"));
-                    }
-
-                    channel_id = Some(map.next_value()?);
-                }
-                Field::Emoji => {
-                    if emoji.is_some() {
-                        return Err(DeError::duplicate_field("emoji"));
-                    }
-
-                    emoji = Some(map.next_value()?);
-                }
-                Field::GuildId => {
-                    if guild_id.is_some() {
-                        return Err(DeError::duplicate_field("guild_id"));
-                    }
-
-                    guild_id = map.next_value()?;
-                }
-                Field::Member => {
-                    if member.is_some() {
-                        return Err(DeError::duplicate_field("member"));
-                    }
-
-                    member = map.next_value()?;
-                }
-                Field::MessageId => {
-                    if message_id.is_some() {
-                        return Err(DeError::duplicate_field("message_id"));
-                    }
-
-                    message_id = Some(map.next_value()?);
-                }
-                Field::UserId => {
-                    if user_id.is_some() {
-                        return Err(DeError::duplicate_field("user_id"));
-                    }
-
-                    user_id = Some(map.next_value()?);
-                }
-            }
-        }
-
-        let channel_id = channel_id.ok_or_else(|| DeError::missing_field("channel_id"))?;
-        let emoji = emoji.ok_or_else(|| DeError::missing_field("emoji"))?;
-        let message_id = message_id.ok_or_else(|| DeError::missing_field("message_id"))?;
-        let user_id = user_id.ok_or_else(|| DeError::missing_field("user_id"))?;
-
-        tracing::trace!(?channel_id, ?emoji, ?message_id, ?user_id);
-
-        let member = if let (Some(guild_id), Some(member)) = (guild_id, member) {
-            tracing::trace!(%guild_id, ?member, "setting member guild id");
-
-            Some(member.into_member(guild_id))
-        } else {
-            None
-        };
-
-        Ok(Self::Value {
-            channel_id,
-            emoji,
-            guild_id,
-            member,
-            message_id,
-            user_id,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for GatewayReaction {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const FIELDS: &[&str] = &[
-            "channel_id",
-            "emoji",
-            "guild_id",
-            "member",
-            "message_id",
-            "user_id",
-        ];
-
-        deserializer.deserialize_struct("GatewayReaction", FIELDS, ReactionVisitor)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GatewayReaction;
     use crate::{
-        channel::message::ReactionType, guild::Member, id::Id, test::image_hash, user::User,
-        util::Timestamp,
+        channel::message::EmojiReactionType,
+        guild::{Member, MemberFlags},
+        id::Id,
+        test::image_hash,
+        user::User,
+        util::{HexColor, Timestamp},
     };
     use serde_test::Token;
     use std::str::FromStr;
@@ -174,19 +46,28 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn reaction_with_member() {
-        let joined_at = Timestamp::from_str("2020-01-01T00:00:00.000000+00:00").unwrap();
+        let joined_at = Some(Timestamp::from_str("2020-01-01T00:00:00.000000+00:00").unwrap());
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
+        let burst_colors = ["#F200FF"];
 
         let value = GatewayReaction {
+            burst: true,
+            burst_colors: burst_colors
+                .iter()
+                .map(|c| HexColor::from_str(c).unwrap())
+                .collect(),
             channel_id: Id::new(2),
-            emoji: ReactionType::Unicode {
+            emoji: EmojiReactionType::Unicode {
                 name: "a".to_owned(),
             },
             guild_id: Some(Id::new(1)),
             member: Some(Member {
                 avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
                 communication_disabled_until: None,
                 deaf: false,
-                guild_id: Id::new(1),
+                flags,
                 joined_at,
                 mute: false,
                 nick: Some("typing".to_owned()),
@@ -196,21 +77,26 @@ mod tests {
                 user: User {
                     accent_color: None,
                     avatar: Some(image_hash::AVATAR),
+                    avatar_decoration: None,
+                    avatar_decoration_data: None,
                     banner: None,
                     bot: false,
                     discriminator: 1,
                     email: None,
                     flags: None,
+                    global_name: Some("test".to_owned()),
                     id: Id::new(4),
                     locale: None,
                     mfa_enabled: None,
                     name: "test".to_owned(),
                     premium_type: None,
+                    primary_guild: None,
                     public_flags: None,
                     system: None,
                     verified: None,
                 },
             }),
+            message_author_id: Some(Id::new(7)),
             message_id: Id::new(3),
             user_id: Id::new(4),
         };
@@ -220,14 +106,20 @@ mod tests {
             &[
                 Token::Struct {
                     name: "GatewayReaction",
-                    len: 6,
+                    len: 9,
                 },
+                Token::Str("burst"),
+                Token::Bool(true),
+                Token::Str("burst_colors"),
+                Token::Seq { len: Some(1) },
+                Token::Str(burst_colors[0]),
+                Token::SeqEnd,
                 Token::Str("channel_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
                 Token::Str("emoji"),
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 1,
                 },
                 Token::Str("name"),
@@ -247,10 +139,10 @@ mod tests {
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
-                Token::Str("guild_id"),
-                Token::NewtypeStruct { name: "Id" },
-                Token::Str("1"),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2020-01-01T00:00:00.000000+00:00"),
                 Token::Str("mute"),
                 Token::Bool(false),
@@ -267,19 +159,26 @@ mod tests {
                 Token::Str("user"),
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 10,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::None,
                 Token::Str("bot"),
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("4"),
@@ -287,6 +186,10 @@ mod tests {
                 Token::Str("test"),
                 Token::StructEnd,
                 Token::StructEnd,
+                Token::Str("message_author_id"),
+                Token::Some,
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("7"),
                 Token::Str("message_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("3"),
@@ -301,13 +204,16 @@ mod tests {
     #[test]
     fn reaction_without_member() {
         let value = GatewayReaction {
+            burst: false,
+            burst_colors: Vec::new(),
             channel_id: Id::new(2),
-            emoji: ReactionType::Unicode {
+            emoji: EmojiReactionType::Unicode {
                 name: "a".to_owned(),
             },
             guild_id: None,
             member: None,
             message_id: Id::new(3),
+            message_author_id: Some(Id::new(7)),
             user_id: Id::new(4),
         };
 
@@ -316,14 +222,16 @@ mod tests {
             &[
                 Token::Struct {
                     name: "GatewayReaction",
-                    len: 6,
+                    len: 8,
                 },
+                Token::Str("burst"),
+                Token::Bool(false),
                 Token::Str("channel_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("2"),
                 Token::Str("emoji"),
                 Token::Struct {
-                    name: "ReactionType",
+                    name: "EmojiReactionType",
                     len: 1,
                 },
                 Token::Str("name"),
@@ -333,6 +241,10 @@ mod tests {
                 Token::None,
                 Token::Str("member"),
                 Token::None,
+                Token::Str("message_author_id"),
+                Token::Some,
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("7"),
                 Token::Str("message_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("3"),

@@ -1,15 +1,21 @@
-use super::RoleTags;
+use super::RoleColors;
+use super::{RoleFlags, RoleTags};
 use crate::{
     guild::Permissions,
-    id::{marker::RoleMarker, Id},
+    id::{Id, marker::RoleMarker},
     util::image_hash::ImageHash,
 };
 use serde::{Deserialize, Serialize};
-use std::cmp::{Ord, Ordering, PartialOrd};
+use std::cmp::Ordering;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Role {
+    #[deprecated(
+        since = "0.17.0",
+        note = "Deprecated by Discord in favour for the new ``colors`` field."
+    )]
     pub color: u32,
+    pub colors: RoleColors,
     pub hoist: bool,
     /// Icon image hash.
     ///
@@ -27,6 +33,8 @@ pub struct Role {
     pub name: String,
     pub permissions: Permissions,
     pub position: i64,
+    /// Flags for this role.
+    pub flags: RoleFlags,
     /// Tags about the role.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<RoleTags>,
@@ -55,18 +63,25 @@ impl Ord for Role {
     /// Compare the position of two roles:
     ///
     /// ```
-    /// # use twilight_model::{guild::{Permissions, Role}, id::Id};
+    /// # use twilight_model::{guild::{Permissions, Role, RoleFlags}, id::Id};
     /// # use std::cmp::Ordering;
+    /// # use twilight_model::guild::RoleColors;
     /// let role_a = Role {
     ///     id: Id::new(123),
     ///     position: 12,
     /// #   color: 0,
+    /// #   colors: RoleColors {
+    /// #       primary_color: 0,
+    /// #       secondary_color: None,
+    /// #       tertiary_color: None,
+    /// #   },
     /// #   hoist: true,
     /// #   icon: None,
     /// #   managed: false,
     /// #   mentionable: true,
     /// #   name: "test".to_owned(),
     /// #   permissions: Permissions::ADMINISTRATOR,
+    /// #   flags: RoleFlags::empty(),
     /// #   tags: None,
     /// #   unicode_emoji: None,
     ///     // ...
@@ -74,13 +89,20 @@ impl Ord for Role {
     /// let role_b = Role {
     ///     id: Id::new(456),
     ///     position: 13,
+    /// #   #[allow(deprecated)]
     /// #   color: 0,
+    /// #   colors: RoleColors {
+    /// #       primary_color: 0,
+    /// #       secondary_color: None,
+    /// #       tertiary_color: None,
+    /// #   },
     /// #   hoist: true,
     /// #   icon: None,
     /// #   managed: false,
     /// #   mentionable: true,
     /// #   name: "test".to_owned(),
     /// #   permissions: Permissions::ADMINISTRATOR,
+    /// #   flags: RoleFlags::empty(),
     /// #   tags: None,
     /// #   unicode_emoji: None,
     ///     // ...
@@ -94,18 +116,25 @@ impl Ord for Role {
     /// Compare the position of two roles with the same position:
     ///
     /// ```
-    /// # use twilight_model::{guild::{Permissions, Role}, id::Id};
+    /// # use twilight_model::{guild::{Permissions, Role, RoleFlags}, id::Id};
     /// # use std::cmp::Ordering;
+    /// # use twilight_model::guild::RoleColors;
     /// let role_a = Role {
     ///     id: Id::new(123),
     ///     position: 12,
     /// #   color: 0,
+    /// #   colors: RoleColors {
+    /// #       primary_color: 0,
+    /// #       secondary_color: None,
+    /// #       tertiary_color: None,
+    /// #   },
     /// #   hoist: true,
     /// #   icon: None,
     /// #   managed: false,
     /// #   mentionable: true,
     /// #   name: "test".to_owned(),
     /// #   permissions: Permissions::ADMINISTRATOR,
+    /// #   flags: RoleFlags::empty(),
     /// #   tags: None,
     /// #   unicode_emoji: None,
     /// };
@@ -113,24 +142,30 @@ impl Ord for Role {
     ///     id: Id::new(456),
     ///     position: 12,
     /// #   color: 0,
+    /// #   colors: RoleColors {
+    /// #       primary_color: 0,
+    /// #       secondary_color: None,
+    /// #       tertiary_color: None,
+    /// #   },
     /// #   hoist: true,
     /// #   icon: None,
     /// #   managed: false,
     /// #   mentionable: true,
     /// #   name: "test".to_owned(),
     /// #   permissions: Permissions::ADMINISTRATOR,
+    /// #   flags: RoleFlags::empty(),
     /// #   tags: None,
     /// #   unicode_emoji: None,
     /// };
-    /// assert_eq!(Ordering::Less, role_a.cmp(&role_b));
-    /// assert_eq!(Ordering::Greater, role_b.cmp(&role_a));
+    /// assert_eq!(Ordering::Greater, role_a.cmp(&role_b));
+    /// assert_eq!(Ordering::Less, role_b.cmp(&role_a));
     /// assert_eq!(Ordering::Equal, role_a.cmp(&role_a));
     /// assert_eq!(Ordering::Equal, role_b.cmp(&role_b));
     /// ```
     fn cmp(&self, other: &Self) -> Ordering {
         self.position
             .cmp(&other.position)
-            .then(self.id.get().cmp(&other.id.get()))
+            .then(other.id.get().cmp(&self.id.get()))
     }
 }
 
@@ -142,15 +177,15 @@ impl PartialOrd for Role {
 
 #[cfg(test)]
 mod tests {
-    use super::{Permissions, Role};
-    use crate::id::Id;
+    use super::{Permissions, Role, RoleColors};
+    use crate::{guild::RoleFlags, id::Id};
     use serde::{Deserialize, Serialize};
     use serde_test::Token;
     use static_assertions::{assert_fields, assert_impl_all};
     use std::{fmt::Debug, hash::Hash};
-
     assert_fields!(
-        Role: color,
+        Role:
+        colors,
         hoist,
         icon,
         id,
@@ -176,7 +211,13 @@ mod tests {
     #[test]
     fn role() {
         let role = Role {
+            #[allow(deprecated)]
             color: 0,
+            colors: RoleColors {
+                primary_color: 0,
+                secondary_color: None,
+                tertiary_color: None,
+            },
             hoist: true,
             icon: None,
             id: Id::new(123),
@@ -185,6 +226,7 @@ mod tests {
             name: "test".to_owned(),
             permissions: Permissions::ADMINISTRATOR,
             position: 12,
+            flags: RoleFlags::IN_PROMPT,
             tags: None,
             unicode_emoji: None,
         };
@@ -194,10 +236,22 @@ mod tests {
             &[
                 Token::Struct {
                     name: "Role",
-                    len: 8,
+                    len: 10,
                 },
                 Token::Str("color"),
                 Token::U32(0),
+                Token::Str("colors"),
+                Token::Struct {
+                    name: "RoleColors",
+                    len: 3,
+                },
+                Token::Str("primary_color"),
+                Token::U32(0),
+                Token::Str("secondary_color"),
+                Token::None,
+                Token::Str("tertiary_color"),
+                Token::None,
+                Token::StructEnd,
                 Token::Str("hoist"),
                 Token::Bool(true),
                 Token::Str("id"),
@@ -213,6 +267,8 @@ mod tests {
                 Token::Str("8"),
                 Token::Str("position"),
                 Token::I64(12),
+                Token::Str("flags"),
+                Token::U64(1),
                 Token::StructEnd,
             ],
         );
