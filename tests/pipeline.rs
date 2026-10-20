@@ -1,30 +1,72 @@
 #![recursion_limit = "256"]
 
-//! Worker pipeline: cache first, then publish, per guild in order
-//! (set TEST_REDIS_URL).
+//! Worker pipeline: cache first, then publish, per guild in order; the Redis
+//! breaker (set TEST_REDIS_URL).
 
 mod common;
 
 use common::*;
+use redis::aio::ConnectionManager;
 use serde_json::{json, Value};
 use std::{
     sync::{atomic::AtomicBool, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use twilight_dispatch::{
     discord_log::DiscordLog,
     gateway::{
+        payload::Route,
         registry::{Registry, ShardHandle},
         runner::parse_event,
-        worker::{self, Breaker, Job, Publisher, WorkerContext},
+        worker::{self, Breaker, Job, Publisher, WorkerContext, BREAKER_COOLDOWN},
     },
-    metrics::GUILD_EVENTS,
+    metrics::{GUILD_EVENTS, STATE_UPDATE_ERRORS},
     models::ApiResult,
     util::Throttle,
 };
 
-/// CLIENT PAUSE affects the whole server, so these tests run one at a time.
+/// CLIENT PAUSE affects the whole server, and the tests compare metric
+/// counters, so these tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Pauses every client of the test Redis (CLIENT PAUSE ALL) until dropped.
+///
+/// It has its own blocking connection, so it can unpause from `Drop` (a failed
+/// assertion cannot leave the server paused for the next test) and does not
+/// depend on the connection under test. Redis postpones UNPAUSE itself until a
+/// PAUSE ALL is over, so dropping it waits for the end of the pause.
+struct Pause(redis::Connection);
+
+impl Pause {
+    fn all(duration: Duration) -> Self {
+        let url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL");
+        let mut conn = redis::Client::open(url)
+            .and_then(|client| client.get_connection())
+            .expect("connect to test redis");
+        conn.set_read_timeout(Some(duration + Duration::from_secs(5)))
+            .unwrap();
+        redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(duration.as_millis() as u64)
+            .arg("ALL")
+            .query::<()>(&mut conn)
+            .expect("pause test redis");
+        Self(conn)
+    }
+}
+
+impl Drop for Pause {
+    fn drop(&mut self) {
+        let unpaused = redis::cmd("CLIENT").arg("UNPAUSE").query::<()>(&mut self.0);
+        if let Err(err) = unpaused {
+            eprintln!("CLIENT UNPAUSE failed: {err}");
+        }
+    }
+}
+
+fn update_errors(reason: &str) -> u64 {
+    STATE_UPDATE_ERRORS.with_label_values(&[reason]).get()
+}
 
 #[derive(Default)]
 struct Recorder {
@@ -68,15 +110,15 @@ fn job(handle: &ShardHandle, kind: &str, seq: u64, d: Value, typed: bool) -> Job
     }
 }
 
-fn context(
-    conn: redis::aio::ConnectionManager,
+fn context<P>(
+    conn: ConnectionManager,
     registry: Arc<Registry>,
-    recorder: Arc<Recorder>,
+    publisher: Arc<P>,
     cache_timeout: Duration,
-) -> WorkerContext<redis::aio::ConnectionManager, Recorder> {
+) -> WorkerContext<ConnectionManager, P> {
     WorkerContext {
         redis: conn,
-        publisher: recorder,
+        publisher,
         registry,
         state: state_all(),
         bot_id: bot_id(),
@@ -197,35 +239,28 @@ async fn a_stalled_redis_does_not_hold_events_back() {
     let Some(mut conn) = redis(2).await else {
         return;
     };
-    let mut admin = conn.clone();
     let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
     let registry = Arc::new(Registry::new([handle.clone()]));
+    // Never touches Redis, so only the cache update can wait for it.
     let recorder = Arc::new(Recorder::default());
-    let ctx = context(
-        conn.clone(),
-        registry,
-        recorder.clone(),
-        Duration::from_millis(200),
-    );
+    let timeout = Duration::from_millis(200);
+    let ctx = context(conn.clone(), registry, recorder.clone(), timeout);
+    let (timeouts, skipped) = (update_errors("timeout"), update_errors("skipped"));
 
-    // Every other client's commands now hang for 2 s.
-    let _: () = redis::cmd("CLIENT")
-        .arg("PAUSE")
-        .arg(2000)
-        .arg("ALL")
-        .query_async(&mut admin)
-        .await
-        .unwrap();
-
-    let started = std::time::Instant::now();
+    let _pause = Pause::all(Duration::from_millis(1500));
+    let started = Instant::now();
     worker::process(
         &ctx,
         &mut conn,
         job(&handle, "GUILD_CREATE", 2, guild(1000, "g"), true),
     )
     .await;
+    assert!(started.elapsed() >= timeout, "{:?}", started.elapsed());
+    assert_eq!(update_errors("timeout") - timeouts, 1);
     assert!(!ctx.breaker.allow(), "a timeout opens the breaker");
+
     // Within the cooldown the next update is skipped instead of waiting again.
+    let started = Instant::now();
     worker::process(
         &ctx,
         &mut conn,
@@ -239,20 +274,110 @@ async fn a_stalled_redis_does_not_hold_events_back() {
     )
     .await;
     assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "{:?}",
+        started.elapsed() < timeout / 2,
+        "an open breaker must not wait for Redis: {:?}",
         started.elapsed()
     );
+    assert_eq!(update_errors("skipped") - skipped, 1);
+    assert_eq!(update_errors("timeout") - timeouts, 1);
 
     let published = recorder.published.lock().unwrap().clone();
     assert_eq!(published.len(), 2, "both events were still published");
+    assert!(
+        published
+            .iter()
+            .all(|(_, body, _)| body.get("old").is_none()),
+        "nothing was read from the cache"
+    );
     assert_eq!(handle.in_flight(), 0);
+}
 
-    let _: () = redis::cmd("CLIENT")
-        .arg("UNPAUSE")
-        .query_async(&mut admin)
+/// Every worker shares the breaker. After the cooldown one of them probes a
+/// stalled Redis while the others keep skipping; if every worker probed, each
+/// would wait for the timeout after every cooldown, and with it every event
+/// queued behind it.
+#[tokio::test]
+async fn a_stalled_redis_is_probed_by_one_worker_at_a_time() {
+    const WORKERS: usize = 8;
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(6).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let registry = Arc::new(Registry::new([handle.clone()]));
+    let recorder = Arc::new(Recorder::default());
+    let timeout = Duration::from_millis(250);
+    // One context, so one breaker, for every worker, as in production.
+    let ctx = Arc::new(context(conn.clone(), registry, recorder.clone(), timeout));
+    let (queues, workers) = worker::spawn(WORKERS, ctx.clone());
+    let guilds: Vec<u64> = (0..WORKERS)
+        .map(|w| {
+            (1000u64..)
+                .find(|&g| Route::Guild(g).worker(WORKERS) == w)
+                .unwrap()
+        })
+        .collect();
+
+    let pause = Duration::from_millis(3000);
+    let before = update_errors("timeout");
+    let paused = Pause::all(pause);
+    let started = Instant::now();
+    let (mut seq, mut opened, mut first_wave) = (1, None, None);
+    // A steady stream for every worker until the pause is over.
+    while started.elapsed() < pause + Duration::from_millis(200) {
+        for (worker, guild) in guilds.iter().enumerate() {
+            seq += 1;
+            let d = message(seq, guild + 3, Some(*guild), "x");
+            let job = job(&handle, "MESSAGE_CREATE", seq, d, true);
+            queues[worker].send(job).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        match opened {
+            None if !ctx.breaker.allow() => opened = Some(Instant::now()),
+            // Updates let through before the breaker opened have ended (they
+            // time out), and the first probe starts a cooldown after it.
+            Some(at) if first_wave.is_none() && at.elapsed() > timeout + timeout / 2 => {
+                first_wave = Some(update_errors("timeout") - before);
+            }
+            _ => {}
+        }
+    }
+    drop(paused);
+    let first_wave = first_wave.expect("the breaker opened");
+
+    // After the cooldown that follows the last probe, the next update probes
+    // a Redis that answers again and closes the breaker.
+    tokio::time::sleep(BREAKER_COOLDOWN + timeout).await;
+    seq += 1;
+    let last = format!("message:{}:{seq}", guilds[0] + 3);
+    let d = message(seq, guilds[0] + 3, Some(guilds[0]), "x");
+    queues[0]
+        .send(job(&handle, "MESSAGE_CREATE", seq, d, true))
         .await
         .unwrap();
+    drop(queues);
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    assert!(exists(&mut conn, &last).await, "the breaker closed again");
+    assert!(ctx.breaker.allow());
+
+    let probes = update_errors("timeout") - before - first_wave;
+    let cycles = pause
+        .as_millis()
+        .div_ceil((timeout + BREAKER_COOLDOWN).as_millis()) as u64;
+    assert!(
+        (1..=cycles + 1).contains(&probes),
+        "{probes} timeouts after the breaker opened (at most {} expected; \
+         {first_wave} before)",
+        cycles + 1
+    );
+    assert_eq!(
+        recorder.published.lock().unwrap().len(),
+        seq as usize - 1,
+        "every event was published"
+    );
+    assert_eq!(handle.in_flight(), 0);
 }
 
 #[tokio::test]

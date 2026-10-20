@@ -19,7 +19,7 @@ use redis::aio::ConnectionLike;
 use serde_json::Value;
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -75,28 +75,97 @@ impl Publisher for crate::amqp::Amqp {
 
 /// Skips cache updates for a short time after one failed, so a Redis outage
 /// does not make every event wait for a timeout.
+///
+/// After the cooldown one update probes Redis while the others keep skipping
+/// until it ends. Every worker shares the breaker: if all of them probed, a
+/// stalled Redis would block each one for the full timeout after every
+/// cooldown, and with it every event queued behind it.
 #[derive(Debug, Default)]
 pub struct Breaker {
-    open_until: Mutex<Option<Instant>>,
+    state: Mutex<BreakerState>,
+}
+
+#[derive(Debug, Default)]
+struct BreakerState {
+    open_until: Option<Instant>,
+    probing: bool,
+}
+
+impl BreakerState {
+    /// `Some(probe)` when an update may start at `now`: every update while
+    /// the breaker is closed, one probe once its cooldown is over.
+    fn admits(&self, now: Instant) -> Option<bool> {
+        match self.open_until {
+            None => Some(false),
+            Some(until) if now < until || self.probing => None,
+            Some(_) => Some(true),
+        }
+    }
 }
 
 impl Breaker {
+    /// Whether an update started now would go through.
     pub fn allow(&self) -> bool {
-        let Ok(open_until) = self.open_until.lock() else {
-            return true;
-        };
-        open_until.is_none_or(|until| Instant::now() >= until)
+        self.state().admits(Instant::now()).is_some()
+    }
+
+    /// Let one update through, or `None` to skip it.
+    pub fn permit(&self) -> Option<Permit<'_>> {
+        self.permit_at(Instant::now())
+    }
+
+    fn permit_at(&self, now: Instant) -> Option<Permit<'_>> {
+        let mut state = self.state();
+        let probe = state.admits(now)?;
+        state.probing |= probe;
+        Some(Permit {
+            breaker: self,
+            probe,
+        })
     }
 
     pub fn failure(&self) {
-        if let Ok(mut open_until) = self.open_until.lock() {
-            *open_until = Some(Instant::now() + BREAKER_COOLDOWN);
-        }
+        self.state().open_until = Some(Instant::now() + BREAKER_COOLDOWN);
     }
 
     pub fn success(&self) {
-        if let Ok(mut open_until) = self.open_until.lock() {
-            *open_until = None;
+        self.state().open_until = None;
+    }
+
+    fn state(&self) -> MutexGuard<'_, BreakerState> {
+        // Nothing panics while the lock is held, so the state is consistent.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// An update the breaker let through. Dropping it ends a probe however the
+/// update ended (an error that says nothing about the connection, or the
+/// update being cancelled), so the next update probes again instead of the
+/// breaker skipping every update from then on.
+#[must_use]
+pub struct Permit<'a> {
+    breaker: &'a Breaker,
+    probe: bool,
+}
+
+impl Permit<'_> {
+    /// Redis answered: close the breaker.
+    pub fn success(self) {
+        self.breaker.success();
+    }
+
+    /// Redis is unreachable or too slow: skip updates for the cooldown. The
+    /// breaker is reopened before the probe ends, so no other update can
+    /// start a probe in between.
+    pub fn failure(self) {
+        self.breaker.failure();
+    }
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        if self.probe {
+            self.breaker.state().probing = false;
         }
     }
 }
@@ -224,10 +293,10 @@ where
     C: ConnectionLike + Send,
     P: Publisher,
 {
-    if !ctx.breaker.allow() {
+    let Some(permit) = ctx.breaker.permit() else {
         STATE_UPDATE_ERRORS.with_label_values(&["skipped"]).inc();
         return None;
-    }
+    };
 
     let update_ctx = UpdateContext {
         state: &ctx.state,
@@ -236,12 +305,12 @@ where
     };
     match tokio::time::timeout(ctx.cache_timeout, cache::update(conn, event, &update_ctx)).await {
         Ok(Ok(outcome)) => {
-            ctx.breaker.success();
+            permit.success();
             Some(outcome)
         }
         Ok(Err(err)) => {
             if is_connection_error(&err) {
-                ctx.breaker.failure();
+                permit.failure();
             }
             STATE_UPDATE_ERRORS.with_label_values(&["error"]).inc();
             if let Some(suppressed) = ctx.cache_errors.check() {
@@ -255,7 +324,7 @@ where
             None
         }
         Err(_) => {
-            ctx.breaker.failure();
+            permit.failure();
             STATE_UPDATE_ERRORS.with_label_values(&["timeout"]).inc();
             if let Some(suppressed) = ctx.cache_errors.check() {
                 warn!(
@@ -357,6 +426,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::Poll;
+    use twilight_model::gateway::payload::incoming::MessageDelete;
 
     #[test]
     fn breaker_opens_after_failure_and_closes_on_success() {
@@ -366,6 +437,150 @@ mod tests {
         assert!(!breaker.allow());
         breaker.success();
         assert!(breaker.allow());
+    }
+
+    #[test]
+    fn one_update_probes_after_the_cooldown() {
+        let breaker = Breaker::default();
+        breaker.failure();
+        let until = breaker.state().open_until.unwrap();
+        assert!(breaker
+            .permit_at(until - Duration::from_millis(1))
+            .is_none());
+
+        let probe = breaker.permit_at(until).expect("one probe");
+        assert!(breaker.permit_at(until).is_none(), "the others skip");
+        // It ended without a verdict (an error about the event, or it was
+        // cancelled): the next update probes.
+        drop(probe);
+        let probe = breaker.permit_at(until).expect("the next probe");
+        assert!(breaker.permit_at(until).is_none());
+
+        probe.success();
+        let permits: Vec<_> = (0..3).map(|_| breaker.permit_at(until)).collect();
+        assert!(permits.iter().all(Option::is_some), "closed: every update");
+        drop(permits);
+
+        breaker.failure();
+        let until = breaker.state().open_until.unwrap();
+        breaker.permit_at(until).expect("a probe").failure();
+        assert!(!breaker.allow(), "a failed probe reopens the breaker");
+        assert!(!breaker.state().probing, "and ends");
+    }
+
+    /// A Redis connection that fails every command in one way.
+    #[derive(Clone, Copy, Debug)]
+    enum Fake {
+        /// Never answers, like a stalled or paused Redis.
+        Hang,
+        BrokenPipe,
+        /// An error about the command, not the connection (like WRONGTYPE).
+        Rejected,
+    }
+
+    impl Fake {
+        fn reply<'a, T: Send + 'a>(self) -> redis::RedisFuture<'a, T> {
+            Box::pin(async move {
+                Err(match self {
+                    Self::Hang => std::future::pending().await,
+                    Self::BrokenPipe => std::io::Error::from(std::io::ErrorKind::BrokenPipe).into(),
+                    Self::Rejected => (redis::ErrorKind::UnexpectedReturnType, "WRONGTYPE").into(),
+                })
+            })
+        }
+    }
+
+    impl ConnectionLike for Fake {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, redis::Value> {
+            self.reply()
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a redis::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+            self.reply()
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    struct Discard;
+
+    impl Publisher for Discard {
+        async fn publish(&self, _: &str, _: Vec<u8>, _: Option<String>) -> ApiResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A context whose breaker's cooldown is over, so the next update probes.
+    fn half_open(redis: Fake, cache_timeout: Duration) -> WorkerContext<Fake, Discard> {
+        let ctx = WorkerContext {
+            redis,
+            publisher: Arc::new(Discard),
+            registry: Arc::new(Registry::new(std::iter::empty())),
+            state: StateConfig {
+                enabled: true,
+                message: true,
+                ..StateConfig::default()
+            },
+            bot_id: Id::new(1),
+            cache_timeout,
+            discord: DiscordLog::disabled(),
+            breaker: Breaker::default(),
+            cache_errors: Throttle::default(),
+            publish_errors: Throttle::default(),
+        };
+        ctx.breaker.state().open_until = Some(Instant::now());
+        ctx
+    }
+
+    /// An event whose update always writes to Redis.
+    fn message_delete() -> Event {
+        Event::MessageDelete(MessageDelete {
+            channel_id: Id::new(1),
+            guild_id: None,
+            id: Id::new(2),
+        })
+    }
+
+    #[tokio::test]
+    async fn every_way_a_probe_ends_releases_it() {
+        let short = Duration::from_millis(10);
+        for (mut conn, reopens) in [
+            (Fake::BrokenPipe, true),
+            (Fake::Hang, true),
+            (Fake::Rejected, false),
+        ] {
+            let ctx = half_open(conn, short);
+            let outcome = update_cache(&ctx, &mut conn, &mut message_delete()).await;
+            assert!(outcome.is_none(), "{conn:?}");
+            let state = ctx.breaker.state();
+            assert!(!state.probing, "{conn:?} ends the probe");
+            assert_eq!(
+                state.open_until.unwrap() > Instant::now(),
+                reopens,
+                "{conn:?}"
+            );
+        }
+
+        // Dropped while it waits for Redis (the worker task was aborted).
+        let ctx = half_open(Fake::Hang, Duration::from_secs(60));
+        let (mut conn, mut event) = (Fake::Hang, message_delete());
+        let mut update = Box::pin(update_cache(&ctx, &mut conn, &mut event));
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(update.as_mut().poll(cx).is_pending())).await;
+        assert!(pending);
+        assert!(!ctx.breaker.allow(), "the update is the probe");
+        drop(update);
+        assert!(ctx.breaker.allow(), "dropping it ends the probe");
     }
 
     #[test]
