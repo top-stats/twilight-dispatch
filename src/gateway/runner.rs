@@ -228,6 +228,9 @@ struct Runner<C> {
     paused_at: Option<Instant>,
     /// While shutting down: when [`Runner::close`] has to be done.
     close_deadline: Option<tokio::time::Instant>,
+    /// Discord asked to reconnect (op 7 or 9) and that was counted then, so
+    /// the close that ends the connection is not counted again.
+    reconnect_counted: bool,
     parse_errors: Throttle,
     receive_errors: Throttle,
 }
@@ -254,6 +257,7 @@ pub async fn run<C>(
         held: VecDeque::new(),
         paused_at: None,
         close_deadline: None,
+        reconnect_counted: false,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
     };
@@ -352,6 +356,7 @@ where
         let code = frame.map(|(code, _)| code);
         self.handle.update(|s| s.close_code = code);
         SHARD_EVENTS.with_label_values(&["Disconnected"]).inc();
+        let counted = std::mem::take(&mut self.reconnect_counted);
         match code {
             Some(code) if is_fatal_close(code) => {
                 error!(
@@ -359,6 +364,8 @@ where
                     self.id, code
                 )
             }
+            // The close answering Discord's request (`reconnect_requested`).
+            _ if counted => {}
             _ => {
                 SHARD_EVENTS.with_label_values(&["Reconnecting"]).inc();
             }
@@ -429,15 +436,19 @@ where
             Prepared::Hello => {
                 info!("[Shard {}] Hello", self.id);
                 SHARD_EVENTS.with_label_values(&["Connecting"]).inc();
+                // A new connection; the last one's end is settled.
+                self.reconnect_counted = false;
             }
-            // twilight answers with a resumable close; the reconnect is
-            // counted once, for the close the gateway echoes (`on_close`).
-            Prepared::Reconnect => info!("[Shard {}] Reconnect requested by Discord", self.id),
+            Prepared::Reconnect => {
+                info!("[Shard {}] Reconnect requested by Discord", self.id);
+                self.reconnect_requested();
+            }
             Prepared::InvalidSession { resumable } => {
                 info!(
                     "[Shard {}] Invalid Session (resumable: {})",
                     self.id, resumable
-                )
+                );
+                self.reconnect_requested();
             }
             Prepared::Other => {}
             Prepared::Dispatch {
@@ -501,6 +512,17 @@ where
                 };
                 self.enqueue(worker, job);
             }
+        }
+    }
+
+    /// Count the reconnect Discord asked for when it asks. twilight answers
+    /// with a close of its own, and the gateway may drop the connection
+    /// instead of echoing it, which yields no close to count it by.
+    fn reconnect_requested(&mut self) {
+        // A shard that is shutting down does not reconnect.
+        if self.close_deadline.is_none() {
+            SHARD_EVENTS.with_label_values(&["Reconnecting"]).inc();
+            self.reconnect_counted = true;
         }
     }
 

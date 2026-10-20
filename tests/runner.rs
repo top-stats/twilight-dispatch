@@ -1830,6 +1830,74 @@ async fn a_reconnect_request_counts_one_reconnect() {
     running.stop().await;
 }
 
+/// As above when the gateway drops the connection instead of echoing
+/// twilight's close, which leaves the runner no close to count: the request
+/// itself is the one reconnect, and it is not mistaken for the next close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_request_counts_one_reconnect_when_the_connection_drops() {
+    let _metrics = METRICS.write().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    for (shard, op) in [(30, 7), (31, 9)] {
+        let fake = FakeDiscord::start().await;
+        let relay = Relay::start(&fake.gateway.url()).await;
+        let mut running = start(&relay.url(), shard, redis.clone(), Opts::default());
+        let mut conn = identified(&fake, shard, "A", QUIET).await;
+        running.recorder.wait_published(1).await;
+        let reconnecting = shard_events("Reconnecting");
+
+        relay.hold(true);
+        if op == 7 {
+            conn.reconnect().await;
+        } else {
+            conn.invalid_session(true).await;
+        }
+        relay.wait_held().await;
+        relay.cut();
+        conn.expect_gone().await;
+        // READY's resume URL is the gateway's own, not the cut relay.
+        let (conn, resume) = resumed(&fake).await;
+        assert_eq!(resume, resume_d("A", 1), "op {op}");
+        conn.resumed(2).await;
+        running.recorder.wait_published(2).await;
+        assert_eq!(shard_events("Reconnecting") - reconnecting, 1, "op {op}");
+        conn.close(4000, "").await;
+        let (_conn, resume) = resumed(&fake).await;
+        assert_eq!(resume, resume_d("A", 2), "op {op}");
+        assert_eq!(shard_events("Reconnecting") - reconnecting, 2, "op {op}");
+        running.stop().await;
+    }
+}
+
+/// A RECONNECT that arrives while shutting down is no reconnect: the shard
+/// stops instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_request_while_shutting_down_is_not_counted() {
+    let _metrics = METRICS.write().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 14;
+    let mut running = start(&relay.url(), shard, redis, Opts::default());
+    let mut conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_published(1).await;
+    let reconnecting = shard_events("Reconnecting");
+
+    relay.hold(true);
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    // Reaches the shard before the answer to its close can.
+    conn.reconnect().await;
+    relay.hold(false);
+    assert_eq!(conn.expect_close().await, Some(4000), "closed resumably");
+    running.join(CLOSE_TIMEOUT + Duration::from_secs(2)).await;
+    assert_eq!(shard_events("Reconnecting") - reconnecting, 0);
+    assert_eq!(fake.gateway.connections(), 1);
+}
+
 /// With STATE_ENABLED=false nothing is ever written to Redis: every test on
 /// `IDLE_DB` leaves it empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
