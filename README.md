@@ -30,8 +30,10 @@ Configuration is read from environment variables (or `.env`); see
 - Events of one guild are cached and published in order; a consumer that reads
   the cache after receiving an event sees that event applied.
 - Active threads are cached under `thread:<guild>:<thread>` (indexed in
-  `thread_keys`, `thread_keys:<guild>` and `guild_keys:<guild>`) and are also
-  kept in the guild blob's `threads`; `channel:` keys never hold threads.
+  `thread_keys`, `thread_keys:<guild>` and `guild_keys:<guild>`), the live
+  copy that thread events keep current; `channel:` keys never hold threads.
+  The guild blob's `threads` is the list from the guild's last GUILD_CREATE,
+  kept for compatibility as in earlier versions: thread events do not update it.
 - With several processes (different `SHARDS_START`/`SHARDS_END`), every
   process consumes `gateway.send`, runs commands for its own shards and
   forwards the others to the `gateway.send.shards` direct exchange (routing key:
