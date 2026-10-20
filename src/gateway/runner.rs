@@ -106,11 +106,11 @@ pub fn wants_typed(kind: &str, state: &StateConfig) -> bool {
 }
 
 /// Parse a raw gateway payload into a twilight event without copying it, the
-/// way [`prepare`] does. `Ok(None)` when it is not a gateway payload at all.
+/// way [`prepare`] does. A payload `prepare` calls malformed is an error too,
+/// so a caller cannot mistake broken input for a payload without an event;
+/// every payload that parses is an event, so it is never `Ok(None)`.
 pub fn parse_event(json: &str) -> Result<Option<Event>, String> {
-    let Ok(envelope) = Envelope::parse(json) else {
-        return Ok(None);
-    };
+    let envelope = Envelope::parse(json).map_err(|err| err.to_string())?;
     parse_typed(json, &envelope).map(Some)
 }
 
@@ -784,7 +784,18 @@ mod tests {
     fn bad_payloads_are_errors_not_panics() {
         let json = r#"{"t":"GUILD_ROLE_DELETE","s":5,"op":0,"d":{"guild_id":"x"}}"#;
         assert!(parse_event(json).is_err());
-        assert_eq!(parse_event("not json").unwrap_or(None), None);
+        // What `prepare` calls malformed: not JSON, cut off, without an op.
+        for json in [
+            "not json",
+            r#"{"t":"GUILD_ROLE_DELETE","s":5,"op":0,"d":{"guild_id":"1","role_id":"2""#,
+            r#"{"t":"GUILD_ROLE_DELETE","s":5,"d":{"guild_id":"1","role_id":"2"}}"#,
+        ] {
+            assert!(
+                matches!(prepare(json, &all_on()), Prepared::Malformed(_)),
+                "{json}"
+            );
+            assert!(parse_event(json).is_err(), "{json}");
+        }
     }
 
     /// The typed event is the one the envelope names, which is also the one
