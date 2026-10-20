@@ -1084,18 +1084,57 @@ async fn an_invalid_token_disables_every_channel() {
     assert_eq!(rest.posted().len(), 1, "{:?}", rest.posted());
 }
 
+/// twilight-http reports no status for an error whose body is not Discord's
+/// JSON error (a Cloudflare or proxy page), so the channel is paused for a
+/// while rather than disabled; the pause itself is unit-tested in
+/// discord_log.rs.
 #[tokio::test]
-#[ignore = "BUG: a 401/403/404 whose body is not Discord's JSON error (e.g. a Cloudflare or proxy HTML page) does not disable the log channel"]
 async fn permanent_errors_without_a_json_body_disable_the_channel() {
+    logs();
     let rest = FakeRest::start().await;
     rest.respond_with(SHARD_LOG, 403, "<html>Access denied</html>");
     let log = DiscordLog::new(rest.client(), SHARD_LOG, GUILD_LOG);
     log.shard(0, "rejected");
     log.shard(0, "not sent");
+    log.shard(0, "not sent either");
 
     let posted = rest.until_marker(&log).await;
-    let titles: Vec<&str> = posted.iter().map(title).collect();
-    assert_eq!(titles, ["rejected"], "a 403 disables the channel");
+    let lines: Vec<(&str, &str)> = posted.iter().map(|p| (p.path.as_str(), title(p))).collect();
+    let shards = messages_path(SHARD_LOG);
+    assert_eq!(
+        lines,
+        [(shards.as_str(), "rejected")],
+        "a 403 page stops the posts to that channel only"
+    );
+
+    // The same for an HTML 404, and for the guild channel.
+    let rest = FakeRest::start().await;
+    rest.respond_with(GUILD_LOG, 404, "<html>Not Found</html>");
+    let log = DiscordLog::new(rest.client(), SHARD_LOG, GUILD_LOG);
+    log.guild_join("a", 1);
+    rest.wait_for(1).await;
+    log.guild_join("b", 2);
+    log.shard(0, "shards still work");
+    let posted = rest.wait_for(2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(rest.posted().len(), 2, "{:?}", rest.posted());
+    assert_eq!(title(&posted[1]), "shards still work");
+}
+
+#[tokio::test]
+async fn an_invalid_token_without_a_json_body_disables_every_channel() {
+    let rest = FakeRest::start().await;
+    rest.respond_with(SHARD_LOG, 401, "<html>401 Authorization Required</html>");
+    let log = DiscordLog::new(rest.client(), SHARD_LOG, GUILD_LOG);
+    log.shard(0, "unauthorized");
+    rest.wait_for(1).await;
+    // twilight remembers a 401 whatever its body, and refuses every later
+    // request with this token.
+    log.guild_join("a", 1);
+    log.guild_join("b", 2);
+    log.shard(0, "c");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(rest.posted().len(), 1, "{:?}", rest.posted());
 }
 
 #[tokio::test]

@@ -2,15 +2,28 @@
 //! LOG_GUILD_CHANNEL).
 //!
 //! Messages go through one bounded queue that a single task drains, so a
-//! reconnect storm cannot spawn an unbounded number of REST calls. A channel
-//! that answers 401/403/404 is disabled, because repeated invalid requests
-//! count towards Discord's Cloudflare ban limit.
+//! reconnect storm cannot spawn an unbounded number of REST calls.
+//!
+//! Repeated invalid requests (401/403) count towards Discord's Cloudflare ban
+//! limit, so a channel that keeps rejecting posts is not posted to again:
+//! - A channel that answers 401/403/404 with Discord's JSON error is disabled.
+//!   After a 401 twilight refuses every request with the token, so the other
+//!   channel is disabled on its next message without another request.
+//! - twilight-http drops the status of an error response whose body is not
+//!   Discord's JSON error (an HTML page from Cloudflare or a proxy), so such a
+//!   response may be a 403 as well as a 502. Disabling the channel would lose
+//!   it for good after a passing outage, so it is paused instead: its messages
+//!   are dropped for a minute, and each further such response before a post
+//!   succeeds again doubles the pause, up to an hour.
+//!
+//! Any other failure (a 5xx with a JSON body, a timeout) only loses that
+//! message.
 
 use crate::constants::{JOIN_COLOR, LEAVE_COLOR};
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -23,6 +36,11 @@ use twilight_model::{
 };
 
 const QUEUE: usize = 256;
+/// The first pause of a channel after an error response without a status.
+const PAUSE_MIN: Duration = Duration::from_secs(60);
+/// The longest pause. A channel that answers every post with a 403 page then
+/// costs one request an hour, far from the ban limit (10,000 per 10 minutes).
+const PAUSE_MAX: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
@@ -40,11 +58,46 @@ pub struct DiscordLog {
     tx: Option<mpsc::Sender<Post>>,
 }
 
-struct Channels {
-    shards: Option<Id<ChannelMarker>>,
-    guilds: Option<Id<ChannelMarker>>,
-    shards_disabled: AtomicBool,
-    guilds_disabled: AtomicBool,
+/// What the posting task knows about one log channel.
+#[derive(Debug, Default)]
+struct ChannelState {
+    /// Set after a permanent error: nothing is posted any more.
+    disabled: bool,
+    /// Messages are dropped until then.
+    paused_until: Option<Instant>,
+    /// The next pause; a successful post resets it.
+    backoff: Duration,
+}
+
+impl ChannelState {
+    /// Whether a message may be posted now.
+    fn accepts(&self, now: Instant) -> bool {
+        !self.disabled && self.paused_until.is_none_or(|until| now >= until)
+    }
+
+    fn posted(&mut self) {
+        self.paused_until = None;
+        self.backoff = Duration::ZERO;
+    }
+
+    /// Pause after an error response without a status; returns for how long.
+    fn pause(&mut self, now: Instant) -> Duration {
+        let pause = self.backoff.clamp(PAUSE_MIN, PAUSE_MAX);
+        self.backoff = pause * 2;
+        self.paused_until = Some(now + pause);
+        pause
+    }
+}
+
+/// How a failed post affects its channel.
+#[derive(Debug, Eq, PartialEq)]
+enum Failure {
+    /// Will not go away by retrying the same channel: disable it.
+    Permanent,
+    /// An error response whose status is unknown: pause the channel.
+    Unknown,
+    /// Only this message is lost.
+    Transient,
 }
 
 impl DiscordLog {
@@ -54,38 +107,51 @@ impl DiscordLog {
     }
 
     pub fn new(client: Arc<Client>, log_channel: u64, log_guild_channel: u64) -> Self {
-        let channels = Arc::new(Channels {
-            shards: Id::new_checked(log_channel),
-            guilds: Id::new_checked(log_guild_channel),
-            shards_disabled: AtomicBool::new(false),
-            guilds_disabled: AtomicBool::new(false),
-        });
-        if channels.shards.is_none() && channels.guilds.is_none() {
+        let shards = Id::<ChannelMarker>::new_checked(log_channel);
+        let guilds = Id::<ChannelMarker>::new_checked(log_guild_channel);
+        if shards.is_none() && guilds.is_none() {
             return Self::disabled();
         }
 
         let (tx, mut rx) = mpsc::channel::<Post>(QUEUE);
         tokio::spawn(async move {
+            let mut shards = shards.map(|id| (id, ChannelState::default()));
+            let mut guilds = guilds.map(|id| (id, ChannelState::default()));
             while let Some(post) = rx.recv().await {
-                let (channel, disabled) = match post.target {
-                    Target::Shards => (channels.shards, &channels.shards_disabled),
-                    Target::Guilds => (channels.guilds, &channels.guilds_disabled),
+                let target = match post.target {
+                    Target::Shards => &mut shards,
+                    Target::Guilds => &mut guilds,
                 };
-                let Some(channel) = channel else { continue };
-                if disabled.load(Ordering::Relaxed) {
+                let Some((channel, state)) = target else {
+                    continue;
+                };
+                if !state.accepts(Instant::now()) {
                     continue;
                 }
                 let embeds = [post.embed];
-                if let Err(err) = client.create_message(channel).embeds(&embeds).await {
-                    if is_permanent(err.kind()) {
+                let err = match client.create_message(*channel).embeds(&embeds).await {
+                    Ok(_) => {
+                        state.posted();
+                        continue;
+                    }
+                    Err(err) => err,
+                };
+                match classify(err.kind()) {
+                    Failure::Permanent => {
                         error!(
                             "Disabling Discord log channel {} after a permanent error: {}",
                             channel, err
                         );
-                        disabled.store(true, Ordering::Relaxed);
-                    } else {
-                        warn!("Failed to post message to Discord: {}", err);
+                        state.disabled = true;
                     }
+                    Failure::Unknown => {
+                        let pause = state.pause(Instant::now());
+                        warn!(
+                            "Pausing Discord log channel {} for {:?} after an error: {}",
+                            channel, pause, err
+                        );
+                    }
+                    Failure::Transient => warn!("Failed to post message to Discord: {}", err),
                 }
             }
         });
@@ -138,12 +204,16 @@ fn now() -> Option<Timestamp> {
     Timestamp::from_secs(OffsetDateTime::now_utc().unix_timestamp()).ok()
 }
 
-/// Errors that will not go away by retrying the same channel.
-fn is_permanent(kind: &ErrorType) -> bool {
+fn classify(kind: &ErrorType) -> Failure {
     match kind {
-        ErrorType::Unauthorized => true,
-        ErrorType::Response { status, .. } => matches!(status.get(), 401 | 403 | 404),
-        _ => false,
+        ErrorType::Unauthorized => Failure::Permanent,
+        ErrorType::Response { status, .. } if matches!(status.get(), 401 | 403 | 404) => {
+            Failure::Permanent
+        }
+        // Only an error response (neither 2xx nor 429) whose body is not
+        // Discord's JSON error: twilight keeps its body but not its status.
+        ErrorType::Parsing { .. } => Failure::Unknown,
+        _ => Failure::Transient,
     }
 }
 
@@ -195,7 +265,54 @@ mod tests {
 
     #[test]
     fn unauthorized_is_permanent() {
-        assert!(is_permanent(&ErrorType::Unauthorized));
-        assert!(!is_permanent(&ErrorType::RequestTimedOut));
+        assert_eq!(classify(&ErrorType::Unauthorized), Failure::Permanent);
+        assert_eq!(classify(&ErrorType::RequestTimedOut), Failure::Transient);
+        assert_eq!(classify(&ErrorType::RequestError), Failure::Transient);
+    }
+
+    #[test]
+    fn error_responses_without_a_json_body_have_no_status() {
+        let html = ErrorType::Parsing {
+            body: b"<html>Access denied</html>".to_vec(),
+        };
+        assert_eq!(classify(&html), Failure::Unknown);
+    }
+
+    #[test]
+    fn pauses_double_up_to_an_hour_until_a_post_succeeds() {
+        let start = Instant::now();
+        let mut state = ChannelState::default();
+        assert!(state.accepts(start));
+
+        assert_eq!(state.pause(start), PAUSE_MIN);
+        assert!(!state.accepts(start));
+        assert!(!state.accepts(start + PAUSE_MIN - Duration::from_millis(1)));
+        assert!(state.accepts(start + PAUSE_MIN));
+
+        let mut now = start + PAUSE_MIN;
+        let mut minutes = Vec::new();
+        for _ in 0..8 {
+            let pause = state.pause(now);
+            minutes.push(pause.as_secs() / 60);
+            assert!(!state.accepts(now));
+            now += pause;
+            assert!(state.accepts(now));
+        }
+        assert_eq!(minutes, [2, 4, 8, 16, 32, 60, 60, 60]);
+
+        state.posted();
+        assert!(state.accepts(now));
+        assert_eq!(state.pause(now), PAUSE_MIN, "a successful post resets it");
+    }
+
+    #[test]
+    fn a_disabled_channel_never_accepts() {
+        let now = Instant::now();
+        let state = ChannelState {
+            disabled: true,
+            ..ChannelState::default()
+        };
+        assert!(!state.accepts(now));
+        assert!(!state.accepts(now + PAUSE_MAX * 24));
     }
 }
