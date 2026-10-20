@@ -1,4 +1,4 @@
-name: Build and Publish Docker Image
+name: CI
 
 on:
   push:
@@ -6,24 +6,81 @@ on:
       - main
     tags:
       - '*'
+  pull_request:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded pull request runs are cancelled; image builds always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Runs on GitHub-hosted runners so pull requests (including ones from forks
+  # of this public repository) never execute on the self-hosted runner.
   test:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+      lavinmq:
+        image: cloudamqp/lavinmq:2.10.1
+        ports:
+          - 5672:5672
+          - 15672:15672
+
+    env:
+      CARGO_TERM_COLOR: always
+      # Integration tests fail instead of skipping when a service is missing.
+      REQUIRE_SERVICES: '1'
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
+      TEST_AMQP_HTTP: 127.0.0.1:15672
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Unit and integration tests against Redis and LavinMQ, all in Docker.
-      - name: Run tests
-        run: scripts/test.sh
+      # Same toolchain as rust-toolchain.toml and the Docker image.
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Wait for Redis and LavinMQ
+        run: |
+          for port in 6379 5672 15672; do
+            for _ in $(seq 1 60); do
+              if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null || { echo "port $port is not reachable"; exit 1; }
+          done
+
+      - name: Test
+        run: cargo test --locked --no-fail-fast
 
   build-and-push:
     needs: test
+    # Only pushes publish an image; pull requests stop after the tests.
+    if: github.event_name == 'push'
     runs-on: self-hosted
     permissions:
       contents: read

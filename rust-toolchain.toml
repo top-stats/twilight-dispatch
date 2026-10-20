@@ -1,0 +1,5 @@
+[toolchain]
+# Same version as the Docker image (Dockerfile) and CI.
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

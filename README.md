@@ -46,7 +46,13 @@ scripts/test.sh
 
 Starts Redis and LavinMQ in Docker and runs `cargo fmt --check`, clippy and
 all unit and integration tests. Plain `cargo test` runs the unit tests and
-skips the integration tests unless `TEST_REDIS_URL` / `TEST_AMQP_URL` are set.
+skips the integration tests unless `TEST_REDIS_URL` / `TEST_AMQP_URL` are set
+(`REQUIRE_SERVICES=1` turns a missing service into a failure).
+
+CI (`.github/workflows/docker.yml`) runs the same checks on every push and
+pull request on GitHub-hosted runners, with Redis and LavinMQ as service
+containers; the image is only built and published (self-hosted runner) for
+pushes to `main` and tags, after the tests passed.
 
 ### Vendored crates
 
