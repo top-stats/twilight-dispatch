@@ -39,12 +39,22 @@ const SAVE_SHUTDOWN: Duration = Duration::from_secs(1);
 /// an older version is still running next to this one (rolling update).
 const LEGACY_EXPIRY_EVERY: u32 = 60;
 
+/// Run until SIGTERM / SIGINT.
 pub async fn run(config: Config) -> ApiResult<()> {
-    // Listen for SIGTERM / SIGINT right away: as PID 1 the process would
+    run_until(config, shutdown_signal()).await
+}
+
+/// Run until `shutdown` completes, then shut down gracefully (the shards are
+/// closed resumably and their sessions saved).
+pub async fn run_until(
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> ApiResult<()> {
+    // Listen for the shutdown right away: as PID 1 the process would
     // otherwise ignore SIGTERM until startup finished.
     let (stop_tx, mut stop_rx) = watch::channel(false);
     tokio::spawn(async move {
-        shutdown_signal().await;
+        shutdown.await;
         let _ = stop_tx.send(true);
     });
     let stopped = async move {
@@ -101,7 +111,7 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
 
     let amqp = Amqp::connect(config.amqp_url.clone(), config.default_queue).await?;
 
-    let http = Arc::new(Client::new(config.bot_token.clone()));
+    let http = Arc::new(http_client(&config));
     let user = http.current_user().await?.model().await?;
     info!("Logged in as {} ({})", user.name, user.id);
 
@@ -266,6 +276,15 @@ impl Started {
             Err(_) => warn!("Timed out saving sessions"),
         }
         self.amqp.close().await;
+    }
+}
+
+/// The Discord REST client, through `DISCORD_API_PROXY` when set.
+pub fn http_client(config: &Config) -> Client {
+    let builder = Client::builder().token(config.bot_token.clone());
+    match &config.discord_api_proxy {
+        Some(proxy) => builder.proxy(proxy.address.clone(), proxy.use_http).build(),
+        None => builder.build(),
     }
 }
 

@@ -1,0 +1,50 @@
+---
+source: tests/contract.rs
+expression: "config_with(&[])"
+---
+Config {
+    bot_token: "token",
+    shards: Some(
+        ShardRange {
+            start: 0,
+            end: 1,
+            total: 2,
+        },
+    ),
+    shards_concurrency: Some(
+        1,
+    ),
+    default_queue: true,
+    resume: true,
+    intents: Intents(
+        GUILDS | GUILD_MEMBERS | GUILD_MODERATION | GUILD_EMOJIS_AND_STICKERS | GUILD_INTEGRATIONS | GUILD_WEBHOOKS | GUILD_INVITES | GUILD_VOICE_STATES | GUILD_PRESENCES | GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | GUILD_MESSAGE_TYPING | DIRECT_MESSAGES | DIRECT_MESSAGE_REACTIONS | DIRECT_MESSAGE_TYPING,
+    ),
+    large_threshold: 250,
+    status: Online,
+    activity_type: Playing,
+    activity_name: "Testing",
+    activity_state: None,
+    activity_url: None,
+    log_channel: 0,
+    log_guild_channel: 0,
+    state: StateConfig {
+        enabled: true,
+        member: true,
+        member_ttl: 60000,
+        message: true,
+        message_ttl: 60000,
+        presence: true,
+        emoji: true,
+        voice: true,
+        old: false,
+    },
+    amqp_url: "amqp://guest:guest@127.0.0.1:5672/%2F?heartbeat=30",
+    redis_url: "redis://127.0.0.1:6379/0",
+    prometheus_host: "0.0.0.0",
+    prometheus_port: 8005,
+    workers: 32,
+    cache_timeout: 10s,
+    shard_silence: 180s,
+    discord_api_proxy: None,
+    discord_gateway_url: None,
+}

@@ -43,6 +43,37 @@ pub struct Config {
     pub cache_timeout: Duration,
     /// A shard that has received nothing for this long is reported unhealthy.
     pub shard_silence: Duration,
+    /// Send Discord REST requests to this proxy instead of discord.com
+    /// (e.g. twilight-http-proxy), as `http://host:port` or `https://host:port`.
+    pub discord_api_proxy: Option<DiscordProxy>,
+    /// Connect shards to this gateway URL instead of wss://gateway.discord.gg
+    /// (e.g. a gateway proxy). Resumes still go to Discord's resume URL.
+    pub discord_gateway_url: Option<String>,
+}
+
+/// A REST proxy address as twilight-http takes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordProxy {
+    /// `host:port`, without the scheme.
+    pub address: String,
+    /// Whether to talk plain HTTP to it.
+    pub use_http: bool,
+}
+
+impl DiscordProxy {
+    fn parse(value: &str) -> Option<Self> {
+        let (scheme, address) = value.trim().split_once("://")?;
+        let use_http = match scheme {
+            "http" => true,
+            "https" => false,
+            _ => return None,
+        };
+        let address = address.trim_end_matches('/');
+        (!address.is_empty() && !address.contains('/')).then(|| Self {
+            address: address.to_owned(),
+            use_http,
+        })
+    }
 }
 
 /// The part of the configuration the state cache needs.
@@ -285,6 +316,31 @@ impl Config {
             workers,
             cache_timeout: Duration::from_millis(cache_timeout_ms),
             shard_silence: Duration::from_secs(shard_silence_secs),
+            discord_api_proxy: match env.string("DISCORD_API_PROXY") {
+                Some(value) => {
+                    Some(
+                        DiscordProxy::parse(&value).ok_or_else(|| ConfigError::Invalid {
+                            name: "DISCORD_API_PROXY",
+                            value: value.clone(),
+                            reason: "expected http://host:port or https://host:port".into(),
+                        })?,
+                    )
+                }
+                None => None,
+            },
+            discord_gateway_url: match env.string("DISCORD_GATEWAY_URL") {
+                Some(url) if url.starts_with("ws://") || url.starts_with("wss://") => {
+                    Some(url.trim_end_matches('/').to_owned())
+                }
+                Some(url) => {
+                    return Err(ConfigError::Invalid {
+                        name: "DISCORD_GATEWAY_URL",
+                        value: url,
+                        reason: "expected a ws:// or wss:// URL".into(),
+                    })
+                }
+                None => None,
+            },
         })
     }
 
@@ -551,6 +607,46 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(config.workers, 32);
+    }
+
+    #[test]
+    fn discord_endpoints_can_be_overridden() {
+        let mut env = example_env();
+        let config = load(&env).unwrap();
+        assert_eq!(config.discord_api_proxy, None);
+        assert_eq!(config.discord_gateway_url, None);
+
+        env.insert("DISCORD_API_PROXY", "http://proxy:3000/".into());
+        env.insert("DISCORD_GATEWAY_URL", "ws://gateway:8080/".into());
+        let config = load(&env).unwrap();
+        assert_eq!(
+            config.discord_api_proxy,
+            Some(DiscordProxy {
+                address: "proxy:3000".into(),
+                use_http: true
+            })
+        );
+        assert_eq!(
+            config.discord_gateway_url.as_deref(),
+            Some("ws://gateway:8080")
+        );
+
+        env.insert("DISCORD_API_PROXY", "https://proxy".into());
+        assert!(!load(&env).unwrap().discord_api_proxy.unwrap().use_http);
+
+        for (name, value) in [
+            ("DISCORD_API_PROXY", "proxy:3000"),
+            ("DISCORD_API_PROXY", "ftp://proxy"),
+            ("DISCORD_API_PROXY", "http://proxy/path"),
+            ("DISCORD_GATEWAY_URL", "http://gateway"),
+        ] {
+            let mut env = example_env();
+            env.insert(name, value.into());
+            assert!(
+                matches!(load(&env), Err(ConfigError::Invalid { name: n, .. }) if n == name),
+                "{name}={value}"
+            );
+        }
     }
 
     #[test]

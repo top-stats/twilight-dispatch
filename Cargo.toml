@@ -34,6 +34,12 @@ twilight-gateway = { version = "0.17.1", default-features = false, features = ["
 twilight-http = { version = "0.17.1", default-features = false, features = ["rustls-webpki-roots", "decompression"] }
 twilight-model = { version = "0.17.1", default-features = false }
 
+[dev-dependencies]
+insta = { version = "1.49", default-features = false, features = ["json", "redactions"] }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+# Fake Discord gateway in the end-to-end tests (same version twilight uses).
+tokio-websockets = { version = "0.13.3", default-features = false, features = ["server"] }
+
 [profile.release]
 lto = "thin"
 panic = "abort"

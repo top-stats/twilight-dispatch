@@ -1,0 +1,44 @@
+---
+source: tests/contract.rs
+expression: "json!({\"stored\": stored, \"redis\": dump(&mut conn).await})"
+---
+{
+  "redis": {
+    "gateway_session:0": {
+      "ttl": "~10min",
+      "type": "string",
+      "value": {
+        "resume_url": "wss://gateway-us-east1-0.discord.gg",
+        "sequence": 42,
+        "session_id": "abc"
+      }
+    },
+    "gateway_session:2": {
+      "ttl": "~10min",
+      "type": "string",
+      "value": {
+        "sequence": 7,
+        "session_id": "def"
+      }
+    },
+    "gateway_sessions": {
+      "type": "string",
+      "value": {
+        "0": {
+          "resume_url": "wss://gateway-us-east1-0.discord.gg",
+          "sequence": 42,
+          "session_id": "abc"
+        },
+        "2": {
+          "sequence": 7,
+          "session_id": "def"
+        },
+        "5": {
+          "sequence": 9,
+          "session_id": "other-process"
+        }
+      }
+    }
+  },
+  "stored": 2
+}

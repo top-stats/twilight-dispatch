@@ -1,0 +1,39 @@
+---
+source: tests/contract.rs
+expression: bodies
+---
+[
+  {
+    "body": {
+      "status": "OK"
+    },
+    "case": "ok",
+    "raw": "{\"status\":\"OK\"}",
+    "status": 200
+  },
+  {
+    "body": {
+      "status": "OK",
+      "warnings": [
+        "not connected to the AMQP broker"
+      ]
+    },
+    "case": "warnings",
+    "raw": "{\"status\":\"OK\",\"warnings\":[\"not connected to the AMQP broker\"]}",
+    "status": 200
+  },
+  {
+    "body": {
+      "problems": [
+        "shard 3 is connected but received nothing for 600s"
+      ],
+      "status": "UNHEALTHY",
+      "warnings": [
+        "shard 1 was closed by Discord with a non-reconnectable code (4014)"
+      ]
+    },
+    "case": "problems",
+    "raw": "{\"problems\":[\"shard 3 is connected but received nothing for 600s\"],\"status\":\"UNHEALTHY\",\"warnings\":[\"shard 1 was closed by Discord with a non-reconnectable code (4014)\"]}",
+    "status": 503
+  }
+]

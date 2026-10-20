@@ -1,0 +1,138 @@
+---
+source: tests/contract.rs
+expression: families
+---
+[
+  {
+    "labels": [],
+    "name": "amqp_connected",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "amqp_publish_failures",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [],
+    "name": "amqp_reconnects",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "result",
+      "shard"
+    ],
+    "name": "gateway_commands",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "shard",
+      "type"
+    ],
+    "name": "gateway_events",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_guild_events",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_latencies",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_parse_errors",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_shard_events",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_shard_fatal",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_shard_silence_seconds",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "gateway_shards",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_statuses",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_channels",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_emojis",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_guilds",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_members",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_messages",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_presences",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [],
+    "name": "state_roles",
+    "type": "GAUGE"
+  },
+  {
+    "labels": [
+      "reason"
+    ],
+    "name": "state_update_errors",
+    "type": "COUNTER"
+  },
+  {
+    "labels": [],
+    "name": "state_voices",
+    "type": "GAUGE"
+  }
+]

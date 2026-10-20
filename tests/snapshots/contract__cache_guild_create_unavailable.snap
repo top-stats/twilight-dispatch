@@ -1,0 +1,31 @@
+---
+source: tests/contract.rs
+expression: contract
+---
+{
+  "events": [
+    {
+      "event": "GUILD_CREATE",
+      "outcome": {
+        "guild_known": false,
+        "old": null,
+        "previous_guild": null
+      }
+    }
+  ],
+  "redis": {
+    "guild:2000": {
+      "type": "string",
+      "value": {
+        "id": "2000",
+        "unavailable": true
+      }
+    },
+    "guild_keys": {
+      "type": "set",
+      "value": [
+        "guild:2000"
+      ]
+    }
+  }
+}

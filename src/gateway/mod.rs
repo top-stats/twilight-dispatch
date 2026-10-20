@@ -117,11 +117,14 @@ pub async fn create(
         limit.total,
     );
 
-    let base = ConfigBuilder::new(config.bot_token.clone(), config.intents)
+    let mut base = ConfigBuilder::new(config.bot_token.clone(), config.intents)
         .presence(presence(config)?)
         .large_threshold(config.large_threshold)
-        .queue(queue)
-        .build();
+        .queue(queue);
+    if let Some(url) = &config.discord_gateway_url {
+        base = base.proxy_url(url.clone());
+    }
+    let base = base.build();
 
     let sessions = resumed.clone();
     let shards = twilight_gateway::create_iterator(
