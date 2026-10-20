@@ -415,10 +415,9 @@ where
                 info!("[Shard {}] Hello", self.id);
                 SHARD_EVENTS.with_label_values(&["Connecting"]).inc();
             }
-            Prepared::Reconnect => {
-                info!("[Shard {}] Reconnect requested by Discord", self.id);
-                SHARD_EVENTS.with_label_values(&["Reconnecting"]).inc();
-            }
+            // twilight answers with a resumable close; the reconnect is
+            // counted once, for the close the gateway echoes (`on_close`).
+            Prepared::Reconnect => info!("[Shard {}] Reconnect requested by Discord", self.id),
             Prepared::InvalidSession { resumable } => {
                 info!(
                     "[Shard {}] Invalid Session (resumable: {})",

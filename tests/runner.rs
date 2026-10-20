@@ -1626,11 +1626,9 @@ async fn the_shard_lifecycle_is_counted_and_logged() {
     );
 }
 
-/// A RECONNECT is one reconnect, like a resumable close by the gateway (and
-/// like earlier versions counted it).
+/// A RECONNECT (op 7) or an INVALID_SESSION (op 9) is one reconnect, like a
+/// resumable close by the gateway (and like earlier versions counted it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BUG: RECONNECT (op 7) counts gateway_shard_events{type=Reconnecting} twice \
-            (runner on_text Reconnect + on_close of the echoed close)"]
 async fn a_reconnect_request_counts_one_reconnect() {
     let _metrics = METRICS.write().await;
     let Some(redis) = common::redis(IDLE_DB).await else {
@@ -1645,12 +1643,19 @@ async fn a_reconnect_request_counts_one_reconnect() {
 
     conn.reconnect().await;
     assert_eq!(conn.expect_close().await, Some(4000));
-    let (conn, resume) = resumed(&fake).await;
+    let (mut conn, resume) = resumed(&fake).await;
     assert_eq!(resume, resume_d("A", 1));
     conn.resumed(2).await;
     running.recorder.wait_published(2).await;
     assert_eq!(shard_events("Disconnected") - disconnected, 1);
     assert_eq!(shard_events("Reconnecting") - reconnecting, 1);
+
+    conn.invalid_session(false).await;
+    assert_eq!(conn.expect_close().await, Some(1000));
+    let _conn = identified(&fake, shard, "B", QUIET).await;
+    running.recorder.wait_published(3).await;
+    assert_eq!(shard_events("Disconnected") - disconnected, 2);
+    assert_eq!(shard_events("Reconnecting") - reconnecting, 2);
     running.stop().await;
 }
 
