@@ -1783,8 +1783,6 @@ proptest! {
 /// disagree and the cache applies a different event than the one published.
 /// Discord puts `t` first, so this needs a gateway (proxy) that reorders keys.
 #[test]
-#[ignore = "BUG (latent): prepare() trusts twilight's text scan for the event type; \
-            a payload with `d` before `t` and a nested \"t\" key is cached as another event"]
 fn typed_event_type_comes_from_the_envelope() {
     let raw = concat!(
         r#"{"op":0,"s":5,"d":{"t":"GUILD_DELETE","id":"1000","channel_id":"7"},"#,

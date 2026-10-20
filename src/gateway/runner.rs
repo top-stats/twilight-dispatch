@@ -103,15 +103,26 @@ pub fn wants_typed(kind: &str, state: &StateConfig) -> bool {
     }
 }
 
-/// Parse a raw dispatch payload into a twilight event without copying it.
+/// Parse a raw gateway payload into a twilight event without copying it, the
+/// way [`prepare`] does. `Ok(None)` when it is not a gateway payload at all.
 pub fn parse_event(json: &str) -> Result<Option<Event>, String> {
-    let Some(deserializer) = GatewayEventDeserializer::from_json(json) else {
+    let Ok(envelope) = Envelope::parse(json) else {
         return Ok(None);
     };
+    parse_typed(json, &envelope).map(Some)
+}
+
+/// Parse a payload as the event its parsed envelope says it is. Not with
+/// `GatewayEventDeserializer::from_json`: it searches the text for the first
+/// `"op":` and `"t":`, which can be a key inside `d` (key order is not
+/// guaranteed behind a gateway proxy), so the cache would apply another event
+/// than the one published; and it misses a key with a space before the colon.
+fn parse_typed(json: &str, envelope: &Envelope<'_>) -> Result<Event, String> {
+    let deserializer = GatewayEventDeserializer::new(envelope.op, envelope.kind());
     let mut json_deserializer = serde_json::Deserializer::from_str(json);
     deserializer
         .deserialize(&mut json_deserializer)
-        .map(|event| Some(Event::from(event)))
+        .map(Event::from)
         .map_err(|err| err.to_string())
 }
 
@@ -185,8 +196,8 @@ pub fn prepare(json: &str, state: &StateConfig) -> Prepared {
         None
     };
     let (event, parse_error) = if wants_typed(&kind, state) {
-        match parse_event(json) {
-            Ok(event) => (event, None),
+        match parse_typed(json, &envelope) {
+            Ok(event) => (Some(event), None),
             Err(err) => (None, Some(err)),
         }
     } else {
@@ -708,6 +719,48 @@ mod tests {
         let json = r#"{"t":"GUILD_ROLE_DELETE","s":5,"op":0,"d":{"guild_id":"x"}}"#;
         assert!(parse_event(json).is_err());
         assert_eq!(parse_event("not json").unwrap_or(None), None);
+    }
+
+    /// The typed event is the one the envelope names, which is also the one
+    /// that is routed and published, however the payload is laid out.
+    #[test]
+    fn typed_events_follow_the_envelope() {
+        let role_delete = [
+            // `t` after a `d` that has a `t` of its own (a key-reordering
+            // proxy); a text scan finds GUILD_DELETE and would wipe guild 1000.
+            r#"{"op":0,"s":5,"d":{"t":"GUILD_DELETE","id":"1000","guild_id":"1","role_id":"2"},"t":"GUILD_ROLE_DELETE"}"#,
+            // Spaces before the colons: a text scan finds no `"op":`.
+            r#"{"t" : "GUILD_ROLE_DELETE", "s" : 5, "op" : 0, "d" : {"guild_id" : "1", "role_id" : "2"}}"#,
+            // An escaped event type.
+            r#"{"t":"GUILD_ROLE\u005fDELETE","s":5,"op":0,"d":{"guild_id":"1","role_id":"2"}}"#,
+        ];
+        for json in role_delete {
+            match prepare(json, &all_on()) {
+                Prepared::Dispatch {
+                    kind,
+                    route,
+                    event: Some(Event::RoleDelete(data)),
+                    parse_error: None,
+                    ..
+                } => {
+                    assert_eq!(kind, "GUILD_ROLE_DELETE");
+                    assert_eq!(route, Route::Guild(1));
+                    assert_eq!((data.guild_id.get(), data.role_id.get()), (1, 2));
+                }
+                other => panic!("{json}: {other:?}"),
+            }
+            assert!(
+                matches!(parse_event(json), Ok(Some(Event::RoleDelete(_)))),
+                "{json}"
+            );
+        }
+        // `op` comes from the envelope too: a nested one is not the payload's.
+        let hello = r#"{"t":null,"s":null,"d":{"op":0,"heartbeat_interval":41250},"op":10}"#;
+        assert!(matches!(prepare(hello, &all_on()), Prepared::Hello));
+        assert!(matches!(
+            parse_event(hello),
+            Ok(Some(Event::GatewayHello(_)))
+        ));
     }
 
     #[test]
