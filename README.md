@@ -32,9 +32,11 @@ Configuration is read from environment variables (or `.env`); see
 - Active threads are cached under `thread:<guild>:<thread>` (indexed in
   `thread_keys`, `thread_keys:<guild>` and `guild_keys:<guild>`) and are also
   kept in the guild blob's `threads`; `channel:` keys never hold threads.
-- Commands in `gateway.send` for a shard this process does not run are
-  returned to the queue once (another process may own it) and dropped if they
-  come back.
+- With several processes (different `SHARDS_START`/`SHARDS_END`), every
+  process consumes `gateway.send`, runs commands for its own shards and
+  forwards the others to the `gateway.send.shards` direct exchange (routing key:
+  shard id), where each process binds an exclusive queue for the shards it
+  runs. Commands for shards no running process has are dropped by the broker.
 
 ### Tests
 

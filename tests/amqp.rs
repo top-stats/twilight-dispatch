@@ -270,3 +270,89 @@ async fn the_command_consumer_follows_reconnects() {
     consumer.abort();
     amqp.close().await;
 }
+
+/// Several processes share gateway.send: every command must reach the
+/// process running its shard, whichever process consumes it first.
+#[tokio::test]
+async fn commands_reach_the_process_running_the_shard() {
+    use std::sync::Arc;
+    use twilight_dispatch::{
+        gateway::registry::{Registry, ShardHandle},
+        metrics::GATEWAY_COMMANDS,
+    };
+    use twilight_gateway::{Intents, Shard, ShardId};
+
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    const PROCESSES: u32 = 3;
+    const PER_SHARD: u64 = 30;
+    // Shards are never polled, so they never connect; their senders accept
+    // commands, which is all the consumer needs.
+    let shards: Vec<Shard> = (0..PROCESSES)
+        .map(|id| {
+            Shard::new(
+                ShardId::new(id, PROCESSES),
+                "token".into(),
+                Intents::empty(),
+            )
+        })
+        .collect();
+    let mut processes = Vec::new();
+    for shard in &shards {
+        let id = shard.id().number();
+        let amqp = Amqp::connect(url.clone(), true).await.unwrap();
+        let registry = Arc::new(Registry::new([Arc::new(ShardHandle::new(
+            id,
+            Some(shard.sender()),
+            None,
+        ))]));
+        let consumer = tokio::spawn(twilight_dispatch::commands::run_consumer(
+            amqp.clone(),
+            registry,
+            PROCESSES,
+        ));
+        processes.push((amqp, consumer));
+    }
+    // Let every process bind its queue before commands arrive.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let sent = |shard: u32| {
+        GATEWAY_COMMANDS
+            .with_label_values(&[shard.to_string().as_str(), "sent"])
+            .get()
+    };
+    let before: Vec<u64> = (0..PROCESSES).map(sent).collect();
+    for round in 0..PER_SHARD {
+        for shard in 0..PROCESSES {
+            let body = format!(
+                r#"{{"op":0,"shard":{shard},"data":{{"op":3,"d":{{"status":"online","activities":[],"afk":false,"since":{round}}}}}}}"#
+            );
+            send_command(&url, body.as_bytes()).await;
+        }
+    }
+
+    let mut delivered = vec![0; PROCESSES as usize];
+    for _ in 0..100 {
+        delivered = (0..PROCESSES)
+            .map(|s| sent(s) - before[s as usize])
+            .collect();
+        if delivered.iter().all(|n| *n == PER_SHARD) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        delivered,
+        vec![PER_SHARD; PROCESSES as usize],
+        "commands per owner"
+    );
+
+    for (amqp, consumer) in processes {
+        consumer.abort();
+        amqp.close().await;
+    }
+}

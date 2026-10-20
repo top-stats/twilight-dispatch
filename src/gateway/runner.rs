@@ -29,6 +29,7 @@ use futures_util::StreamExt;
 use redis::aio::ConnectionLike;
 use serde::{de::DeserializeSeed, Deserialize};
 use std::{
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -209,7 +210,7 @@ struct Runner<C> {
     last_status: &'static str,
     session: Option<Arc<str>>,
     /// Jobs waiting for room in a full worker queue, in order.
-    held: Vec<(usize, Job)>,
+    held: VecDeque<(usize, Job)>,
     /// When the shard was closed because of backpressure.
     paused_at: Option<Instant>,
     parse_errors: Throttle,
@@ -235,7 +236,7 @@ pub async fn run<C>(
         id,
         last_status: "Disconnected",
         session,
-        held: Vec::new(),
+        held: VecDeque::new(),
         paused_at: None,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
@@ -247,10 +248,16 @@ pub async fn run<C>(
         if runner.paused_at.is_some() {
             if runner.is_disconnected() {
                 runner.flush_held().await;
-            } else {
+                // From now on the runner waits for the old connection to
+                // finish closing; /healthcheck reports it if that never ends.
+                runner
+                    .handle
+                    .update(|s| s.close_wait_since = Some(Instant::now()));
+            } else if !runner.try_flush_held() {
                 // Still connected (e.g. the connection dropped without a
-                // close echo and twilight reconnected on its own): close
-                // again rather than block while a heartbeat is owed.
+                // close echo and twilight reconnected on its own) and the
+                // workers are still full: close again rather than block
+                // while a heartbeat is owed.
                 runner.shard.close(CloseFrame::RESUME);
             }
         }
@@ -278,6 +285,7 @@ where
 {
     /// Handle one stream item. Returns false once the shard is finished.
     async fn on_item(&mut self, item: Option<Result<Message, ReceiveMessageError>>) -> bool {
+        self.handle.update(|s| s.close_wait_since = None);
         match item {
             None => {
                 error!(
@@ -527,13 +535,13 @@ where
     /// resumably, so it stops receiving until the workers caught up.
     fn enqueue(&mut self, worker: usize, job: Job) {
         if !self.held.is_empty() {
-            self.held.push((worker, job));
+            self.held.push_back((worker, job));
             return;
         }
         match self.ctx.workers[worker].try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(job)) => {
-                self.held.push((worker, job));
+                self.held.push_back((worker, job));
                 if self.paused_at.is_none() {
                     self.paused_at = Some(Instant::now());
                     // A disconnected shard owes no heartbeat; a close queued
@@ -561,6 +569,25 @@ where
             self.shard.state(),
             ShardState::Disconnected { .. } | ShardState::FatallyClosed
         )
+    }
+
+    /// Queue held jobs without waiting, in order, stopping at the first full
+    /// queue. Returns true once nothing is held any more (the pause is over).
+    fn try_flush_held(&mut self) -> bool {
+        while let Some((worker, job)) = self.held.pop_front() {
+            match self.ctx.workers[worker].try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) => {
+                    self.held.push_front((worker, job));
+                    return false;
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
+        }
+        if self.paused_at.take().is_some() {
+            info!("[Shard {}] Event queue drained; resuming", self.id);
+        }
+        true
     }
 
     /// Wait until every held job is queued. Only called once no heartbeat is

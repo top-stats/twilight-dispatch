@@ -6,6 +6,9 @@ use twilight_model::id::{
 pub const EXCHANGE: &str = "gateway";
 pub const QUEUE_RECV: &str = "gateway.recv";
 pub const QUEUE_SEND: &str = "gateway.send";
+/// Direct exchange that routes gateway commands to the process running the
+/// shard (routing key: the shard id), for deployments with several processes.
+pub const SHARD_EXCHANGE: &str = "gateway.send.shards";
 
 /// Legacy blob of every shard's session, written by older versions. Read once
 /// at startup as a fallback; new versions store one key per shard instead.

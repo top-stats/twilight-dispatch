@@ -307,3 +307,60 @@ async fn failed_publishes_hold_the_resume_point() {
     // A restart now resumes before the lost event so Discord replays it.
     assert_eq!(handle.session_info().unwrap().sequence, 1);
 }
+
+#[tokio::test]
+async fn deletes_of_a_previous_session_are_still_applied() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(4).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let registry = Arc::new(Registry::new([handle.clone()]));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = context(
+        conn.clone(),
+        registry,
+        recorder.clone(),
+        Duration::from_secs(5),
+    );
+
+    worker::process(
+        &ctx,
+        &mut conn,
+        job(
+            &handle,
+            "MESSAGE_CREATE",
+            2,
+            message(1, 1003, Some(1000), "x"),
+            true,
+        ),
+    )
+    .await;
+    // Queued before the session ended, processed after the new READY.
+    let delete = job(
+        &handle,
+        "MESSAGE_DELETE",
+        3,
+        json!({"id": "1", "channel_id": "1003", "guild_id": "1000"}),
+        true,
+    );
+    let create = job(
+        &handle,
+        "MESSAGE_CREATE",
+        4,
+        message(2, 1003, Some(1000), "y"),
+        true,
+    );
+    handle.new_session(1);
+    worker::process(&ctx, &mut conn, delete).await;
+    worker::process(&ctx, &mut conn, create).await;
+
+    // Nothing replays the delete, so it is applied; the stale create is not.
+    assert!(!exists(&mut conn, "message:1003:1").await);
+    assert!(!exists(&mut conn, "message:1003:2").await);
+    assert_eq!(
+        recorder.published.lock().unwrap().len(),
+        3,
+        "both are still published"
+    );
+}

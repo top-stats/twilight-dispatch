@@ -162,7 +162,7 @@ where
     };
     let mut outcome = None;
     if let Some(mut event) = event {
-        if ctx.state.enabled && current {
+        if ctx.state.enabled && (current || only_removes(&event)) {
             outcome = update_cache(ctx, conn, &mut event).await;
         }
         log_guild_changes(ctx, &event, outcome.as_ref());
@@ -181,6 +181,23 @@ where
             // Keep the resume point before it so a restart replays it.
             handle.fail(token);
         }
+    }
+}
+
+/// Events that only remove cached state. Nothing replays them after a new
+/// session (GUILD_CREATE keeps the messages of channels it lists), and they
+/// cannot bring back anything READY removed, so they are applied even when
+/// they belong to a previous session.
+fn only_removes(event: &Event) -> bool {
+    match event {
+        Event::MessageDelete(_)
+        | Event::MessageDeleteBulk(_)
+        | Event::ChannelDelete(_)
+        | Event::ThreadDelete(_)
+        | Event::RoleDelete(_) => true,
+        // An outage marks the guild unavailable, which writes a stub.
+        Event::GuildDelete(data) => data.unavailable != Some(true),
+        _ => false,
     }
 }
 

@@ -157,6 +157,12 @@ counter!(
     "amqp_reconnects",
     "Reconnects to the AMQP broker"
 );
+counter_vec!(
+    GATEWAY_COMMANDS,
+    "gateway_commands",
+    "Gateway commands from gateway.send by outcome (sent, forwarded, dropped, invalid)",
+    &["shard", "result"]
+);
 gauge!(
     AMQP_CONNECTED,
     "amqp_connected",
@@ -281,6 +287,9 @@ pub async fn run_server(listener: TcpListener) {
     }
 }
 
+/// How long a shard may wait for a connection it closed to finish.
+pub const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
 /// What /healthcheck reports for the current shard snapshots.
 pub fn compute_health(
     snapshots: &[(u32, ShardSnapshot)],
@@ -297,6 +306,15 @@ pub fn compute_health(
                     .close_code
                     .map(|code| format!(" ({code})"))
                     .unwrap_or_default()
+            ));
+        } else if snapshot
+            .close_wait_since
+            .is_some_and(|since| since.elapsed() > CLOSE_WAIT_LIMIT)
+        {
+            // The gateway never finished closing the connection; twilight
+            // would wait for it forever.
+            health.problems.push(format!(
+                "shard {shard} is stuck waiting for the gateway to close the connection"
             ));
         } else if snapshot.active && silence.is_some_and(|s| s > shard_silence) {
             health.problems.push(format!(
@@ -486,6 +504,15 @@ mod tests {
 
         // Fatal closes and broker outages are warnings: restarting would only
         // burn identifies.
+        let mut closing = snapshot(false, false, 600);
+        closing.close_wait_since = std::time::Instant::now().checked_sub(CLOSE_WAIT_LIMIT * 2);
+        let stuck_closing = compute_health(&[(0, closing)], true, silence);
+        assert_eq!(
+            stuck_closing.problems.len(),
+            1,
+            "waiting forever for a close"
+        );
+
         let fatal = compute_health(&[(0, snapshot(false, true, 600))], false, silence);
         assert!(fatal.problems.is_empty());
         assert_eq!(fatal.warnings.len(), 2);

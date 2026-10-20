@@ -98,27 +98,25 @@ pub fn validate(delivery: &DeliveryInfo) -> Result<ShardCommand, InvalidCommand>
     }
 }
 
-/// What to do with a delivery once it was looked at.
+/// What to do with a delivery.
 #[derive(Debug, Eq, PartialEq)]
-pub enum Disposition {
-    /// Handled (or permanently invalid): acknowledge.
-    Ack,
-    /// Another process owns the shard: give it back to the queue.
-    Requeue,
+pub enum Plan {
+    /// Run the command on one of this process' shards.
+    Run(u32, ShardCommand),
+    /// Another process runs the shard: route the command there.
+    Forward(u32),
+    /// Malformed, not allowed or for a shard that does not exist: drop it.
+    Drop,
 }
 
-/// Decide what to run for a delivery. `owned` says whether this process runs
+/// Decide what to do with a delivery. `owned` says whether this process runs
 /// the shard; `total` is the shard count of the bot.
-pub fn plan(
-    body: &[u8],
-    owned: impl Fn(u32) -> bool,
-    total: u32,
-) -> (Disposition, Option<(u32, ShardCommand)>) {
+pub fn plan(body: &[u8], owned: impl Fn(u32) -> bool, total: u32) -> Plan {
     let delivery = match parse(body) {
         Ok(delivery) => delivery,
         Err(err) => {
             tracing::warn!("Dropping gateway command: {}", err);
-            return (Disposition::Ack, None);
+            return Plan::Drop;
         }
     };
     if delivery.shard >= total {
@@ -126,49 +124,54 @@ pub fn plan(
             "Dropping gateway command for invalid shard {}",
             delivery.shard
         );
-        return (Disposition::Ack, None);
+        return Plan::Drop;
     }
     if !owned(delivery.shard) {
-        return (Disposition::Requeue, None);
+        return Plan::Forward(delivery.shard);
     }
     match validate(&delivery) {
-        Ok(command) => (Disposition::Ack, Some((delivery.shard, command))),
+        Ok(command) => Plan::Run(delivery.shard, command),
         Err(err) => {
             tracing::warn!(
                 "Dropping gateway command for shard {}: {}",
                 delivery.shard,
                 err
             );
-            (Disposition::Ack, None)
+            Plan::Drop
         }
     }
 }
 
-/// Time limit for acknowledging one delivery.
+/// Time limit for acknowledging or forwarding one delivery.
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Consume `gateway.send` until the connection is closed. The consumer
-/// follows the AMQP supervisor's current link, so it moves to a new
-/// connection as soon as one is installed. Commands are acknowledged only
-/// after they were handed to a shard.
+/// Consume gateway commands until the connection is closed.
 ///
-/// A command for a shard this process does not run is returned to the queue
-/// once (another process may own the shard); when it comes back again it is
-/// dropped, so such commands can never fill the prefetch window.
+/// Producers publish to `gateway.send`, which every process consumes. A
+/// process runs commands for its own shards and forwards the others to the
+/// `gateway.send.shards` exchange with the shard id as routing key; each
+/// process binds an exclusive queue there for the shards it runs. So with
+/// several processes every command reaches the one running its shard (and is
+/// dropped by the broker if none does).
+///
+/// The consumer follows the AMQP supervisor's current link, so it moves to a
+/// new connection as soon as one is installed. Deliveries are acknowledged
+/// only after they were handled.
 pub async fn run_consumer(
     amqp: std::sync::Arc<crate::amqp::Amqp>,
     registry: std::sync::Arc<crate::gateway::registry::Registry>,
     total: u32,
 ) {
+    use crate::{constants::SHARD_EXCHANGE, metrics::GATEWAY_COMMANDS};
     use futures_util::StreamExt;
     use lapin::{
-        options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions},
+        options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions},
         types::FieldTable,
     };
     use std::time::Duration;
     use twilight_gateway::CloseFrame;
 
-    let dropped = crate::util::Throttle::default();
+    let shards: Vec<u32> = registry.handles().map(|handle| handle.id).collect();
     let mut links = amqp.subscribe();
     let mut backoff = Duration::from_millis(250);
 
@@ -180,30 +183,38 @@ pub async fn run_consumer(
         let Some(link) = link else { continue };
         let channel = link.consume_channel().clone();
 
-        // Re-declare the queue in case it was deleted (the consumer would
-        // otherwise retry a 404 forever).
-        let consumer = async {
-            crate::amqp::declare_consume(&channel).await?;
-            channel
+        // Declared on every (re)subscribe, in case a queue was deleted.
+        let subscribe = async {
+            let own = crate::amqp::declare_consume(&channel, shards.iter().copied()).await?;
+            let shared = channel
                 .basic_consume(
                     QUEUE_SEND.into(),
                     "".into(),
                     BasicConsumeOptions::default(),
                     FieldTable::default(),
                 )
-                .await
+                .await?;
+            let own = channel
+                .basic_consume(
+                    own.as_str().into(),
+                    "".into(),
+                    BasicConsumeOptions::default(),
+                    FieldTable::default(),
+                )
+                .await?;
+            Ok::<_, lapin::Error>((shared, own))
         };
-        let mut consumer = match tokio::time::timeout(ACK_TIMEOUT, consumer).await {
-            Ok(Ok(consumer)) => consumer,
+        let (mut shared, mut own) = match tokio::time::timeout(ACK_TIMEOUT, subscribe).await {
+            Ok(Ok(consumers)) => consumers,
             Ok(Err(err)) => {
-                tracing::warn!("Failed to consume {}: {}", QUEUE_SEND, err);
+                tracing::warn!("Failed to consume gateway commands: {}", err);
                 amqp.mark_broken(Some(link.generation));
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
             }
             Err(_) => {
-                tracing::warn!("Timed out subscribing to {}", QUEUE_SEND);
+                tracing::warn!("Timed out subscribing to gateway commands");
                 amqp.mark_broken(Some(link.generation));
                 continue;
             }
@@ -211,10 +222,11 @@ pub async fn run_consumer(
         backoff = Duration::from_millis(250);
 
         loop {
-            let delivery = tokio::select! {
+            let (delivery, routed_to_us) = tokio::select! {
                 // A new link (or none): leave this connection.
                 _ = links.changed() => break,
-                delivery = consumer.next() => delivery,
+                delivery = shared.next() => (delivery, false),
+                delivery = own.next() => (delivery, true),
             };
             let delivery = match delivery {
                 Some(Ok(delivery)) => delivery,
@@ -223,69 +235,75 @@ pub async fn run_consumer(
                     amqp.mark_broken(Some(link.generation));
                     break;
                 }
-                None => {
-                    // Cancelled by the broker (e.g. the queue was deleted).
-                    break;
-                }
+                // Cancelled by the broker (e.g. a queue was deleted).
+                None => break,
             };
 
-            let (mut disposition, command) =
-                plan(&delivery.data, |shard| registry.get(shard).is_some(), total);
-            if let Some((shard, command)) = command {
-                let sender = registry
-                    .get(shard)
-                    .and_then(|handle| handle.sender.as_ref());
-                let sent = match (sender, command) {
-                    (Some(sender), ShardCommand::Send(json)) => sender.send(json).is_ok(),
-                    (Some(sender), ShardCommand::Reconnect) => {
-                        tracing::info!("Reconnecting shard {} on request", shard);
-                        sender.close(CloseFrame::RESUME).is_ok()
-                    }
-                    (None, _) => false,
-                };
-                if !sent {
-                    // The shard stopped for good (fatal close code).
-                    tracing::warn!("Shard {} is not running; dropping its command", shard);
-                }
-            }
-            if disposition == Disposition::Requeue && delivery.redelivered {
-                if let Some(suppressed) = dropped.check() {
-                    tracing::warn!(
-                        "Dropping a gateway command for a shard no running process took ({} similar suppressed)",
-                        suppressed
-                    );
-                }
-                disposition = Disposition::Ack;
-            }
-
-            let result = match disposition {
-                Disposition::Ack => {
-                    tokio::time::timeout(
-                        ACK_TIMEOUT,
-                        delivery.acker.ack(BasicAckOptions::default()),
-                    )
-                    .await
-                }
-                Disposition::Requeue => {
-                    let requeue = BasicNackOptions {
-                        multiple: false,
-                        requeue: true,
+            let plan = plan(&delivery.data, |shard| registry.get(shard).is_some(), total);
+            let mut forward_failed = false;
+            match plan {
+                Plan::Run(shard, command) => {
+                    let sender = registry
+                        .get(shard)
+                        .and_then(|handle| handle.sender.as_ref());
+                    let sent = match (sender, command) {
+                        (Some(sender), ShardCommand::Send(json)) => sender.send(json).is_ok(),
+                        (Some(sender), ShardCommand::Reconnect) => {
+                            tracing::info!("Reconnecting shard {} on request", shard);
+                            sender.close(CloseFrame::RESUME).is_ok()
+                        }
+                        (None, _) => false,
                     };
-                    tokio::time::timeout(ACK_TIMEOUT, delivery.acker.nack(requeue)).await
+                    let result = if sent { "sent" } else { "dropped" };
+                    GATEWAY_COMMANDS
+                        .with_label_values(&[shard.to_string().as_str(), result])
+                        .inc();
+                    if !sent {
+                        // The shard stopped for good (fatal close code).
+                        tracing::warn!("Shard {} is not running; dropping its command", shard);
+                    }
                 }
+                Plan::Forward(shard) if !routed_to_us => {
+                    let forwarded = tokio::time::timeout(
+                        ACK_TIMEOUT,
+                        channel.basic_publish(
+                            SHARD_EXCHANGE.into(),
+                            shard.to_string().as_str().into(),
+                            BasicPublishOptions::default(),
+                            &delivery.data,
+                            delivery.properties.clone(),
+                        ),
+                    )
+                    .await;
+                    forward_failed = !matches!(forwarded, Ok(Ok(_)));
+                    if !forward_failed {
+                        GATEWAY_COMMANDS
+                            .with_label_values(&[shard.to_string().as_str(), "forwarded"])
+                            .inc();
+                    }
+                }
+                Plan::Forward(shard) => {
+                    tracing::warn!("Dropping a command routed here for shard {}, which this process does not run", shard);
+                }
+                Plan::Drop => {
+                    GATEWAY_COMMANDS.with_label_values(&["", "invalid"]).inc();
+                }
+            }
+
+            let acked = if forward_failed {
+                let requeue = BasicNackOptions {
+                    multiple: false,
+                    requeue: true,
+                };
+                tokio::time::timeout(ACK_TIMEOUT, delivery.acker.nack(requeue)).await
+            } else {
+                tokio::time::timeout(ACK_TIMEOUT, delivery.acker.ack(BasicAckOptions::default()))
+                    .await
             };
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!("Failed to acknowledge gateway command: {}", err);
-                    amqp.mark_broken(Some(link.generation));
-                    break;
-                }
-                Err(_) => {
-                    tracing::warn!("Timed out acknowledging a gateway command");
-                    amqp.mark_broken(Some(link.generation));
-                    break;
-                }
+            if forward_failed || !matches!(acked, Ok(Ok(_))) {
+                tracing::warn!("Failed to handle a gateway command; reconnecting");
+                amqp.mark_broken(Some(link.generation));
+                break;
             }
         }
     }
@@ -381,17 +399,17 @@ mod tests {
         };
         let owned = |shard: u32| shard < 2;
 
-        let (disposition, command) = plan(&body(1), owned, 4);
-        assert_eq!(disposition, Disposition::Ack);
-        assert!(matches!(command, Some((1, ShardCommand::Send(_)))));
-
-        assert_eq!(plan(&body(3), owned, 4), (Disposition::Requeue, None));
-        assert_eq!(plan(&body(9), owned, 4), (Disposition::Ack, None));
-        assert_eq!(plan(b"junk", owned, 4), (Disposition::Ack, None));
+        assert!(matches!(
+            plan(&body(1), owned, 4),
+            Plan::Run(1, ShardCommand::Send(_))
+        ));
+        assert_eq!(plan(&body(3), owned, 4), Plan::Forward(3));
+        assert_eq!(plan(&body(9), owned, 4), Plan::Drop);
+        assert_eq!(plan(b"junk", owned, 4), Plan::Drop);
 
         let invalid = json!({"op": 0, "shard": 0, "data": {"op": 2}})
             .to_string()
             .into_bytes();
-        assert_eq!(plan(&invalid, owned, 4), (Disposition::Ack, None));
+        assert_eq!(plan(&invalid, owned, 4), Plan::Drop);
     }
 }

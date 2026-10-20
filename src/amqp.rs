@@ -14,7 +14,7 @@
 //! workers (and with them the shards).
 
 use crate::{
-    constants::{EXCHANGE, QUEUE_RECV, QUEUE_SEND},
+    constants::{EXCHANGE, QUEUE_RECV, QUEUE_SEND, SHARD_EXCHANGE},
     metrics::{AMQP_PUBLISH_FAILURES, AMQP_RECONNECTS},
     models::{ApiError, ApiResult},
 };
@@ -163,7 +163,9 @@ impl Amqp {
             .await?;
             let publish = connection.create_channel().await?;
             let consume = connection.create_channel().await?;
-            declare(&publish, &consume, self.default_queue).await?;
+            // gateway.send is declared by the consumer, so publishing does not
+            // depend on it.
+            declare(&publish, self.default_queue).await?;
             Ok::<_, ApiError>(Link {
                 generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
                 connection: Arc::new(connection),
@@ -271,9 +273,19 @@ impl Amqp {
     }
 }
 
+/// A link that breaks sooner than this after it was installed counts as a
+/// failed attempt (e.g. a broker that closes every channel when low on disk),
+/// so the supervisor backs off instead of reconnecting in a tight loop.
+const MIN_LINK_LIFETIME: Duration = Duration::from_secs(5);
+/// Backoff cap for attempts that fail fast (refused, reset, DNS): retrying
+/// is cheap, and a long sleep would keep events failing after the broker is
+/// back. Attempts that time out back off up to [`MAX_BACKOFF`].
+const FAST_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Keep a healthy link installed until the connection is closed.
 async fn supervise(amqp: Arc<Amqp>) {
     let mut backoff = Duration::from_millis(250);
+    let mut installed_at: Option<Instant> = None;
     loop {
         if amqp.is_closing() {
             return;
@@ -281,7 +293,9 @@ async fn supervise(amqp: Arc<Amqp>) {
         let healthy = amqp.link.borrow().as_ref().map(Link::is_healthy);
         match healthy {
             Some(true) => {
-                backoff = Duration::from_millis(250);
+                if installed_at.is_some_and(|at| at.elapsed() >= MIN_LINK_LIFETIME) {
+                    backoff = Duration::from_millis(250);
+                }
                 tokio::select! {
                     _ = amqp.wake.notified() => {}
                     _ = tokio::time::sleep(CHECK_INTERVAL) => {}
@@ -291,7 +305,20 @@ async fn supervise(amqp: Arc<Amqp>) {
             Some(false) => amqp.mark_broken(None),
             None => {}
         }
+        // The previous link died right away: wait before trying again.
+        if installed_at
+            .take()
+            .is_some_and(|at| at.elapsed() < MIN_LINK_LIFETIME)
+        {
+            warn!(
+                "The AMQP connection broke right after connecting; retrying in {:?}",
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
 
+        let attempt = Instant::now();
         match amqp.open().await {
             Ok(link) if amqp.is_closing() => {
                 let _ = link.connection.close(200, "shutting down".into()).await;
@@ -301,11 +328,19 @@ async fn supervise(amqp: Arc<Amqp>) {
                 info!("Connected to the AMQP broker");
                 AMQP_RECONNECTS.inc();
                 amqp.install(link);
+                installed_at = Some(Instant::now());
             }
             Err(err) => {
+                let timed_out = attempt.elapsed() >= CONNECT_TIMEOUT;
+                let cap = if timed_out {
+                    MAX_BACKOFF
+                } else {
+                    FAST_FAILURE_BACKOFF
+                };
+                backoff = backoff.min(cap);
                 warn!("AMQP reconnect failed, retrying in {:?}: {}", backoff, err);
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff * 2).min(cap);
             }
         }
     }
@@ -321,19 +356,51 @@ const DURABLE_QUEUE: QueueDeclareOptions = QueueDeclareOptions {
     nowait: false,
 };
 
-/// Declare `gateway.send` and set the prefetch on the consume channel.
-pub async fn declare_consume(consume: &Channel) -> Result<(), lapin::Error> {
+/// Prepare the consume channel: declare `gateway.send`, set the prefetch,
+/// and declare this process' own exclusive queue bound to [`SHARD_EXCHANGE`]
+/// for every shard it runs. Returns the name of that queue.
+pub async fn declare_consume(
+    consume: &Channel,
+    shards: impl IntoIterator<Item = u32>,
+) -> Result<String, lapin::Error> {
     consume
         .queue_declare(QUEUE_SEND.into(), DURABLE_QUEUE, FieldTable::default())
         .await?;
     consume
         .basic_qos(PREFETCH, BasicQosOptions::default())
         .await?;
-    Ok(())
+    // Server-named, deleted with the connection: while this process is down
+    // nothing is routed to it (the broker drops commands for its shards).
+    let own = consume
+        .queue_declare(
+            "".into(),
+            QueueDeclareOptions {
+                passive: false,
+                durable: false,
+                exclusive: true,
+                auto_delete: true,
+                nowait: false,
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    let name = own.name().to_string();
+    for shard in shards {
+        consume
+            .queue_bind(
+                name.as_str().into(),
+                SHARD_EXCHANGE.into(),
+                shard.to_string().as_str().into(),
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+    }
+    Ok(name)
 }
 
 /// Declare the exchange and queues (idempotent).
-async fn declare(publish: &Channel, consume: &Channel, default_queue: bool) -> ApiResult<()> {
+async fn declare(publish: &Channel, default_queue: bool) -> ApiResult<()> {
     publish
         .exchange_declare(
             EXCHANGE.into(),
@@ -348,7 +415,20 @@ async fn declare(publish: &Channel, consume: &Channel, default_queue: bool) -> A
             FieldTable::default(),
         )
         .await?;
-    declare_consume(consume).await?;
+    publish
+        .exchange_declare(
+            SHARD_EXCHANGE.into(),
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions {
+                passive: false,
+                durable: true,
+                auto_delete: false,
+                internal: false,
+                nowait: false,
+            },
+            FieldTable::default(),
+        )
+        .await?;
 
     if default_queue {
         publish

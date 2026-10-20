@@ -46,6 +46,8 @@ pub struct ShardSnapshot {
     pub last_message: Option<Instant>,
     pub session_id: Option<String>,
     pub resume_url: Option<String>,
+    /// Set while the runner waits for a connection it closed to finish.
+    pub close_wait_since: Option<Instant>,
 }
 
 impl Default for ShardSnapshot {
@@ -60,6 +62,7 @@ impl Default for ShardSnapshot {
             last_message: None,
             session_id: None,
             resume_url: None,
+            close_wait_since: None,
         }
     }
 }

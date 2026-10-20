@@ -637,6 +637,18 @@ async fn legacy_expiry_hash_is_migrated() {
         .unwrap();
     assert_eq!(jobs::migrate_legacy_expiry(&mut conn).await.unwrap(), 1);
     assert_eq!(score(&mut conn, "member:1:2").await, Some(1500.0));
+
+    // An older instance refreshed an entry that was already migrated: the
+    // later deadline wins (ZADD GT on Redis >= 6.2).
+    let _: () = redis::cmd("HSET")
+        .arg("expiry_keys")
+        .arg("member:1:2")
+        .arg(r#""1970-01-01T00:00:02.5""#)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(jobs::migrate_legacy_expiry(&mut conn).await.unwrap(), 1);
+    assert_eq!(score(&mut conn, "member:1:2").await, Some(2500.0));
     assert!(!exists(&mut conn, "expiry_keys").await);
     // Running it again is a no-op.
     assert_eq!(jobs::migrate_legacy_expiry(&mut conn).await.unwrap(), 0);

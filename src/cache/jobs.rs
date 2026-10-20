@@ -93,6 +93,7 @@ pub async fn expire_due<C: ConnectionLike + Send>(conn: &mut C, now_ms: i64) -> 
 pub async fn migrate_legacy_expiry<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<u64> {
     let mut cursor: u64 = 0;
     let mut migrated = 0;
+    let mut gt = None;
     loop {
         let (next, entries): (u64, Vec<(String, String)>) = redis::cmd("HSCAN")
             .arg(EXPIRY_KEYS)
@@ -109,11 +110,13 @@ pub async fn migrate_legacy_expiry<C: ConnectionLike + Send>(conn: &mut C) -> Ap
                 .collect();
             // GT keeps the later deadline when an older instance refreshed
             // an entry that was migrated before (Redis >= 6.2; NX before).
-            let mut result = migrate_batch(conn, &entries, &scored, "GT").await;
-            if result.is_err() {
-                result = migrate_batch(conn, &entries, &scored, "NX").await;
+            // Probed up front: a MULTI with an unsupported flag would still
+            // run its HDEL and lose the entries.
+            if gt.is_none() {
+                gt = Some(supports_zadd_gt(conn).await?);
             }
-            result?;
+            let mode = if gt == Some(true) { "GT" } else { "NX" };
+            migrate_batch(conn, &entries, &scored, mode).await?;
             migrated += scored.len() as u64;
         }
 
@@ -123,6 +126,28 @@ pub async fn migrate_legacy_expiry<C: ConnectionLike + Send>(conn: &mut C) -> Ap
         }
     }
     Ok(migrated)
+}
+
+/// Whether the server knows `ZADD ... GT` (Redis 6.2+).
+async fn supports_zadd_gt<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<bool> {
+    const PROBE: &str = "expiry_zset_probe";
+    let result: redis::RedisResult<()> = redis::cmd("ZADD")
+        .arg(PROBE)
+        .arg("GT")
+        .arg(0)
+        .arg("probe")
+        .query_async(conn)
+        .await;
+    let _: redis::RedisResult<()> = redis::cmd("DEL").arg(PROBE).query_async(conn).await;
+    match result {
+        Ok(()) => Ok(true),
+        Err(err)
+            if err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn migrate_batch<C: ConnectionLike + Send>(
