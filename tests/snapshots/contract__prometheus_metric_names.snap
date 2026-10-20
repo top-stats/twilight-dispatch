@@ -124,6 +124,11 @@ expression: families
     "type": "GAUGE"
   },
   {
+    "labels": [],
+    "name": "state_threads",
+    "type": "GAUGE"
+  },
+  {
     "labels": [
       "reason"
     ],

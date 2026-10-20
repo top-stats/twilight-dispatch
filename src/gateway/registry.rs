@@ -69,7 +69,13 @@ impl Default for ShardSnapshot {
 
 impl ShardSnapshot {
     pub fn silence(&self) -> Option<Duration> {
-        self.last_message.map(|at| at.elapsed())
+        self.silence_at(Instant::now())
+    }
+
+    /// How long the shard had received nothing at `now`.
+    pub fn silence_at(&self, now: Instant) -> Option<Duration> {
+        self.last_message
+            .map(|at| now.saturating_duration_since(at))
     }
 }
 
@@ -156,10 +162,21 @@ impl ShardHandle {
     }
 
     pub fn status_info(&self, now: FormattedDateTime) -> StatusInfo {
+        self.status_info_at(now, Instant::now())
+    }
+
+    /// [`Self::status_info`] with `instant` as the monotonic clock at `now`,
+    /// so a test can put `now` ahead of the last ACK instead of putting the
+    /// ACK in the past (which `Instant::checked_sub` refuses on a host that
+    /// booted more recently than that).
+    pub fn status_info_at(&self, now: FormattedDateTime, instant: Instant) -> StatusInfo {
         let snapshot = self.snapshot();
         let last_ack = snapshot
             .last_ack
-            .map(|at| now - time::Duration::milliseconds(at.elapsed().as_millis() as i64))
+            .map(|at| {
+                let ago = instant.saturating_duration_since(at);
+                now - time::Duration::milliseconds(ago.as_millis() as i64)
+            })
             .unwrap_or(now);
         StatusInfo {
             shard: self.id,
@@ -233,5 +250,33 @@ mod tests {
         ] {
             assert!(STATUS_LABELS.contains(&status_label(state)));
         }
+    }
+
+    #[test]
+    fn times_are_measured_from_the_given_instant() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(2_500);
+        let handle = ShardHandle::new(4, None, None);
+        let now = FormattedDateTime::now();
+        assert_eq!(
+            handle.status_info_at(now, later).last_ack,
+            now,
+            "no ACK yet"
+        );
+
+        handle.update(|s| {
+            s.last_ack = Some(start);
+            s.last_message = Some(start);
+        });
+        let info = handle.status_info_at(now, later);
+        assert_eq!((now - info.last_ack).whole_milliseconds(), 2_500);
+        assert_eq!(
+            handle.snapshot().silence_at(later),
+            Some(Duration::from_millis(2_500))
+        );
+        // An instant before the last message is no silence, not a panic.
+        handle.update(|s| s.last_message = Some(later));
+        assert_eq!(handle.snapshot().silence_at(start), Some(Duration::ZERO));
+        assert_eq!(ShardSnapshot::default().silence_at(later), None);
     }
 }

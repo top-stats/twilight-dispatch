@@ -2,14 +2,15 @@
 //!
 //! Metric names of earlier versions are unchanged. New: `gateway_parse_errors`,
 //! `state_update_errors`, `amqp_publish_failures`, `amqp_reconnects`,
-//! `amqp_connected`, `gateway_shard_fatal`, `gateway_shard_silence_seconds`.
+//! `amqp_connected`, `gateway_shard_fatal`, `gateway_shard_silence_seconds`,
+//! `state_threads`.
 
 use crate::{
     amqp::Amqp,
     cache::keys::type_index,
     constants::{
         CHANNEL_KEY, EMOJI_KEY, GUILD_KEY, MEMBER_KEY, MESSAGE_KEY, METRICS_JOB_INTERVAL_MS,
-        PRESENCE_KEY, ROLE_KEY, VOICE_KEY,
+        PRESENCE_KEY, ROLE_KEY, THREAD_KEY, VOICE_KEY,
     },
     gateway::registry::{Registry, ShardSnapshot, STATUS_LABELS},
     models::ApiResult,
@@ -33,34 +34,76 @@ use redis::aio::ConnectionLike;
 use std::{
     collections::HashMap,
     convert::Infallible,
+    ops::Deref,
     sync::{Arc, LazyLock, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
 use tracing::warn;
 
+/// A metric that is created and registered on first use, like a `LazyLock`.
+///
+/// The first use of any metric also registers all the others (see [`init`]),
+/// so /metrics lists every metric (vectors once they have a child) instead of
+/// only those something happened to touch, and a new metric shows up in the
+/// metric names snapshot without the test knowing about it.
+pub struct Metric<T>(LazyLock<T>);
+
+impl<T> Metric<T> {
+    const fn new(create: fn() -> T) -> Self {
+        Self(LazyLock::new(create))
+    }
+}
+
+impl<T> Deref for Metric<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        LazyLock::force(&REGISTERED);
+        &self.0
+    }
+}
+
+trait Register: Sync {
+    fn register(&self);
+}
+
+impl<T: Send + Sync> Register for Metric<T> {
+    fn register(&self) {
+        // The inner value, not `deref`: that would wait for `REGISTERED`.
+        LazyLock::force(&self.0);
+    }
+}
+
+static REGISTERED: LazyLock<()> = LazyLock::new(|| ALL.iter().for_each(|m| m.register()));
+
+/// Register every metric now rather than on first use.
+pub fn init() {
+    LazyLock::force(&REGISTERED);
+}
+
 macro_rules! counter_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
-        pub static $name: LazyLock<IntCounterVec> =
-            LazyLock::new(|| register_int_counter_vec!($metric, $help, $labels).unwrap());
+        pub static $name: Metric<IntCounterVec> =
+            Metric::new(|| register_int_counter_vec!($metric, $help, $labels).unwrap());
     };
 }
 macro_rules! counter {
     ($name:ident, $metric:literal, $help:literal) => {
-        pub static $name: LazyLock<IntCounter> =
-            LazyLock::new(|| register_int_counter!($metric, $help).unwrap());
+        pub static $name: Metric<IntCounter> =
+            Metric::new(|| register_int_counter!($metric, $help).unwrap());
     };
 }
 macro_rules! gauge {
     ($name:ident, $metric:literal, $help:literal) => {
-        pub static $name: LazyLock<IntGauge> =
-            LazyLock::new(|| register_int_gauge!($metric, $help).unwrap());
+        pub static $name: Metric<IntGauge> =
+            Metric::new(|| register_int_gauge!($metric, $help).unwrap());
     };
 }
 macro_rules! gauge_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
-        pub static $name: LazyLock<IntGaugeVec> =
-            LazyLock::new(|| register_int_gauge_vec!($metric, $help, $labels).unwrap());
+        pub static $name: Metric<IntGaugeVec> =
+            Metric::new(|| register_int_gauge_vec!($metric, $help, $labels).unwrap());
     };
 }
 
@@ -135,6 +178,11 @@ gauge!(
     "state_voices",
     "Number of voices in state cache"
 );
+gauge!(
+    STATE_THREADS,
+    "state_threads",
+    "Number of threads in state cache"
+);
 counter_vec!(
     GATEWAY_PARSE_ERRORS,
     "gateway_parse_errors",
@@ -180,6 +228,49 @@ gauge_vec!(
     "Seconds since a shard last received anything",
     &["shard"]
 );
+
+/// Every metric above. One left out is only registered on its first use; a
+/// unit test checks that none is.
+static ALL: &[&dyn Register] = &[
+    &GATEWAY_EVENTS,
+    &SHARD_EVENTS,
+    &GUILD_EVENTS,
+    &GATEWAY_SHARDS,
+    &GATEWAY_STATUSES,
+    &GATEWAY_LATENCIES,
+    &STATE_GUILDS,
+    &STATE_CHANNELS,
+    &STATE_MESSAGES,
+    &STATE_ROLES,
+    &STATE_EMOJIS,
+    &STATE_MEMBERS,
+    &STATE_PRESENCES,
+    &STATE_VOICES,
+    &STATE_THREADS,
+    &GATEWAY_PARSE_ERRORS,
+    &STATE_UPDATE_ERRORS,
+    &AMQP_PUBLISH_FAILURES,
+    &AMQP_RECONNECTS,
+    &GATEWAY_COMMANDS,
+    &AMQP_CONNECTED,
+    &SHARD_FATAL,
+    &SHARD_SILENCE,
+];
+
+/// Each state gauge and the cache type it counts (the size of the
+/// `<prefix>_keys` index). One table drives both the SCARD pipeline and the
+/// assignment, so the two cannot get out of step.
+pub static STATE_GAUGES: &[(&str, &Metric<IntGauge>)] = &[
+    (GUILD_KEY, &STATE_GUILDS),
+    (CHANNEL_KEY, &STATE_CHANNELS),
+    (MESSAGE_KEY, &STATE_MESSAGES),
+    (ROLE_KEY, &STATE_ROLES),
+    (EMOJI_KEY, &STATE_EMOJIS),
+    (MEMBER_KEY, &STATE_MEMBERS),
+    (PRESENCE_KEY, &STATE_PRESENCES),
+    (VOICE_KEY, &STATE_VOICES),
+    (THREAD_KEY, &STATE_THREADS),
+];
 
 /// What /healthcheck reports.
 ///
@@ -263,6 +354,7 @@ async fn serve(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallib
 /// Serve /metrics and /healthcheck. Bind the listener first so a bind error
 /// fails startup.
 pub async fn run_server(listener: TcpListener) {
+    init();
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(conn) => conn,
@@ -296,9 +388,21 @@ pub fn compute_health(
     amqp_connected: bool,
     shard_silence: Duration,
 ) -> Health {
+    compute_health_at(snapshots, amqp_connected, shard_silence, Instant::now())
+}
+
+/// [`compute_health`] at `now`. A test can move `now` ahead instead of
+/// moving the snapshots' instants back, which `Instant::checked_sub` refuses
+/// on a host that booted more recently than that.
+pub fn compute_health_at(
+    snapshots: &[(u32, ShardSnapshot)],
+    amqp_connected: bool,
+    shard_silence: Duration,
+    now: Instant,
+) -> Health {
     let mut health = Health::default();
     for (shard, snapshot) in snapshots {
-        let silence = snapshot.silence();
+        let silence = snapshot.silence_at(now);
         if snapshot.fatal {
             health.warnings.push(format!(
                 "shard {shard} was closed by Discord with a non-reconnectable code{}",
@@ -309,7 +413,7 @@ pub fn compute_health(
             ));
         } else if snapshot
             .close_wait_since
-            .is_some_and(|since| since.elapsed() > CLOSE_WAIT_LIMIT)
+            .is_some_and(|since| now.saturating_duration_since(since) > CLOSE_WAIT_LIMIT)
         {
             // The gateway never finished closing the connection; twilight
             // would wait for it forever.
@@ -331,21 +435,26 @@ pub fn compute_health(
     health
 }
 
-async fn state_counts<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<Vec<u64>> {
+/// Set every state gauge to the size of its cache type.
+pub async fn update_state_gauges<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<()> {
     let mut pipe = redis::pipe();
-    for prefix in [
-        GUILD_KEY,
-        CHANNEL_KEY,
-        MESSAGE_KEY,
-        ROLE_KEY,
-        EMOJI_KEY,
-        MEMBER_KEY,
-        PRESENCE_KEY,
-        VOICE_KEY,
-    ] {
+    for (prefix, _) in STATE_GAUGES {
         pipe.cmd("SCARD").arg(type_index(prefix));
     }
-    Ok(pipe.query_async(conn).await?)
+    let counts: Vec<i64> = pipe.query_async(conn).await?;
+    // Counts that do not line up with the gauges would land on the wrong ones.
+    if counts.len() != STATE_GAUGES.len() {
+        return Err(format!(
+            "expected {} state counts, got {}",
+            STATE_GAUGES.len(),
+            counts.len()
+        )
+        .into());
+    }
+    for ((_, gauge), count) in STATE_GAUGES.iter().zip(counts) {
+        gauge.set(count);
+    }
+    Ok(())
 }
 
 /// Update gauges and the health state every second.
@@ -384,26 +493,8 @@ pub async fn run_jobs<C: ConnectionLike + Send>(
             shard_silence,
         ));
 
-        match state_counts(&mut conn).await {
-            Ok(counts) if counts.len() == 8 => {
-                for (gauge, value) in [
-                    &*STATE_GUILDS,
-                    &*STATE_CHANNELS,
-                    &*STATE_MESSAGES,
-                    &*STATE_ROLES,
-                    &*STATE_EMOJIS,
-                    &*STATE_MEMBERS,
-                    &*STATE_PRESENCES,
-                    &*STATE_VOICES,
-                ]
-                .into_iter()
-                .zip(counts)
-                {
-                    gauge.set(value as i64);
-                }
-            }
-            Ok(_) => {}
-            Err(err) => warn!("Failed to get state stats: {}", err),
+        if let Err(err) = update_state_gauges(&mut conn).await {
+            warn!("Failed to get state stats: {}", err);
         }
 
         tokio::time::sleep(Duration::from_millis(METRICS_JOB_INTERVAL_MS)).await;
@@ -479,12 +570,12 @@ mod tests {
         assert_eq!(body["problems"][0], "shard 1 is stuck");
     }
 
-    fn snapshot(active: bool, fatal: bool, silent_secs: u64) -> ShardSnapshot {
+    fn snapshot(now: Instant, active: bool, fatal: bool, silent_secs: u64) -> ShardSnapshot {
         ShardSnapshot {
             active,
             fatal,
             close_code: fatal.then_some(4014),
-            last_message: std::time::Instant::now().checked_sub(Duration::from_secs(silent_secs)),
+            last_message: Some(now - Duration::from_secs(silent_secs)),
             ..ShardSnapshot::default()
         }
     }
@@ -492,31 +583,111 @@ mod tests {
     #[test]
     fn only_stuck_connected_shards_fail_the_healthcheck() {
         let silence = Duration::from_secs(180);
-        let healthy = compute_health(&[(0, snapshot(true, false, 10))], true, silence);
-        assert!(healthy.problems.is_empty() && healthy.warnings.is_empty());
+        // An hour ahead, so the snapshots can lie up to an hour before it
+        // however recently the host booted.
+        let now = Instant::now() + Duration::from_secs(3600);
+        let health = |snapshot, amqp| compute_health_at(&[(0, snapshot)], amqp, silence, now);
 
-        let stuck = compute_health(&[(0, snapshot(true, false, 600))], true, silence);
+        let healthy = health(snapshot(now, true, false, 10), true);
+        assert!(healthy.problems.is_empty() && healthy.warnings.is_empty());
+        let current = snapshot(Instant::now(), true, false, 0);
+        assert!(compute_health(&[(0, current)], true, silence)
+            .problems
+            .is_empty());
+
+        let stuck = health(snapshot(now, true, false, 600), true);
         assert_eq!(stuck.problems.len(), 1);
 
         // Disconnected shards are twilight's to reconnect; a restart would not help.
-        let reconnecting = compute_health(&[(0, snapshot(false, false, 600))], true, silence);
+        let reconnecting = health(snapshot(now, false, false, 600), true);
         assert!(reconnecting.problems.is_empty());
 
-        // Fatal closes and broker outages are warnings: restarting would only
-        // burn identifies.
-        let mut closing = snapshot(false, false, 600);
-        closing.close_wait_since = std::time::Instant::now().checked_sub(CLOSE_WAIT_LIMIT * 2);
-        let stuck_closing = compute_health(&[(0, closing)], true, silence);
+        let mut closing = snapshot(now, false, false, 600);
+        closing.close_wait_since = Some(now - CLOSE_WAIT_LIMIT * 2);
+        let stuck_closing = health(closing, true);
         assert_eq!(
             stuck_closing.problems.len(),
             1,
             "waiting forever for a close"
         );
 
-        let fatal = compute_health(&[(0, snapshot(false, true, 600))], false, silence);
+        // Fatal closes and broker outages are warnings: restarting would only
+        // burn identifies.
+        let fatal = health(snapshot(now, false, true, 600), false);
         assert!(fatal.problems.is_empty());
         assert_eq!(fatal.warnings.len(), 2);
         assert!(fatal.warnings[0].contains("4014"));
+    }
+
+    #[test]
+    fn every_metric_is_registered_by_init() {
+        let defined = include_str!("metrics.rs")
+            .lines()
+            .filter(|line| {
+                ["counter!(", "counter_vec!(", "gauge!(", "gauge_vec!("]
+                    .iter()
+                    .any(|call| line.starts_with(call))
+            })
+            .count();
+        assert_eq!(ALL.len(), defined, "every metric is listed in ALL");
+
+        init();
+        // Vectors are only listed once they have a child.
+        let names: Vec<String> = prometheus::gather()
+            .iter()
+            .map(|family| family.name().to_owned())
+            .collect();
+        for name in ["state_threads", "amqp_reconnects", "amqp_publish_failures"] {
+            assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn state_gauges_count_each_type_once() {
+        for (i, (prefix, gauge)) in STATE_GAUGES.iter().enumerate() {
+            for (other_prefix, other) in &STATE_GAUGES[i + 1..] {
+                assert_ne!(prefix, other_prefix);
+                assert!(!std::ptr::eq(*gauge, *other), "{prefix} shares a gauge");
+            }
+        }
+    }
+
+    /// Answers every pipeline with one value.
+    struct ShortReply;
+
+    impl ConnectionLike for ShortReply {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, redis::Value> {
+            Box::pin(async { Ok(redis::Value::Int(1)) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a redis::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+            Box::pin(async { Ok(vec![redis::Value::Int(1)]) })
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn counts_that_do_not_match_the_gauges_are_an_error() {
+        STATE_GUILDS.set(-5);
+        let result = update_state_gauges(&mut ShortReply).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("got 1")),
+            "{result:?}"
+        );
+        assert_eq!(STATE_GUILDS.get(), -5, "no count is assigned to a guess");
     }
 
     #[test]
