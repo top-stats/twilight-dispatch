@@ -7,6 +7,12 @@
 //! one guild are applied in order by the same worker (see
 //! [`crate::gateway::worker`]), which makes the read-modify-write updates here
 //! safe.
+//!
+//! READY is the exception: it commits the bot user and the guild stubs in one
+//! transaction, then removes each stale guild of the shard in a transaction
+//! of its own, which keeps every transaction the size of one guild. A failure
+//! part way leaves the remaining stale guilds to the shard's next READY, which
+//! finds them the same way.
 
 pub mod batch;
 pub mod jobs;
@@ -18,7 +24,7 @@ use crate::{
     config::StateConfig,
     constants::{
         channel_key, emoji_key, guild_key, member_key, message_key, presence_key, role_key,
-        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, GUILD_KEY, THREAD_KEY,
+        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, GUILD_KEY,
     },
     models::ApiResult,
 };
@@ -36,7 +42,7 @@ use twilight_model::{
     },
     guild::{Guild, Member},
     id::{
-        marker::{GuildMarker, UserMarker},
+        marker::{ChannelMarker, GuildMarker, UserMarker},
         Id,
     },
     voice::VoiceState,
@@ -141,10 +147,10 @@ async fn clear_channel<C: ConnectionLike + Send>(
 async fn clear_guild<C: ConnectionLike + Send>(
     conn: &mut C,
     batch: &mut Batch,
-    guild_id: u64,
+    guild_id: Id<GuildMarker>,
     keep: &HashSet<u64>,
 ) -> ApiResult<Option<Value>> {
-    let key = format!("{GUILD_KEY}:{guild_id}");
+    let key = guild_key(guild_id);
     let index = keys::guild_index(guild_id);
     let previous = get(conn, &key).await?;
 
@@ -155,13 +161,14 @@ async fn clear_guild<C: ConnectionLike + Send>(
             }
             continue;
         }
-        match keys::channel_id_of(&child) {
-            Some(channel_id) if keep.contains(&channel_id) => {}
+        // Ids are never zero; a `channel:0` is removed like any other child.
+        match keys::channel_id_of(&child).and_then(Id::new_checked) {
+            Some(channel_id) if keep.contains(&channel_id.get()) => {}
             Some(channel_id) => {
                 // Stored channel keys lose their guild; re-add it so the
                 // channel is also removed from guild_keys:<guild>.
-                let logical = format!("channel:{guild_id}:{channel_id}");
-                clear_channel(conn, batch, &logical, channel_id).await?;
+                let logical = channel_key(Some(guild_id), channel_id);
+                clear_channel(conn, batch, &logical, channel_id.get()).await?;
             }
             None => batch.del(&child),
         }
@@ -176,15 +183,13 @@ async fn clear_guild<C: ConnectionLike + Send>(
 /// Cached threads of a guild, optionally only those under `parents`.
 async fn cached_threads<C: ConnectionLike + Send>(
     conn: &mut C,
-    guild_id: u64,
+    guild_id: Id<GuildMarker>,
     parents: Option<&HashSet<u64>>,
-) -> ApiResult<Vec<u64>> {
+) -> ApiResult<Vec<Id<ChannelMarker>>> {
     let threads = members(conn, &keys::thread_index(guild_id)).await?;
+    let thread_id = |key: &str| keys::thread_id_of(key).and_then(Id::new_checked);
     let Some(parents) = parents else {
-        return Ok(threads
-            .iter()
-            .filter_map(|key| keys::thread_id_of(key))
-            .collect());
+        return Ok(threads.iter().filter_map(|key| thread_id(key)).collect());
     };
     let values = get_all(conn, &threads).await?;
     Ok(threads
@@ -192,7 +197,7 @@ async fn cached_threads<C: ConnectionLike + Send>(
         .zip(values)
         .filter_map(|(key, value)| {
             let parent = value?.get("parent_id")?.as_str()?.parse::<u64>().ok()?;
-            parents.contains(&parent).then(|| keys::thread_id_of(key))?
+            parents.contains(&parent).then(|| thread_id(key))?
         })
         .collect())
 }
@@ -201,12 +206,11 @@ async fn cached_threads<C: ConnectionLike + Send>(
 async fn clear_threads<C: ConnectionLike + Send>(
     conn: &mut C,
     batch: &mut Batch,
-    guild_id: u64,
-    threads: impl IntoIterator<Item = u64>,
+    guild_id: Id<GuildMarker>,
+    threads: impl IntoIterator<Item = Id<ChannelMarker>>,
 ) -> ApiResult<()> {
     for thread in threads {
-        let key = format!("{THREAD_KEY}:{guild_id}:{thread}");
-        clear_channel(conn, batch, &key, thread).await?;
+        clear_channel(conn, batch, &thread_key(guild_id, thread), thread.get()).await?;
     }
     Ok(())
 }
@@ -319,12 +323,19 @@ fn merge_presence(cached: Option<Value>, update: Value) -> Value {
 ///
 /// GUILD_CREATE's lists are moved out of `event` into their own keys, so only
 /// the guild's scalar fields are left in it afterwards.
+///
+/// With the cache disabled (`STATE_ENABLED=false`) nothing is read or written.
+/// The callers skip it then too, but a new call site must not be able to
+/// write to a Redis that other services expect to be left alone.
 pub async fn update<C: ConnectionLike + Send>(
     conn: &mut C,
     event: &mut Event,
     ctx: &UpdateContext<'_>,
 ) -> ApiResult<Outcome> {
     let state = ctx.state;
+    if !state.enabled {
+        return Ok(Outcome::default());
+    }
     let mut batch = Batch::new();
     let mut outcome = Outcome::default();
 
@@ -347,8 +358,8 @@ pub async fn update<C: ConnectionLike + Send>(
             clear_channel(conn, &mut batch, &key, data.id.get()).await?;
             if let Some(guild_id) = data.guild_id {
                 let parent: HashSet<u64> = [data.id.get()].into_iter().collect();
-                let threads = cached_threads(conn, guild_id.get(), Some(&parent)).await?;
-                clear_threads(conn, &mut batch, guild_id.get(), threads).await?;
+                let threads = cached_threads(conn, guild_id, Some(&parent)).await?;
+                clear_threads(conn, &mut batch, guild_id, threads).await?;
             }
         }
         Event::ChannelPinsUpdate(data) => {
@@ -396,11 +407,11 @@ pub async fn update<C: ConnectionLike + Send>(
             // All active threads of `channel_ids` (or of the whole guild when
             // it is empty); cached threads that are not listed are gone.
             let parents: HashSet<u64> = data.channel_ids.iter().map(|id| id.get()).collect();
-            let listed: HashSet<u64> = data.threads.iter().map(|t| t.id.get()).collect();
+            let listed: HashSet<Id<ChannelMarker>> = data.threads.iter().map(|t| t.id).collect();
             let scope = (!parents.is_empty()).then_some(&parents);
-            let cached = cached_threads(conn, data.guild_id.get(), scope).await?;
+            let cached = cached_threads(conn, data.guild_id, scope).await?;
             let gone = cached.into_iter().filter(|id| !listed.contains(id));
-            clear_threads(conn, &mut batch, data.guild_id.get(), gone).await?;
+            clear_threads(conn, &mut batch, data.guild_id, gone).await?;
             for thread in &data.threads {
                 set_channel(&mut batch, Some(data.guild_id), thread)?;
             }
@@ -413,7 +424,7 @@ pub async fn update<C: ConnectionLike + Send>(
                     .chain(&guild.threads)
                     .map(|channel| channel.id.get())
                     .collect();
-                let previous = clear_guild(conn, &mut batch, guild.id.get(), &keep).await?;
+                let previous = clear_guild(conn, &mut batch, guild.id, &keep).await?;
                 outcome.guild_known = previous.is_some();
                 outcome.old = old_if(ctx, previous.clone());
                 outcome.previous_guild = previous;
@@ -442,8 +453,7 @@ pub async fn update<C: ConnectionLike + Send>(
                 )?;
                 outcome.previous_guild = previous;
             } else {
-                let previous =
-                    clear_guild(conn, &mut batch, data.id.get(), &HashSet::new()).await?;
+                let previous = clear_guild(conn, &mut batch, data.id, &HashSet::new()).await?;
                 outcome.old = old_if(ctx, previous.clone());
                 outcome.previous_guild = previous;
             }
@@ -471,11 +481,10 @@ pub async fn update<C: ConnectionLike + Send>(
         }
         Event::GuildEmojisUpdate(data) => {
             if state.emoji {
-                let prefix = format!("{EMOJI_KEY}:");
-                let cached: Vec<String> = members(conn, &keys::guild_index(data.guild_id.get()))
+                let cached: Vec<String> = members(conn, &keys::guild_index(data.guild_id))
                     .await?
                     .into_iter()
-                    .filter(|key| key.starts_with(&prefix))
+                    .filter(|key| keys::has_prefix(key, EMOJI_KEY))
                     .collect();
                 let keep: HashSet<String> = data
                     .emojis
@@ -697,7 +706,9 @@ fn write_guild(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &mut Guild) ->
     let state = ctx.state;
     let guild_id = guild.id;
 
-    // Threads are cached as channels and, as before, also kept in the blob.
+    // Threads get their own keys, which the thread events keep current. As in
+    // earlier versions, the blob also keeps this list of them: a snapshot as
+    // of GUILD_CREATE, for compatibility.
     let channels = std::mem::take(&mut guild.channels);
     for channel in channels.iter().chain(guild.threads.iter()) {
         set_channel(batch, Some(guild_id), channel)?;
@@ -815,7 +826,8 @@ async fn ready<C: ConnectionLike + Send>(
             .await?
             .into_iter()
             .filter_map(|key| keys::guild_id_of(&key));
-        for guild_id in keys::stale_guilds(cached, &listed, shard.number(), shard.total()) {
+        let stale = keys::stale_guilds(cached, &listed, shard.number(), shard.total());
+        for guild_id in stale.into_iter().filter_map(Id::new_checked) {
             let mut batch = Batch::new();
             clear_guild(conn, &mut batch, guild_id, &HashSet::new()).await?;
             batch.commit(conn).await?;

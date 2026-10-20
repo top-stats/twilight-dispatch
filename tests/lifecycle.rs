@@ -11,6 +11,21 @@ use serde_json::json;
 /// time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A removed thread must also leave every index that listed it, or the
+/// indexes point at keys that no longer exist.
+async fn assert_thread_unindexed(conn: &mut redis::aio::ConnectionManager, thread: u64) {
+    let key = format!("thread:1000:{thread}");
+    assert!(!exists(conn, &key).await, "{key}");
+    for set in ["thread_keys:1000", "guild_keys:1000", "thread_keys"] {
+        assert!(
+            !members(conn, set).await.contains(&key),
+            "{key} still in {set}"
+        );
+    }
+    let messages = format!("channel_keys:{thread}");
+    assert!(members(conn, &messages).await.is_empty(), "{messages}");
+}
+
 #[tokio::test]
 async fn guild_create_keeps_messages_of_channels_it_still_lists() {
     let _serial = SERIAL.lock().await;
@@ -83,9 +98,44 @@ async fn deleting_a_channel_removes_its_threads() {
         "thread of the deleted channel"
     );
     assert!(!exists(&mut conn, "message:1005:1").await);
+    assert_thread_unindexed(&mut conn, 1005).await;
+    assert!(members(&mut conn, "message_keys").await.is_empty());
     assert!(
         exists(&mut conn, "channel:1004").await,
         "other channels stay"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_thread_removes_it_from_every_index() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(7).await else {
+        return;
+    };
+    let state = state_all();
+    apply(&mut conn, &state, "GUILD_CREATE", guild(1000, "g")).await;
+    apply(&mut conn, &state, "THREAD_CREATE", thread(1006, 1000, 1004)).await;
+    apply(
+        &mut conn,
+        &state,
+        "MESSAGE_CREATE",
+        message(1, 1005, Some(1000), "in thread"),
+    )
+    .await;
+
+    apply(
+        &mut conn,
+        &state,
+        "THREAD_DELETE",
+        json!({"id": "1005", "guild_id": "1000", "parent_id": "1003", "type": 11}),
+    )
+    .await;
+    assert!(!exists(&mut conn, "message:1005:1").await);
+    assert_thread_unindexed(&mut conn, 1005).await;
+    assert_eq!(
+        members(&mut conn, "thread_keys:1000").await,
+        vec!["thread:1000:1006"],
+        "other threads stay"
     );
 }
 
@@ -108,7 +158,12 @@ async fn only_active_threads_are_cached() {
     )
     .await;
     assert!(!exists(&mut conn, "thread:1000:1005").await);
+    assert_thread_unindexed(&mut conn, 1005).await;
     assert!(exists(&mut conn, "thread:1000:1006").await);
+    assert_eq!(
+        members(&mut conn, "thread_keys:1000").await,
+        vec!["thread:1000:1006"]
+    );
 
     let mut archived = thread(1006, 1000, 1003);
     archived["thread_metadata"]["archived"] = json!(true);
@@ -117,9 +172,8 @@ async fn only_active_threads_are_cached() {
         !exists(&mut conn, "thread:1000:1006").await,
         "archived threads are dropped"
     );
-    assert!(!members(&mut conn, "guild_keys:1000")
-        .await
-        .contains(&"thread:1000:1006".to_owned()));
+    assert_thread_unindexed(&mut conn, 1006).await;
+    assert!(members(&mut conn, "thread_keys").await.is_empty());
 }
 
 #[tokio::test]

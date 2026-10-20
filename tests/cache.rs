@@ -6,8 +6,13 @@
 mod common;
 
 use common::*;
+use redis::aio::ConnectionLike;
 use serde_json::json;
-use twilight_dispatch::{cache::jobs, config::StateConfig};
+use twilight_dispatch::{
+    cache::{self, jobs, Outcome, UpdateContext},
+    config::StateConfig,
+    metrics,
+};
 
 #[tokio::test]
 async fn guild_create_splits_the_guild_into_keys() {
@@ -684,4 +689,120 @@ async fn disabled_features_write_nothing() {
         .await
         .unwrap();
     assert!(keys.is_empty(), "{keys:?}");
+}
+
+/// A Redis connection that fails (and counts) every command.
+#[derive(Default)]
+struct Untouchable {
+    calls: usize,
+}
+
+impl Untouchable {
+    fn fail<'a, T: Send + 'a>(&mut self) -> redis::RedisFuture<'a, T> {
+        self.calls += 1;
+        Box::pin(async { Err(std::io::Error::other("Redis must not be used").into()) })
+    }
+}
+
+impl ConnectionLike for Untouchable {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        _cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        self.fail()
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        _pipeline: &'a redis::Pipeline,
+        _offset: usize,
+        _count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        self.fail()
+    }
+
+    fn get_db(&self) -> i64 {
+        0
+    }
+}
+
+/// STATE_ENABLED=false must leave Redis alone even for a caller that does not
+/// check it itself. Every other flag is on, so anything would be written.
+#[tokio::test]
+async fn a_disabled_cache_sends_nothing_to_redis() {
+    let disabled = StateConfig {
+        enabled: false,
+        ..state_all()
+    };
+    let ctx = UpdateContext {
+        state: &disabled,
+        bot_id: Some(bot_id()),
+        now_ms: now_ms(),
+    };
+    let mut added = member(30, &[]);
+    added["guild_id"] = json!("1000");
+    added["joined_at"] = json!(now_iso());
+    let events = [
+        ("READY", ready([0, 1], &[1000, 2000])),
+        ("GUILD_CREATE", guild(1000, "g")),
+        ("CHANNEL_DELETE", channel(1003, Some(1000), "general")),
+        ("MESSAGE_CREATE", message(1, 1003, Some(1000), "hi")),
+        ("GUILD_MEMBER_ADD", added),
+        ("PRESENCE_UPDATE", presence(1000, 10, "online")),
+        ("USER_UPDATE", ready([0, 1], &[])["user"].clone()),
+        ("GUILD_DELETE", json!({"id": "1000"})),
+    ];
+    let mut conn = Untouchable::default();
+    for (kind, d) in events {
+        let mut typed = event(kind, d);
+        let outcome = cache::update(&mut conn, &mut typed, &ctx).await;
+        assert_eq!(outcome.unwrap(), Outcome::default(), "{kind}");
+    }
+    assert_eq!(conn.calls, 0);
+}
+
+/// Each state gauge counts its own type index: every index gets a different
+/// size, so a gauge that reads another index's count shows up.
+#[tokio::test]
+async fn state_gauges_count_their_own_type() {
+    let Some(mut conn) = redis(0).await else {
+        return;
+    };
+    let gauges = [
+        ("guild_keys", &metrics::STATE_GUILDS),
+        ("channel_keys", &metrics::STATE_CHANNELS),
+        ("message_keys", &metrics::STATE_MESSAGES),
+        ("role_keys", &metrics::STATE_ROLES),
+        ("emoji_keys", &metrics::STATE_EMOJIS),
+        ("member_keys", &metrics::STATE_MEMBERS),
+        ("presence_keys", &metrics::STATE_PRESENCES),
+        ("voice_keys", &metrics::STATE_VOICES),
+        ("thread_keys", &metrics::STATE_THREADS),
+    ];
+    assert_eq!(
+        gauges.len(),
+        metrics::STATE_GAUGES.len(),
+        "a gauge is untested"
+    );
+    for (count, (set, _)) in (1..).zip(&gauges) {
+        let members: Vec<String> = (0..count).map(|n| format!("{set}:{n}")).collect();
+        redis::cmd("SADD")
+            .arg(set)
+            .arg(members)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+    }
+    // Per-guild indexes are not types.
+    redis::cmd("SADD")
+        .arg("thread_keys:1000")
+        .arg((0..20).map(|n| n.to_string()).collect::<Vec<_>>())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    metrics::update_state_gauges(&mut conn).await.unwrap();
+    let counted: Vec<(&str, i64)> = gauges.iter().map(|(set, g)| (*set, g.get())).collect();
+    let expected: Vec<(&str, i64)> = (1..).zip(&gauges).map(|(n, (set, _))| (*set, n)).collect();
+    assert_eq!(counted, expected);
 }
