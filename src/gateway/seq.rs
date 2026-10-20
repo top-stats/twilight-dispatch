@@ -16,8 +16,11 @@ use std::{
 /// Discord only keeps a session resumable for a few minutes, so older failures
 /// cannot be replayed anyway.
 pub const FAILED_RETENTION: Duration = Duration::from_secs(15 * 60);
-/// At most one failure is remembered per this interval.
-const FAILED_GRANULARITY: Duration = Duration::from_secs(1);
+/// At most one failure is remembered per this interval. Failures within it
+/// share the entry (and the time) of the first one, so a failure can stop
+/// holding the resume point back up to this much before [`FAILED_RETENTION`]
+/// has passed; tests that check the retention need this bound.
+pub const FAILED_GRANULARITY: Duration = Duration::from_secs(1);
 
 /// Identifies one dispatched payload; hand it back to [`SeqTracker::complete`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,5 +255,49 @@ mod tests {
         assert_eq!(tracker.resume_seq(), 4);
         tracker.complete(b);
         assert_eq!(tracker.resume_seq(), 5);
+    }
+
+    #[test]
+    fn failures_from_an_old_session_are_ignored() {
+        let now = Instant::now();
+        let mut tracker = SeqTracker::new();
+        tracker.new_session(1);
+        let old = tracker.dispatch(2);
+
+        tracker.new_session(10);
+        tracker.fail(old, now);
+        assert_eq!(
+            tracker.resume_seq_at(now),
+            10,
+            "a failure of the old session does not hold the new one back"
+        );
+        assert!(tracker.failed.is_empty());
+    }
+
+    #[test]
+    fn failures_are_held_for_fifteen_minutes() {
+        assert_eq!(FAILED_RETENTION, Duration::from_secs(15 * 60));
+        assert_eq!(FAILED_GRANULARITY, Duration::from_secs(1));
+
+        let start = Instant::now();
+        let mut tracker = SeqTracker::new();
+        tracker.new_session(1);
+        let t5 = tracker.dispatch(5);
+        let t3 = tracker.dispatch(3);
+        tracker.fail(t5, start);
+        // Within the granularity: shares the first failure's entry and time.
+        tracker.fail(t3, start + FAILED_GRANULARITY - Duration::from_millis(1));
+        assert_eq!(tracker.failed.len(), 1);
+
+        let released = start + FAILED_RETENTION;
+        assert_eq!(
+            tracker.resume_seq_at(released - Duration::from_millis(1)),
+            2
+        );
+        assert_eq!(
+            tracker.resume_seq_at(released),
+            5,
+            "released up to the granularity early"
+        );
     }
 }

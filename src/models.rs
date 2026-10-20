@@ -219,4 +219,16 @@ mod tests {
         };
         assert!(!empty.is_resumable());
     }
+
+    #[test]
+    fn a_session_needs_both_an_id_and_a_sequence() {
+        let session = |id: &str, sequence| SessionInfo {
+            session_id: id.to_owned(),
+            sequence,
+            resume_url: None,
+        };
+        assert!(session("abc", 1).is_resumable());
+        assert!(!session("abc", 0).is_resumable(), "nothing received yet");
+        assert!(!session("", 5).is_resumable(), "no session id");
+    }
 }

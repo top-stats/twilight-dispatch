@@ -25,7 +25,9 @@ impl Throttle {
         self.check_at(Instant::now())
     }
 
-    fn check_at(&self, now: Instant) -> Option<u64> {
+    /// [`Throttle::check`] at a given time, so tests need not sleep through
+    /// the interval.
+    pub fn check_at(&self, now: Instant) -> Option<u64> {
         let Ok(mut state) = self.state.lock() else {
             return Some(0);
         };
@@ -62,5 +64,32 @@ mod tests {
         assert_eq!(throttle.check_at(start + Duration::from_secs(1)), None);
         assert_eq!(throttle.check_at(start + Duration::from_secs(6)), Some(2));
         assert_eq!(throttle.check_at(start + Duration::from_secs(7)), None);
+    }
+
+    #[test]
+    fn the_interval_runs_from_the_last_logged_message() {
+        let interval = Duration::from_secs(5);
+        let just_before = interval - Duration::from_nanos(1);
+        let throttle = Throttle::new(interval);
+        let start = Instant::now();
+        assert_eq!(throttle.check_at(start), Some(0));
+        assert_eq!(throttle.check_at(start + just_before), None);
+        assert_eq!(
+            throttle.check_at(start + interval),
+            Some(1),
+            "exactly one interval"
+        );
+
+        // Suppressed checks do not push the next message back.
+        let logged = start + interval;
+        for second in 1..5 {
+            assert_eq!(
+                throttle.check_at(logged + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert_eq!(throttle.check_at(logged + interval), Some(4));
+        // The count starts over after it was reported.
+        assert_eq!(throttle.check_at(logged + interval * 2), Some(0));
     }
 }
