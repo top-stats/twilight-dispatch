@@ -161,7 +161,8 @@ async fn clear_guild<C: ConnectionLike + Send>(
             }
             continue;
         }
-        // Ids are never zero; a `channel:0` is removed like any other child.
+        // twilight never produces id 0; a `channel:0` would only be deleted,
+        // without looking up its messages.
         match keys::channel_id_of(&child).and_then(Id::new_checked) {
             Some(channel_id) if keep.contains(&channel_id.get()) => {}
             Some(channel_id) => {

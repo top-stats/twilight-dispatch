@@ -878,6 +878,14 @@ pub(crate) mod tests {
         ] {
             assert_invalid("DISCORD_GATEWAY_URL", &[("DISCORD_GATEWAY_URL", value)]);
         }
+        // Parses on its own, but not once twilight appends its query
+        // (http::Uri's length limit), which would panic in the connect.
+        let long = format!("ws://gw/{}", "a".repeat(65_500 - "ws://gw/".len()));
+        assert!(long.parse::<hyper::Uri>().is_ok());
+        assert_invalid(
+            "DISCORD_GATEWAY_URL",
+            &[("DISCORD_GATEWAY_URL", long.as_str())],
+        );
         assert_eq!(
             with(&[("DISCORD_GATEWAY_URL", " ")])
                 .unwrap()
