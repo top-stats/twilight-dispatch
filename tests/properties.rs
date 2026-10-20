@@ -2523,11 +2523,9 @@ fn every_documented_variable_is_still_read() {
     assert!(missing.is_empty(), "no longer read: {missing:?}");
 }
 
-/// `DISCORD_GATEWAY_URL=ws://` (no host) is accepted and trimmed to `ws:`,
-/// which only fails later, when the shards try to connect.
+/// `DISCORD_GATEWAY_URL=ws://` (no host) is a config error. It used to be
+/// trimmed to `ws:`, which twilight cannot parse when a shard connects.
 #[test]
-#[ignore = "BUG (minor): DISCORD_GATEWAY_URL without a host (ws://, wss:///) is accepted \
-            and becomes \"ws:\" instead of a config error"]
 fn gateway_url_needs_a_host() {
     for value in ["ws://", "wss://", "ws:///"] {
         let mut env = example_env();
@@ -2543,6 +2541,286 @@ fn gateway_url_needs_a_host() {
             ),
             "{value} -> {result:?}"
         );
+    }
+}
+
+/// One piece of a URL: `good` as operators write it, or one of `bad`, a
+/// mistake that makes the whole value invalid wherever it occurs.
+fn url_piece(good: BoxedStrategy<String>, bad: &[&str]) -> BoxedStrategy<(String, bool)> {
+    let bad: Vec<String> = bad.iter().map(|piece| (*piece).to_owned()).collect();
+    prop_oneof![
+        8 => good.prop_map(|piece| (piece, true)),
+        1 => prop::sample::select(bad).prop_map(|piece| (piece, false)),
+    ]
+    .boxed()
+}
+
+fn one_of(pieces: &[&str]) -> BoxedStrategy<String> {
+    let pieces: Vec<String> = pieces.iter().map(|piece| (*piece).to_owned()).collect();
+    prop::sample::select(pieces).boxed()
+}
+
+/// `host[:port]`: names, IPv4 and IPv6 addresses, any 16-bit port.
+fn host_and_port() -> BoxedStrategy<(String, bool)> {
+    let host = url_piece(
+        prop_oneof![
+            "[A-Za-z][A-Za-z0-9-]{0,12}(\\.[a-z0-9-]{1,8}){0,2}",
+            any::<std::net::Ipv4Addr>().prop_map(|ip| ip.to_string()),
+            any::<std::net::Ipv6Addr>().prop_map(|ip| format!("[{ip}]")),
+        ]
+        .boxed(),
+        &[
+            "",
+            "gate way",
+            "gatewäy",
+            "gate\u{0}way",
+            "[::1",
+            "@gateway",
+            "user@gateway",
+            "user:pass@gateway",
+        ],
+    );
+    // http::Uri accepts the bad ports; the clients would then quietly
+    // connect to the scheme's default port.
+    let port = url_piece(
+        prop_oneof![
+            Just(String::new()),
+            any::<u16>().prop_map(|port| format!(":{port}")),
+        ]
+        .boxed(),
+        &[":", ":65536", ":99999", ":port", ":-1", ":80:90"],
+    );
+    (host, port)
+        .prop_map(|((host, host_ok), (port, port_ok))| {
+            (format!("{host}{port}"), host_ok && port_ok)
+        })
+        .boxed()
+}
+
+/// Whitespace around a value (Docker and Compose pass it on) and redundant
+/// trailing slashes.
+fn padding() -> BoxedStrategy<(String, String, String)> {
+    let space = || one_of(&["", " ", "\t", "\n", " \r\n"]);
+    (space(), one_of(&["", "/", "//", "///"]), space()).boxed()
+}
+
+/// A DISCORD_GATEWAY_URL and, when every piece of it is well formed, the
+/// value the config must keep (trimmed, without trailing `/`, path kept).
+fn gateway_url() -> BoxedStrategy<(String, Option<String>)> {
+    let scheme = url_piece(
+        one_of(&["ws", "wss"]),
+        &["", "http", "https", "WS", "Wss", "ws ", "ftp"],
+    );
+    let separator = url_piece(Just("://".to_owned()).boxed(), &[":", "//"]);
+    // RFC 3986 path characters (`%` included: http::Uri does not check the
+    // escapes); a query or fragment would swallow twilight's own query.
+    let path = url_piece(
+        prop::collection::vec("[A-Za-z0-9._~!$&'()*+,;=:@%-]{1,8}", 0..3)
+            .prop_map(|segments| segments.iter().map(|s| format!("/{s}")).collect::<String>())
+            .boxed(),
+        &[
+            "/a b",
+            "/a<b",
+            "/a`b",
+            "?v=10",
+            "/?v=10&encoding=json",
+            "/?",
+            "#x",
+            "/#",
+        ],
+    );
+    (scheme, separator, host_and_port(), path, padding())
+        .prop_map(|(scheme, separator, host, path, (left, slashes, right))| {
+            let value = format!(
+                "{left}{}{}{}{}{slashes}{right}",
+                scheme.0, separator.0, host.0, path.0
+            );
+            let well_formed = scheme.1 && separator.1 && host.1 && path.1;
+            let expected = format!("{}://{}{}", scheme.0, host.0, path.0);
+            (value, well_formed.then_some(expected))
+        })
+        .boxed()
+}
+
+/// A DISCORD_API_PROXY and, when it is well formed, the proxy it means.
+fn api_proxy() -> BoxedStrategy<(String, Option<(String, bool)>)> {
+    let scheme = url_piece(
+        one_of(&["http", "https"]),
+        &["", "ws", "HTTP", "ftp", "http "],
+    );
+    // twilight-http puts its own path after the address.
+    let suffix = url_piece(
+        Just(String::new()).boxed(),
+        &["/api", "/a/", "?x=1", "/?x=1", "#x", " x", "\tx"],
+    );
+    (scheme, host_and_port(), suffix, padding())
+        .prop_map(|(scheme, address, suffix, (left, slashes, right))| {
+            let value = format!(
+                "{left}{}://{}{}{slashes}{right}",
+                scheme.0, address.0, suffix.0
+            );
+            let well_formed = scheme.1 && address.1 && suffix.1;
+            (value, well_formed.then(|| (address.0, scheme.0 == "http")))
+        })
+        .boxed()
+}
+
+/// What the shards connect to for an accepted DISCORD_GATEWAY_URL: the URI
+/// twilight builds (vendor/twilight-gateway/src/shard.rs, `poll_connect`)
+/// passes the `ClientBuilder::uri` call twilight `expect`s, and the client
+/// uses all of the authority (no userinfo or unparsed port it would ignore).
+fn check_gateway_url(value: &str, url: &str) -> Result<(), TestCaseError> {
+    prop_assert_eq!(url, value.trim().trim_end_matches('/'));
+    let uri = format!(
+        "{url}/?v={}&encoding=json&compress=zstd-stream",
+        twilight_gateway::API_VERSION
+    );
+    let builder = tokio_websockets::ClientBuilder::new().uri(&uri);
+    prop_assert!(builder.is_ok(), "{:?} -> {:?}", value, uri);
+    let parsed: hyper::Uri = uri.parse().unwrap();
+    prop_assert!(matches!(parsed.scheme_str(), Some("ws" | "wss")), "{}", uri);
+    prop_assert_eq!(
+        parsed.query(),
+        Some("v=10&encoding=json&compress=zstd-stream")
+    );
+    check_authority(&parsed)
+}
+
+/// What twilight-http requests for an accepted DISCORD_API_PROXY.
+fn check_api_proxy(value: &str, proxy: &config::DiscordProxy) -> Result<(), TestCaseError> {
+    let scheme = if proxy.use_http { "http" } else { "https" };
+    prop_assert!(
+        value.trim().starts_with(&format!("{scheme}://")),
+        "{:?}",
+        value
+    );
+    let url = format!(
+        "{scheme}://{}/api/v{}/gateway/bot",
+        proxy.address,
+        twilight_http::API_VERSION
+    );
+    let parsed: Result<hyper::Uri, _> = url.parse();
+    prop_assert!(parsed.is_ok(), "{:?} -> {:?}", value, url);
+    let parsed = parsed.unwrap();
+    prop_assert_eq!(parsed.path(), "/api/v10/gateway/bot");
+    prop_assert_eq!(parsed.query(), None);
+    prop_assert_eq!(
+        parsed.authority().map(|a| a.as_str()),
+        Some(&*proxy.address)
+    );
+    check_authority(&parsed)
+}
+
+/// The authority is a non-empty host and a port http::Uri parsed, nothing
+/// the clients would drop.
+fn check_authority(uri: &hyper::Uri) -> Result<(), TestCaseError> {
+    let host = uri.host().unwrap_or_default();
+    prop_assert!(!host.is_empty(), "{}", uri);
+    let port = uri
+        .port()
+        .map(|port| format!(":{}", port.as_str()))
+        .unwrap_or_default();
+    prop_assert_eq!(
+        uri.authority().map(|a| a.as_str()),
+        Some(&*format!("{host}{port}"))
+    );
+    Ok(())
+}
+
+/// Text that looks a bit like a URL, mostly printable ASCII.
+fn url_noise() -> BoxedStrategy<String> {
+    prop_oneof![
+        3 => (
+            "[ \t]{0,2}",
+            one_of(&["ws://", "wss://", "http://", "https://", "WS://", "ws:", "ws:/", ""]),
+            "[ -~]{0,24}",
+            "[ \t\n]{0,2}",
+        )
+            .prop_map(|(left, scheme, rest, right)| format!("{left}{scheme}{rest}{right}")),
+        1 => "(?s).{0,32}",
+    ]
+    .boxed()
+}
+
+proptest! {
+    #![proptest_config(cases(1024))]
+
+    #[test]
+    fn gateway_urls_are_accepted_exactly_when_well_formed((value, expected) in gateway_url()) {
+        let mut env = example_env();
+        env.insert("DISCORD_GATEWAY_URL".into(), value.clone());
+        match (load(&env), expected) {
+            (Ok(config), Some(expected)) => {
+                let url = config.discord_gateway_url.unwrap();
+                prop_assert_eq!(&url, &expected, "{:?}", value);
+                check_gateway_url(&value, &url)?;
+            }
+            (Err(ConfigError::Invalid { name: "DISCORD_GATEWAY_URL", .. }), None) => {}
+            (result, expected) => prop_assert!(
+                false,
+                "{:?}: expected {:?}, got {:?}",
+                value,
+                expected,
+                result.map(|config| config.discord_gateway_url)
+            ),
+        }
+    }
+
+    #[test]
+    fn api_proxies_are_accepted_exactly_when_well_formed((value, expected) in api_proxy()) {
+        let mut env = example_env();
+        env.insert("DISCORD_API_PROXY".into(), value.clone());
+        match (load(&env), expected) {
+            (Ok(config), Some((address, use_http))) => {
+                let proxy = config.discord_api_proxy.unwrap();
+                prop_assert_eq!((&proxy.address, proxy.use_http), (&address, use_http));
+                check_api_proxy(&value, &proxy)?;
+            }
+            (Err(ConfigError::Invalid { name: "DISCORD_API_PROXY", .. }), None) => {}
+            (result, expected) => prop_assert!(
+                false,
+                "{:?}: expected {:?}, got {:?}",
+                value,
+                expected,
+                result.map(|config| config.discord_api_proxy)
+            ),
+        }
+    }
+
+    /// Whatever is accepted is something twilight can use as written; the
+    /// rest is a config error, never a panic at the first connect.
+    #[test]
+    fn accepted_discord_endpoints_are_uris_twilight_uses_as_written(
+        gateway in prop_oneof![gateway_url().prop_map(|(value, _)| value), url_noise()],
+        proxy in prop_oneof![api_proxy().prop_map(|(value, _)| value), url_noise()],
+    ) {
+        let mut env = example_env();
+        env.insert("DISCORD_GATEWAY_URL".into(), gateway.clone());
+        match load(&env) {
+            Ok(config) => match config.discord_gateway_url {
+                Some(url) => check_gateway_url(&gateway, &url)?,
+                None => prop_assert!(gateway.trim().is_empty(), "{:?}", gateway),
+            },
+            Err(err) => prop_assert!(
+                matches!(err, ConfigError::Invalid { name: "DISCORD_GATEWAY_URL", .. }),
+                "{:?}",
+                err
+            ),
+        }
+
+        let mut env = example_env();
+        env.insert("DISCORD_API_PROXY".into(), proxy.clone());
+        match load(&env) {
+            Ok(config) => match config.discord_api_proxy {
+                Some(accepted) => check_api_proxy(&proxy, &accepted)?,
+                None => prop_assert!(proxy.trim().is_empty(), "{:?}", proxy),
+            },
+            Err(err) => prop_assert!(
+                matches!(err, ConfigError::Invalid { name: "DISCORD_API_PROXY", .. }),
+                "{:?}",
+                err
+            ),
+        }
     }
 }
 

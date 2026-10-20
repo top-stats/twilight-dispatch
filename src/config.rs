@@ -19,7 +19,9 @@ pub struct Config {
     pub bot_token: String,
     /// `None` means "use Discord's recommended shard count, all shards".
     pub shards: Option<ShardRange>,
-    /// Upper bound for identify concurrency; Discord's value is used if lower.
+    /// Upper bound for identify concurrency; Discord's value is used if lower,
+    /// and a value that does not divide it is lowered further (see
+    /// `gateway::concurrency`).
     pub shards_concurrency: Option<u16>,
     pub default_queue: bool,
     pub resume: bool,
@@ -48,6 +50,7 @@ pub struct Config {
     pub discord_api_proxy: Option<DiscordProxy>,
     /// Connect shards to this gateway URL instead of wss://gateway.discord.gg
     /// (e.g. a gateway proxy). Resumes still go to Discord's resume URL.
+    /// Trimmed and without a trailing `/`, as twilight appends `/?v=10&...`.
     pub discord_gateway_url: Option<String>,
 }
 
@@ -69,11 +72,70 @@ impl DiscordProxy {
             _ => return None,
         };
         let address = address.trim_end_matches('/');
-        (!address.is_empty() && !address.contains('/')).then(|| Self {
+        // twilight-http sends every request to `{scheme}://{address}/api/v10/...`,
+        // so anything but `host[:port]` ends up in the middle of those URLs: a
+        // path, query or fragment moves or swallows the API path (every
+        // request fails, long after the start) and userinfo is ignored.
+        if address.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@')) {
+            return None;
+        }
+        let url = format!(
+            "{scheme}://{address}/api/v{}/gateway/bot",
+            twilight_http::API_VERSION
+        );
+        let uri: hyper::Uri = url.parse().ok()?;
+        is_host_and_port(&uri).then(|| Self {
             address: address.to_owned(),
             use_http,
         })
     }
+}
+
+/// A `DISCORD_GATEWAY_URL` as twilight's `ConfigBuilder::proxy_url` takes it:
+/// `ws://` or `wss://`, a host, an optional port and path, trimmed and
+/// without a trailing `/`.
+///
+/// twilight appends `/?v=10&encoding=json&compress=zstd-stream` and
+/// `expect`s the result to parse inside the shard's connect future, so a
+/// value it cannot parse aborts the process (`panic = "abort"`). That can
+/// happen hours after the start: resumed shards connect to Discord's resume
+/// URL and only fall back to this one when a session is lost. A query or
+/// fragment would swallow twilight's `v` and `encoding`, so both are
+/// rejected too.
+fn parse_gateway_url(value: &str) -> Option<String> {
+    let url = value.trim().trim_end_matches('/');
+    if url.contains(['?', '#']) {
+        return None;
+    }
+    let uri: hyper::Uri = url.parse().ok()?;
+    let twilight = format!(
+        "{url}/?v={}&encoding=json&compress=zstd-stream",
+        twilight_gateway::API_VERSION
+    );
+    (matches!(uri.scheme_str(), Some("ws" | "wss"))
+        && is_host_and_port(&uri)
+        && twilight.parse::<hyper::Uri>().is_ok())
+    .then(|| url.to_owned())
+}
+
+/// Whether the authority of `uri` is a host with an optional 16-bit port and
+/// nothing else. `http::Uri` also accepts an empty host, userinfo and ports
+/// such as `99999` or `x`; twilight's clients ignore the userinfo and quietly
+/// connect to the scheme's default port when the port does not parse.
+fn is_host_and_port(uri: &hyper::Uri) -> bool {
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority.host();
+    !host.is_empty()
+        && match authority.as_str().strip_prefix(host) {
+            Some("") => true,
+            Some(port) => port
+                .strip_prefix(':')
+                .is_some_and(|port| port.parse::<u16>().is_ok()),
+            // Userinfo before the host.
+            None => false,
+        }
 }
 
 /// The part of the configuration the state cache needs.
@@ -317,28 +379,27 @@ impl Config {
             cache_timeout: Duration::from_millis(cache_timeout_ms),
             shard_silence: Duration::from_secs(shard_silence_secs),
             discord_api_proxy: match env.string("DISCORD_API_PROXY") {
-                Some(value) => {
-                    Some(
-                        DiscordProxy::parse(&value).ok_or_else(|| ConfigError::Invalid {
-                            name: "DISCORD_API_PROXY",
-                            value: value.clone(),
-                            reason: "expected http://host:port or https://host:port".into(),
-                        })?,
-                    )
-                }
+                Some(value) => Some(DiscordProxy::parse(&value).ok_or_else(|| {
+                    ConfigError::Invalid {
+                        name: "DISCORD_API_PROXY",
+                        value: value.clone(),
+                        reason: "expected http://host:port or https://host:port \
+                                 (no path, query or credentials)"
+                            .into(),
+                    }
+                })?),
                 None => None,
             },
             discord_gateway_url: match env.string("DISCORD_GATEWAY_URL") {
-                Some(url) if url.starts_with("ws://") || url.starts_with("wss://") => {
-                    Some(url.trim_end_matches('/').to_owned())
-                }
-                Some(url) => {
-                    return Err(ConfigError::Invalid {
+                Some(value) => Some(parse_gateway_url(&value).ok_or_else(|| {
+                    ConfigError::Invalid {
                         name: "DISCORD_GATEWAY_URL",
-                        value: url,
-                        reason: "expected a ws:// or wss:// URL".into(),
-                    })
-                }
+                        value: value.clone(),
+                        reason: "expected ws:// or wss:// with a host, an optional port and \
+                                 path, and no query, fragment or credentials"
+                            .into(),
+                    }
+                })?),
                 None => None,
             },
         })
@@ -346,12 +407,16 @@ impl Config {
 
     /// Variables that older versions required but that no longer do anything.
     pub fn obsolete_variables(lookup: Lookup<'_>) -> Vec<&'static str> {
-        ["CLUSTERS", "SHARDS_WAIT"]
-            .into_iter()
+        OBSOLETE_VARIABLES
+            .iter()
+            .copied()
             .filter(|name| lookup(name).is_some_and(|v| !v.trim().is_empty()))
             .collect()
     }
 }
+
+/// Reported at startup when set, so deployments learn they can drop them.
+const OBSOLETE_VARIABLES: &[&str] = &["CLUSTERS", "SHARDS_WAIT"];
 
 struct Env<'a>(Lookup<'a>);
 
@@ -420,7 +485,12 @@ fn encode(value: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::{
+        cell::RefCell,
+        collections::{BTreeSet, HashMap},
+    };
+
+    const ENV_EXAMPLE: &str = include_str!("../.env.example");
 
     /// The variables of `.env.example`, which every deployment started from.
     pub(crate) fn example_env() -> HashMap<&'static str, String> {
@@ -467,6 +537,35 @@ pub(crate) mod tests {
 
     fn load(env: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
         Config::from_lookup(&|name| env.get(name).cloned())
+    }
+
+    /// `example_env()` with `changes` applied (an empty value means unset).
+    fn with(changes: &[(&'static str, &str)]) -> Result<Config, ConfigError> {
+        let mut env = example_env();
+        env.extend(
+            changes
+                .iter()
+                .map(|&(name, value)| (name, value.to_owned())),
+        );
+        load(&env)
+    }
+
+    /// The uncommented `NAME=value` lines of the shipped `.env.example`.
+    fn shipped_env() -> HashMap<&'static str, String> {
+        ENV_EXAMPLE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.trim(), v.trim().to_owned()))
+            .collect()
+    }
+
+    fn assert_invalid(name: &str, changes: &[(&'static str, &str)]) {
+        let result = with(changes);
+        assert!(
+            matches!(&result, Err(ConfigError::Invalid { name: n, .. }) if *n == name),
+            "{changes:?} -> {result:?}"
+        );
     }
 
     #[test]
@@ -550,6 +649,74 @@ pub(crate) mod tests {
             load(&env).unwrap_err(),
             ConfigError::Missing("SHARDS_TOTAL")
         );
+
+        // A range that ends before it starts would make ShardRange::len
+        // underflow; SHARDS_START alone can do that too (END defaults to the
+        // last shard).
+        for (start, end, total) in [("3", "1", "4"), ("2", "", "2"), ("0", "0", "0")] {
+            assert_invalid(
+                "SHARDS_END",
+                &[
+                    ("SHARDS_START", start),
+                    ("SHARDS_END", end),
+                    ("SHARDS_TOTAL", total),
+                ],
+            );
+        }
+    }
+
+    /// One shard per process (e.g. per Swarm replica).
+    #[test]
+    fn a_process_may_run_a_single_shard() {
+        let config = with(&[
+            ("SHARDS_START", "1"),
+            ("SHARDS_END", "1"),
+            ("SHARDS_TOTAL", "2"),
+        ])
+        .unwrap();
+        let range = config.shards.unwrap();
+        assert_eq!(
+            range,
+            ShardRange {
+                start: 1,
+                end: 1,
+                total: 2
+            }
+        );
+        assert_eq!(range.len(), 1);
+        assert_eq!(range.ids().collect::<Vec<_>>(), [1]);
+        assert!(range.contains(1) && !range.contains(0) && !range.contains(2));
+
+        let range = with(&[
+            ("SHARDS_START", ""),
+            ("SHARDS_END", ""),
+            ("SHARDS_TOTAL", "1"),
+        ])
+        .unwrap()
+        .shards
+        .unwrap();
+        assert_eq!((range.start, range.end, range.len()), (0, 0, 1));
+    }
+
+    #[test]
+    fn shard_range_len_and_contains_agree_with_ids() {
+        let range = ShardRange {
+            start: 2,
+            end: 5,
+            total: 8,
+        };
+        assert_eq!(range.len(), 4);
+        assert_eq!(range.ids().collect::<Vec<_>>(), [2, 3, 4, 5]);
+        assert!(!range.contains(1) && range.contains(2) && range.contains(5));
+        assert!(!range.contains(6) && !range.contains(u32::MAX));
+
+        let widest = ShardRange {
+            start: 0,
+            end: u32::MAX - 1,
+            total: u32::MAX,
+        };
+        assert_eq!(widest.len(), u32::MAX);
+        assert!(widest.contains(0) && widest.contains(u32::MAX - 1));
     }
 
     #[test]
@@ -583,20 +750,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// The documented limits are inclusive on both sides.
+    #[test]
+    fn tuning_bounds_are_inclusive() {
+        for (name, accepted, rejected) in [
+            ("CACHE_TIMEOUT_MS", "100", "99"),
+            ("SHARD_SILENCE_SECS", "120", "119"),
+            ("WORKERS", "1", "0"),
+            ("WORKERS", "1024", "1025"),
+            ("LARGE_THRESHOLD", "50", "49"),
+            ("LARGE_THRESHOLD", "250", "251"),
+        ] {
+            let result = with(&[(name, accepted)]);
+            assert!(result.is_ok(), "{name}={accepted}: {result:?}");
+            assert_invalid(name, &[(name, rejected)]);
+        }
+        let config = with(&[
+            ("CACHE_TIMEOUT_MS", "100"),
+            ("SHARD_SILENCE_SECS", "120"),
+            ("WORKERS", "1024"),
+            ("LARGE_THRESHOLD", "50"),
+        ])
+        .unwrap();
+        assert_eq!(config.cache_timeout, Duration::from_millis(100));
+        assert_eq!(config.shard_silence, Duration::from_secs(120));
+        assert_eq!((config.workers, config.large_threshold), (1024, 50));
+    }
+
     #[test]
     fn shipped_env_example_loads() {
-        let env: HashMap<&'static str, String> = include_str!("../.env.example")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| {
-                (
-                    &*Box::leak(k.trim().to_owned().into_boxed_str()),
-                    v.trim().to_owned(),
-                )
-            })
-            .chain([("BOT_TOKEN", "token".to_owned())])
-            .collect();
+        let mut env = shipped_env();
+        env.insert("BOT_TOKEN", "token".into());
         let config = load(&env).unwrap();
         assert_eq!(
             config.shards,
@@ -649,6 +833,203 @@ pub(crate) mod tests {
         }
     }
 
+    /// twilight appends `/?v=10&encoding=json&compress=zstd-stream` to the
+    /// gateway URL and panics (aborting the process) if that does not parse.
+    #[test]
+    fn gateway_url_is_a_uri_twilight_can_connect_to() {
+        for (value, expected) in [
+            ("ws://gateway:8080", "ws://gateway:8080"),
+            ("wss://gateway.discord.gg/", "wss://gateway.discord.gg"),
+            // Docker and Compose do not trim values (dotenvy does).
+            ("ws://gateway:8080 ", "ws://gateway:8080"),
+            (" \tws://127.0.0.1:9000//\n", "ws://127.0.0.1:9000"),
+            ("ws://proxy:8080/gateway/", "ws://proxy:8080/gateway"),
+            ("ws://[::1]:7878/a/b", "ws://[::1]:7878/a/b"),
+        ] {
+            let config = with(&[("DISCORD_GATEWAY_URL", value)]).unwrap();
+            let url = config.discord_gateway_url.unwrap();
+            assert_eq!(url, expected, "{value:?}");
+            let uri: hyper::Uri = format!("{url}/?v=10&encoding=json&compress=zstd-stream")
+                .parse()
+                .unwrap();
+            assert_eq!(uri.query(), Some("v=10&encoding=json&compress=zstd-stream"));
+        }
+        for value in [
+            "ws://",
+            "wss://",
+            "ws:///",
+            "ws:",
+            "ws://gate way:8080",
+            "ws://gateway:8080 x",
+            "ws://gatewäy",
+            "ws://:8080",
+            // http::Uri accepts these ports; the client would use port 80.
+            "ws://gateway:99999",
+            "ws://gateway:port",
+            "ws://gateway:",
+            "ws://user:pass@gateway",
+            "WSS://gateway.discord.gg",
+            "http://gateway",
+            "gateway:8080",
+            // Discord's documented URL: twilight adds its own query.
+            "wss://gateway.discord.gg/?v=10&encoding=json",
+            "ws://gateway?x",
+            "ws://gateway/#fragment",
+        ] {
+            assert_invalid("DISCORD_GATEWAY_URL", &[("DISCORD_GATEWAY_URL", value)]);
+        }
+        assert_eq!(
+            with(&[("DISCORD_GATEWAY_URL", " ")])
+                .unwrap()
+                .discord_gateway_url,
+            None
+        );
+    }
+
+    /// twilight-http requests `{scheme}://{address}/api/v10/...`.
+    #[test]
+    fn api_proxy_is_a_host_and_port() {
+        for (value, address, use_http) in [
+            ("http://proxy:3000", "proxy:3000", true),
+            (" https://proxy/ ", "proxy", false),
+            ("http://[::1]:3000", "[::1]:3000", true),
+        ] {
+            let proxy = with(&[("DISCORD_API_PROXY", value)])
+                .unwrap()
+                .discord_api_proxy
+                .unwrap();
+            assert_eq!(
+                proxy,
+                DiscordProxy {
+                    address: address.into(),
+                    use_http
+                },
+                "{value:?}"
+            );
+        }
+        for value in [
+            "http://",
+            "http:///",
+            "http://:3000",
+            "http://pro xy:3000",
+            "http://proxy:3000\tx",
+            "http://proxy:3000?x=1",
+            "http://proxy:3000#x",
+            "http://user:pass@proxy:3000",
+            "http://@proxy",
+            "http://proxy:99999",
+            "http://proxy:",
+            "http://proxy/api",
+        ] {
+            assert_invalid("DISCORD_API_PROXY", &[("DISCORD_API_PROXY", value)]);
+        }
+    }
+
+    /// Every variable `Config::from_lookup` asks for, on variants of the
+    /// example that between them take every branch: URLs or their parts,
+    /// state on and off, every optional value set and the SHARDS_* unset.
+    fn variables_read() -> BTreeSet<String> {
+        let variants: [&[(&'static str, &str)]; 4] = [
+            &[],
+            &[
+                ("AMQP_URL", "amqp://mq"),
+                ("REDIS_URL", "redis://cache"),
+                ("STATE_ENABLED", "false"),
+            ],
+            &[
+                ("RABBIT_VHOST", "vhost"),
+                ("REDIS_USERNAME", "user"),
+                ("REDIS_PASSWORD", "pass"),
+                ("REDIS_DB", "1"),
+                ("ACTIVITY_TYPE", "1"),
+                ("ACTIVITY_STATE", "state"),
+                ("ACTIVITY_URL", "https://twitch.tv/discord"),
+                ("LOG_CHANNEL", "1"),
+                ("LOG_GUILD_CHANNEL", "2"),
+                ("DISCORD_API_PROXY", "http://proxy:3000"),
+                ("DISCORD_GATEWAY_URL", "ws://gateway:8080"),
+            ],
+            &[
+                ("SHARDS_START", ""),
+                ("SHARDS_END", ""),
+                ("SHARDS_TOTAL", ""),
+            ],
+        ];
+        let seen = RefCell::new(BTreeSet::new());
+        for variant in variants {
+            let mut env = shipped_env();
+            env.insert("BOT_TOKEN", "token".into());
+            env.extend(
+                variant
+                    .iter()
+                    .map(|&(name, value)| (name, value.to_owned())),
+            );
+            // A failed load stops at the first error and asks for less.
+            let config = Config::from_lookup(&|name| {
+                seen.borrow_mut().insert(name.to_owned());
+                env.get(name).cloned()
+            });
+            assert!(config.is_ok(), "{variant:?}: {config:?}");
+        }
+        seen.into_inner()
+    }
+
+    /// The `NAME=value` and `# NAME=value` lines of `.env.example`.
+    fn env_example_names() -> BTreeSet<&'static str> {
+        ENV_EXAMPLE
+            .lines()
+            .filter_map(|line| line.trim_start_matches(['#', ' ']).split_once('='))
+            .map(|(name, _)| name)
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .collect()
+    }
+
+    /// Whether `text` contains `name` as a whole word.
+    fn mentions(text: &str, name: &str) -> bool {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        text.match_indices(name).any(|(at, _)| {
+            !text[..at].ends_with(word) && !text[at + name.len()..].starts_with(word)
+        })
+    }
+
+    /// `.env.example` is where operators look for settings (README points
+    /// there), so a new variable must be documented in it.
+    #[test]
+    fn every_variable_the_config_reads_is_in_env_example() {
+        let undocumented: Vec<String> = variables_read()
+            .into_iter()
+            .filter(|name| !mentions(ENV_EXAMPLE, name))
+            .filter(|name| !OBSOLETE_VARIABLES.contains(&name.as_str()))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "read by Config::from_lookup but not in .env.example: {undocumented:?}"
+        );
+    }
+
+    /// A variable that is no longer read leaves .env.example, or goes into
+    /// OBSOLETE_VARIABLES so that deployments still setting it are told.
+    #[test]
+    fn every_variable_in_env_example_is_read() {
+        // Read by tracing-subscriber's EnvFilter in main.rs.
+        let external = ["RUST_LOG"];
+        let read = variables_read();
+        let names = env_example_names();
+        // Commented-out entries count too.
+        assert!(names.contains("DISCORD_GATEWAY_URL") && names.contains("BOT_TOKEN"));
+        let dead: Vec<&str> = names
+            .into_iter()
+            .filter(|name| !read.contains(*name))
+            .filter(|name| !OBSOLETE_VARIABLES.contains(name) && !external.contains(name))
+            .collect();
+        assert!(dead.is_empty(), "in .env.example but never read: {dead:?}");
+    }
+
     #[test]
     fn credentials_are_escaped() {
         let mut env = example_env();
@@ -674,10 +1055,34 @@ pub(crate) mod tests {
 
     #[test]
     fn disabled_state_disables_everything() {
-        let mut env = example_env();
-        env.insert("STATE_ENABLED", "false".into());
-        let state = load(&env).unwrap().state;
-        assert!(!state.member && !state.message && !state.presence && !state.old);
+        let state = with(&[("STATE_ENABLED", "false"), ("STATE_OLD", "true")])
+            .unwrap()
+            .state;
+        // The TTLs are kept: they only matter while the flags are on.
+        assert_eq!(
+            state,
+            StateConfig {
+                enabled: false,
+                member_ttl: 60_000,
+                message_ttl: 60_000,
+                ..StateConfig::default()
+            }
+        );
+        let state = load(&example_env()).unwrap().state;
+        assert_eq!(
+            state,
+            StateConfig {
+                enabled: true,
+                member: true,
+                member_ttl: 60_000,
+                message: true,
+                message_ttl: 60_000,
+                presence: true,
+                emoji: true,
+                voice: true,
+                old: false,
+            }
+        );
     }
 
     #[test]
