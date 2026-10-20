@@ -30,8 +30,12 @@ use tracing::{info, warn};
 use twilight_http::Client;
 
 /// Shutdown budget. Docker and Swarm kill the container 10 s after SIGTERM by
-/// default (raise stop_grace_period for more headroom).
-const RUNNER_SHUTDOWN: Duration = Duration::from_secs(6);
+/// default (raise stop_grace_period for more headroom). A runner closes its
+/// shard within `runner::CLOSE_TIMEOUT`; one aborted before that would not
+/// mirror its final session, so the runners get a second more. Then the
+/// workers drain and the sessions are saved, 8 s in all, which leaves time to
+/// close the broker connection (at most 1 s).
+const RUNNER_SHUTDOWN: Duration = runner::CLOSE_TIMEOUT.saturating_add(Duration::from_secs(1));
 const WORKER_SHUTDOWN: Duration = Duration::from_secs(2);
 const SAVE_SHUTDOWN: Duration = Duration::from_secs(1);
 
@@ -338,5 +342,19 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_fits_dockers_default_stop_grace_period() {
+        // A runner is never aborted while close() is still within its deadline.
+        assert!(RUNNER_SHUTDOWN >= runner::CLOSE_TIMEOUT + Duration::from_secs(1));
+        // Amqp::close waits at most 1 s; Docker kills the container at 10 s.
+        let total = RUNNER_SHUTDOWN + WORKER_SHUTDOWN + SAVE_SHUTDOWN + Duration::from_secs(1);
+        assert!(total < Duration::from_secs(10), "{total:?}");
     }
 }

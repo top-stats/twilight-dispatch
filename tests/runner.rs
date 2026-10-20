@@ -12,8 +12,9 @@
 //! - the registry snapshot (`refresh()`): session, resume URL, status, close
 //!   code, fatal flag and the resume point after READY;
 //! - shutdown: a resumable close that still dispatches what arrives while
-//!   closing, bounded by the close timeout, and no new connection when the
-//!   shard is already disconnected;
+//!   closing, all within one close timeout (the gateway's answer, held events
+//!   and READY's cache update), no new connection when the shard is already
+//!   disconnected and no RESUME when the connection drops while closing;
 //! - fatal close codes end `run()`; gateway commands reach the gateway; shard
 //!   lifecycle metrics and Discord log messages.
 //!
@@ -31,7 +32,7 @@ mod fake_discord;
 
 use fake_discord::{ready_payload, FakeDiscord, Frame, GatewayConnection};
 use futures_util::future::join_all;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionLike, ConnectionManager};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -55,7 +56,7 @@ use twilight_dispatch::{
     discord_log::DiscordLog,
     gateway::{
         registry::{Registry, ShardHandle, ShardSnapshot},
-        runner::{self, RunnerContext, FATAL_CLOSE_CODES},
+        runner::{self, RunnerContext, CLOSE_TIMEOUT, FATAL_CLOSE_CODES},
         worker::{self, Breaker, Publisher, WorkerContext, QUEUE},
     },
     metrics::{GATEWAY_EVENTS, GATEWAY_PARSE_ERRORS, SHARD_EVENTS},
@@ -74,12 +75,10 @@ const TOKEN: &str = "runner-token";
 const IDLE_DB: u8 = 0;
 const PARSE_DB: u8 = 1;
 const STALE_DB: u8 = 2;
+const READY_DB: u8 = 3;
 /// A day: no heartbeat is due during a test, so the gateway only sees the
 /// frames a test expects.
 const QUIET: u64 = 86_400_000;
-/// `runner::CLOSE_TIMEOUT` (private): how long a shutdown waits for the
-/// gateway to answer the close.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// One worker queue holds `QUEUE` jobs. With the only worker held at the gate
 /// on READY, sequences 2..=QUEUE + 1 fill it and this one does not fit.
 const FULL: u64 = QUEUE as u64 + 2;
@@ -254,6 +253,21 @@ fn new_shard(url: &str, id: u32, restore: Option<&SessionInfo>) -> Shard<InMemor
 
 /// Run shard `id` against the gateway at `url` the way `app::start` does.
 fn start(url: &str, id: u32, redis: ConnectionManager, opts: Opts) -> Running {
+    start_with(url, id, redis.clone(), redis, opts)
+}
+
+/// `start` with another Redis for the runner (READY's cache update) than
+/// for the workers.
+fn start_with<C>(
+    url: &str,
+    id: u32,
+    redis: ConnectionManager,
+    runner_redis: C,
+    opts: Opts,
+) -> Running
+where
+    C: ConnectionLike + Clone + Send + Sync + 'static,
+{
     init();
     let shard = new_shard(url, id, opts.restore.as_ref());
     let resumed = opts.restore.as_ref().map(|session| session.sequence);
@@ -267,7 +281,7 @@ fn start(url: &str, id: u32, redis: ConnectionManager, opts: Opts) -> Running {
     let registry = Arc::new(Registry::new([handle.clone()]));
     let recorder = Recorder::new(opts.open, opts.delay);
     let worker_ctx = Arc::new(WorkerContext {
-        redis: redis.clone(),
+        redis,
         publisher: recorder.clone(),
         registry,
         state: opts.state.clone(),
@@ -283,7 +297,7 @@ fn start(url: &str, id: u32, redis: ConnectionManager, opts: Opts) -> Running {
     let runner_ctx = Arc::new(RunnerContext {
         state: opts.state,
         workers: queues,
-        redis,
+        redis: runner_redis,
         discord: opts.discord,
         bot_id: common::bot_id(),
         cache_timeout: Duration::from_secs(5),
@@ -497,6 +511,32 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// A Redis that never answers.
+#[derive(Clone)]
+struct Unresponsive;
+
+impl ConnectionLike for Unresponsive {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        _cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        Box::pin(std::future::pending())
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        _pipeline: &'a redis::Pipeline,
+        _offset: usize,
+        _count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn get_db(&self) -> i64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,12 +1432,104 @@ async fn shutdown_while_disconnected_opens_no_connection() {
     );
 }
 
+/// One deadline for the whole shutdown: a gateway that never answers the
+/// close and workers that never take what arrived meanwhile cost the close
+/// timeout once, not once each. What was not queued is replayed on resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_waits_once_for_the_gateway_and_the_held_events() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 27;
+    let opts = Opts {
+        open: false,
+        ..Opts::default()
+    };
+    let mut running = start(&relay.url(), shard, redis, opts);
+
+    let conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_entered(1).await;
+    relay.hold(true);
+    let stopping = Instant::now();
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    // READY waits at the gate, 2..=FULL - 1 fill the queue and FULL is held.
+    send_typing(&conn, 2..=FULL).await;
+    eventually("every event received", || {
+        (received(shard, "TYPING_START") == FULL - 1).then_some(())
+    })
+    .await;
+    eventually("run() to return", || running.finished().then_some(())).await;
+    let took = stopping.elapsed();
+    assert!(
+        took >= CLOSE_TIMEOUT - Duration::from_millis(500)
+            && took < CLOSE_TIMEOUT + Duration::from_secs(1),
+        "shutdown took {took:?}"
+    );
+
+    running.recorder.open();
+    running.join(WAIT).await;
+    assert_ids(
+        &running.recorder.published(),
+        &running.ids("A", 1..=FULL - 1),
+    );
+    assert_eq!(
+        running.handle.session_info(),
+        Some(session("A", FULL - 1, &fake.gateway.resume_url()))
+    );
+}
+
+/// A READY that arrives while closing is still published and starts the
+/// session, but its cache update does not outlast the close timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_does_not_wait_for_readys_cache_update_past_the_close_timeout() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(READY_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 29;
+    let opts = Opts {
+        state: StateConfig {
+            enabled: true,
+            ..StateConfig::default()
+        },
+        ..Opts::default()
+    };
+    let mut running = start_with(&relay.url(), shard, redis, Unresponsive, opts);
+
+    let mut conn = fake.gateway.accept().await;
+    conn.hello(QUIET).await;
+    conn.expect_identify().await;
+    relay.hold(true);
+    let stopping = Instant::now();
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    conn.ready(1, "A", [shard, TOTAL], &[]).await;
+    running.recorder.wait_published(1).await;
+    eventually("run() to return", || running.finished().then_some(())).await;
+    let took = stopping.elapsed();
+    assert!(
+        took >= CLOSE_TIMEOUT - Duration::from_millis(500)
+            && took < CLOSE_TIMEOUT + Duration::from_millis(700),
+        "shutdown took {took:?}"
+    );
+    running.join(WAIT).await;
+    assert_ids(&running.recorder.published(), &running.ids("A", 1..=1));
+    assert_eq!(
+        running.handle.session_info(),
+        Some(session("A", 1, &fake.gateway.resume_url()))
+    );
+}
+
 /// The gateway drops the connection instead of answering the shutdown's
 /// close: nothing is left to wait for, so `run()` returns promptly and the
 /// shard does not resume a new connection during the shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BUG: shutdown after a dropped connection reconnects, RESUMEs and waits the full \
-            CLOSE_TIMEOUT (runner close() keeps polling while twilight reconnects silently)"]
 async fn shutdown_does_not_resume_when_the_gateway_drops_the_connection() {
     let _metrics = METRICS.read().await;
     let Some(redis) = common::redis(IDLE_DB).await else {
@@ -1433,11 +1565,50 @@ async fn shutdown_does_not_resume_when_the_gateway_drops_the_connection() {
         !matches!(reconnected.as_ref().and_then(Frame::op), Some(2 | 6)),
         "identified or resumed a new connection during the shutdown: {reconnected:?}"
     );
+    // twilight 0.17 does reconnect; the runner drops that connection at HELLO.
+    assert_eq!(reconnected, Some(Frame::Gone));
     assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
     assert_eq!(
         running.handle.session_info(),
         Some(session("A", 3, &fake.gateway.resume_url()))
     );
+}
+
+/// As above, but connecting again fails: `run()` returns at the failed
+/// attempt instead of retrying until the close timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_does_not_retry_when_the_gateway_drops_the_connection() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 28;
+    let mut running = start(&relay.url(), shard, redis, Opts::default());
+    // Resuming goes to a port nothing listens on, then (cut) to the relay.
+    let dead = format!("ws://127.0.0.1:{}", free_port());
+
+    let mut conn = fake.gateway.accept().await;
+    conn.hello(QUIET).await;
+    conn.expect_identify().await;
+    let ready = ready_payload(common::BOT_ID, "A", &dead, [shard, TOTAL], &[]);
+    conn.dispatch("READY", 1, &ready).await;
+    send_typing(&conn, 2..=3).await;
+    running.recorder.wait_published(3).await;
+
+    relay.hold(true);
+    let stopping = Instant::now();
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    relay.cut();
+    conn.expect_gone().await;
+    running.join(CLOSE_TIMEOUT * 2).await;
+    let took = stopping.elapsed();
+    // twilight waits 1 s before connecting again, then 2 s after a failure.
+    assert!(took < Duration::from_millis(2500), "shutdown took {took:?}");
+    assert_eq!(fake.gateway.connections(), 1);
+    assert_eq!(running.handle.session_info(), Some(session("A", 3, &dead)));
 }
 
 /// Shutting down before the first connection does not connect at all.

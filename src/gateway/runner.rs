@@ -52,8 +52,10 @@ use twilight_model::{
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes>
 pub const FATAL_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
 
-/// How long a resumable shutdown waits for the gateway to acknowledge the close.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a resumable shutdown may take in all: waiting for the gateway to
+/// answer the close, and for room in the worker queues for what arrived until
+/// then. `app` waits a little longer for the runners before aborting them.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Upper bound for READY's inline cache update, well below the ~41 s heartbeat.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -224,6 +226,8 @@ struct Runner<C> {
     held: VecDeque<(usize, Job)>,
     /// When the shard was closed because of backpressure.
     paused_at: Option<Instant>,
+    /// While shutting down: when [`Runner::close`] has to be done.
+    close_deadline: Option<tokio::time::Instant>,
     parse_errors: Throttle,
     receive_errors: Throttle,
 }
@@ -249,6 +253,7 @@ pub async fn run<C>(
         session,
         held: VecDeque::new(),
         paused_at: None,
+        close_deadline: None,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
     };
@@ -366,8 +371,7 @@ where
 
     /// Sync the registry snapshot with the shard and record state changes.
     fn refresh(&mut self) {
-        let state = self.shard.state();
-        let status = status_label(state);
+        let status = status_label(self.shard.state());
         if status != self.last_status {
             match status {
                 "Identifying" => {
@@ -382,7 +386,13 @@ where
             }
             self.last_status = status;
         }
+        self.sync();
+    }
 
+    /// Mirror the shard's state, latency and session in the registry snapshot.
+    fn sync(&mut self) {
+        let state = self.shard.state();
+        let status = status_label(state);
         let latency = self.shard.latency();
         let latency_ms = latency.recent().first().map_or(0, |d| d.as_millis() as u64);
         let last_ack = latency.received();
@@ -407,7 +417,12 @@ where
     }
 
     async fn on_text(&mut self, json: String) {
-        match prepare(&json, &self.ctx.state) {
+        let prepared = prepare(&json, &self.ctx.state);
+        self.on_prepared(prepared, json).await;
+    }
+
+    async fn on_prepared(&mut self, prepared: Prepared, json: String) {
+        match prepared {
             Prepared::Malformed(err) => {
                 warn!("[Shard {}] Could not decode payload: {}", self.id, err)
             }
@@ -529,8 +544,12 @@ where
             now_ms: FormattedDateTime::now().unix_millis(),
         };
         let mut conn = self.ctx.redis.clone();
-        let limit = self.ctx.cache_timeout.min(READY_TIMEOUT);
-        match tokio::time::timeout(limit, cache::update(&mut conn, event, &update_ctx)).await {
+        let limit = tokio::time::Instant::now() + self.ctx.cache_timeout.min(READY_TIMEOUT);
+        // A READY that arrives while closing must not hold up the shutdown.
+        let limit = self
+            .close_deadline
+            .map_or(limit, |deadline| deadline.min(limit));
+        match tokio::time::timeout_at(limit, cache::update(&mut conn, event, &update_ctx)).await {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => warn!(
                 "[Shard {}] Failed to update state for READY: {}",
@@ -616,35 +635,61 @@ where
         }
     }
 
-    /// Close resumably and keep handling payloads until the gateway confirms.
+    /// Close resumably and keep handling payloads until the gateway confirms,
+    /// all within [`CLOSE_TIMEOUT`].
     async fn close(&mut self) {
         info!("[Shard {}] Shutting down", self.id);
+        let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
+        self.close_deadline = Some(deadline);
         // A disconnected shard has nothing to close; a close queued now would
         // open a new connection just to close it. Whatever it did not
         // receive is replayed after the restart.
         if !self.is_disconnected() {
             self.shard.close(CloseFrame::RESUME);
-            let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
             loop {
-                match tokio::time::timeout_at(deadline, self.shard.next()).await {
+                let json = match tokio::time::timeout_at(deadline, self.shard.next()).await {
                     Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
-                    Ok(Some(Ok(Message::Text(json)))) => self.on_text(json).await,
-                    Ok(Some(Err(_))) => {}
+                    Ok(Some(Ok(Message::Text(json)))) => json,
+                    // The connection is gone (it dropped instead of
+                    // answering the close) and twilight failed to reconnect.
+                    Ok(Some(Err(err)))
+                        if matches!(err.kind(), ReceiveMessageErrorType::Reconnect) =>
+                    {
+                        break
+                    }
+                    Ok(Some(Err(_))) => continue,
+                };
+                let prepared = prepare(&json, &self.ctx.state);
+                if matches!(prepared, Prepared::Hello) {
+                    // HELLO starts a connection, normally one twilight opened
+                    // on its own after the old one dropped instead of
+                    // answering. twilight sends RESUME (or IDENTIFY) on the
+                    // next poll, which would take the session over only to
+                    // drop it again.
+                    info!(
+                        "[Shard {}] Reconnected while shutting down; not resuming",
+                        self.id
+                    );
+                    break;
                 }
+                self.on_prepared(prepared, json).await;
             }
         }
         // Everything received has to reach the workers before the session is
         // saved; the shard no longer needs polling.
-        let flush = tokio::time::timeout(CLOSE_TIMEOUT, self.flush_held()).await;
-        if flush.is_err() {
+        if tokio::time::timeout_at(deadline, self.flush_held())
+            .await
+            .is_err()
+        {
             warn!(
                 "[Shard {}] Could not queue every event before shutting down",
                 self.id
             );
         }
         // Mirror the final session: Discord may have invalidated it while
-        // closing, and then it must not be saved.
-        self.refresh();
+        // closing, and then it must not be saved. Not a state change to
+        // record: a connection twilight opened meanwhile was never used.
+        self.sync();
         self.handle.update(|s| s.active = false);
     }
 }
