@@ -1,7 +1,8 @@
 #![recursion_limit = "256"]
 
 //! The "broken pipe" regression: after Redis drops our connection, commands
-//! must work again (set TEST_REDIS_URL).
+//! must work again; and a slow reply is awaited, not timed out (set
+//! TEST_REDIS_URL).
 //!
 //! With redis 0.22's MultiplexedConnection every command after a dropped
 //! connection failed with `broken pipe` forever, which flooded the logs.
@@ -96,4 +97,51 @@ async fn the_kill_breaks_a_plain_multiplexed_connection() {
     let result: redis::RedisResult<i64> = redis::cmd("GET").arg("k").query_async(&mut plain).await;
     let err = result.expect_err("the first command after the kill fails");
     assert!(err.is_connection_dropped() || err.is_io_error(), "{err}");
+}
+
+/// A large GUILD_CREATE transaction can keep Redis from answering for longer
+/// than redis-rs' default response timeout (500 ms), which would fail the
+/// cache update although Redis goes on to apply it. The connection waits up
+/// to `RESPONSE_TIMEOUT` instead.
+#[tokio::test]
+async fn a_reply_slower_than_redis_rs_default_timeout_is_awaited() {
+    // A CLIENT KILL from the other tests would end the pause early.
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = common::redis(5).await else {
+        return;
+    };
+    let base = std::env::var("TEST_REDIS_URL").unwrap();
+    let mut pauser = redis::Client::open(format!("{}/5", base.trim_end_matches('/')))
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    // Redis holds back every client's commands (and so the replies) for 2 s.
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(2000)
+        .arg("ALL")
+        .query_async(&mut pauser)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result: redis::RedisResult<()> = redis::cmd("SET")
+        .arg("k")
+        .arg("v")
+        .query_async(&mut conn)
+        .await;
+    let waited = started.elapsed();
+    result.expect("the slow reply is awaited");
+    // The margin is for a loaded host that starts the clock late.
+    assert!(
+        waited > Duration::from_millis(500),
+        "not held back for longer than redis-rs' default: {waited:?}"
+    );
+    assert!(waited < twilight_dispatch::redis_conn::RESPONSE_TIMEOUT);
+    let value: String = redis::cmd("GET")
+        .arg("k")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(value, "v");
 }
