@@ -601,6 +601,9 @@ fn args(cmd: &Cmd) -> Vec<String> {
 struct Recording<C> {
     inner: C,
     sent: Vec<Sent>,
+    /// Commands refused with NOSCRIPT: a script Redis did not have yet, so it
+    /// did not run. redis-rs then sends SCRIPT LOAD and the EVALSHA again.
+    scripts_not_run: usize,
 }
 
 impl<C> Recording<C> {
@@ -608,6 +611,7 @@ impl<C> Recording<C> {
         Self {
             inner,
             sent: Vec::new(),
+            scripts_not_run: 0,
         }
     }
 }
@@ -615,7 +619,14 @@ impl<C> Recording<C> {
 impl<C: ConnectionLike + Send> ConnectionLike for Recording<C> {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, RedisValue> {
         self.sent.push(Sent::Command(args(cmd)));
-        self.inner.req_packed_command(cmd)
+        Box::pin(async move {
+            let reply = self.inner.req_packed_command(cmd).await;
+            // Error replies are values here; `Cmd::query_async` makes them errors.
+            if matches!(&reply, Ok(RedisValue::ServerError(err)) if err.code() == "NOSCRIPT") {
+                self.scripts_not_run += 1;
+            }
+            reply
+        })
     }
 
     fn req_packed_commands<'a>(
@@ -872,26 +883,42 @@ async fn seed_guild_and_dm(conn: &mut ConnectionManager, fixtures: &[Fixture]) {
 /// expiry deadlines depend on the clock and are left out).
 async fn dump(conn: &mut ConnectionManager) -> BTreeSet<String> {
     let keys: Vec<String> = redis::cmd("KEYS").arg("*").query_async(conn).await.unwrap();
-    let mut entries = BTreeSet::new();
-    for key in keys {
-        let kind: String = redis::cmd("TYPE")
-            .arg(&key)
-            .query_async(conn)
-            .await
-            .unwrap();
-        let values: Vec<String> = match kind.as_str() {
-            "string" => vec![redis::cmd("GET").arg(&key).query_async(conn).await.unwrap()],
-            "set" => members(conn, &key).await,
-            "zset" => redis::cmd("ZRANGE")
-                .arg(&key)
-                .arg(0)
-                .arg(-1)
-                .query_async(conn)
-                .await
-                .unwrap(),
-            other => vec![format!("<{other}>")],
+    // redis-rs refuses an empty pipeline.
+    if keys.is_empty() {
+        return BTreeSet::new();
+    }
+    // Pipelined: every_event_is_one_transaction dumps before and after each
+    // event.
+    let mut types = redis::pipe();
+    for key in &keys {
+        types.cmd("TYPE").arg(key);
+    }
+    let types: Vec<String> = types.query_async(conn).await.unwrap();
+    let mut reads = redis::pipe();
+    for (key, kind) in keys.iter().zip(&types) {
+        match kind.as_str() {
+            "string" => reads.cmd("GET").arg(key),
+            "set" => reads.cmd("SMEMBERS").arg(key),
+            "zset" => reads.cmd("ZRANGE").arg(key).arg(0).arg(-1),
+            // Only the type of anything else.
+            _ => reads.cmd("TYPE").arg(key),
         };
-        entries.extend(values.into_iter().map(|value| format!("{key} {value}")));
+    }
+    let values: Vec<RedisValue> = reads.query_async(conn).await.unwrap();
+    let mut entries = BTreeSet::new();
+    for (key, value) in keys.iter().zip(values) {
+        let values = match value {
+            RedisValue::Array(members) | RedisValue::Set(members) => members,
+            value => vec![value],
+        };
+        for value in values {
+            let value = match value {
+                RedisValue::BulkString(bytes) => String::from_utf8(bytes).unwrap(),
+                RedisValue::SimpleString(kind) => format!("<{kind}>"),
+                other => panic!("{key}: {other:?}"),
+            };
+            entries.insert(format!("{key} {value}"));
+        }
     }
     entries
 }
@@ -1316,15 +1343,24 @@ async fn leaving_a_guild_removes_everything_its_events_cached() {
 // ---------------------------------------------------------------------------
 // Every event is applied atomically
 
-/// Commands that run a Lua script, which Redis runs atomically as well (a
-/// NOSCRIPT retry sends EVALSHA, SCRIPT LOAD, EVALSHA for one script).
-const SCRIPTS: [&str; 3] = ["EVAL", "EVALSHA", "SCRIPT"];
+/// Commands that run a Lua script, which Redis runs atomically as well. Each
+/// script that runs is an atomic write of its own, so two scripts for one
+/// event are two writes.
+const SCRIPTS: [&str; 2] = ["EVAL", "EVALSHA"];
+
+/// Loads a script (for the EVALSHA redis-rs retries after NOSCRIPT) and
+/// stores no data.
+fn loads_script(command: &[String]) -> bool {
+    matches!(command, [script, load, ..] if script == "SCRIPT" && load == "LOAD")
+}
 
 /// A connection error between two writes leaves keys that no index refers
-/// to, so each event writes in one MULTI/EXEC (`cache::batch`, or one
-/// script). READY is the exception: one transaction for the bot user and the
-/// guild stubs, then one per cached guild of the shard that READY no longer
-/// lists.
+/// to, so an event that changes the cache does so in exactly one atomic
+/// write: one MULTI/EXEC (`cache::batch`) or one script. Whether it changed
+/// anything is read from Redis, not from the recording, so a write the
+/// recording does not count as one fails too. READY is the exception: one
+/// transaction for the bot user and the guild stubs, then one per cached
+/// guild of the shard that READY no longer lists.
 #[tokio::test]
 async fn every_event_is_one_transaction() {
     let Some(mut conn) = redis(3).await else {
@@ -1337,6 +1373,8 @@ async fn every_event_is_one_transaction() {
     };
     let mut failures = Vec::new();
     let mut stale_readies = 0;
+    // Events other than READY that changed the cache, so were checked.
+    let mut changes = 0;
     for (name, state) in [("all", state_all()), ("minimal", minimal)] {
         for seeded in [true, false] {
             flush(&mut conn).await;
@@ -1359,20 +1397,23 @@ async fn every_event_is_one_transaction() {
                 } else {
                     0
                 };
+                let before = dump(&mut conn).await;
                 let mut recording = Recording::new(conn.clone());
                 cache::update(&mut recording, &mut event, &update_context(&state))
                     .await
                     .unwrap_or_else(|err| panic!("{}: {err}", fixture.label));
+                let changed = dump(&mut conn).await != before;
 
                 let at = format!("{} with {name} (seeded: {seeded})", fixture.label);
                 let mut transactions = Vec::new();
-                let mut scripted = false;
+                let mut scripts = 0;
                 for sent in &recording.sent {
                     match sent {
                         Sent::Command(command) if READS.contains(&command[0].as_str()) => {}
                         Sent::Command(command) if SCRIPTS.contains(&command[0].as_str()) => {
-                            scripted = true
+                            scripts += 1
                         }
+                        Sent::Command(command) if loads_script(command) => {}
                         Sent::Command(command) => {
                             failures.push(format!("{at}: {command:?} outside a transaction"))
                         }
@@ -1386,7 +1427,7 @@ async fn every_event_is_one_transaction() {
                         Sent::Pipeline { commands, .. } => transactions.push(commands),
                     }
                 }
-                let atomic_writes = transactions.len() + usize::from(scripted);
+                let atomic_writes = transactions.len() + scripts - recording.scripts_not_run;
                 if fixture.kind == "READY" {
                     let bot_user = transactions.first().is_some_and(|first| {
                         first.iter().any(|c| c[0] == "SET" && c[1] == "bot_user")
@@ -1398,14 +1439,24 @@ async fn every_event_is_one_transaction() {
                              user first: {bot_user})"
                         ));
                     }
-                } else if atomic_writes > 1 {
-                    failures.push(format!("{at}: {atomic_writes} atomic writes"));
+                } else if atomic_writes > 1 || (changed && atomic_writes == 0) {
+                    // An update that changes nothing (a DEL of keys that are
+                    // not cached) may still send its transaction.
+                    failures.push(format!(
+                        "{at}: {atomic_writes} atomic writes (changed the cache: {changed})"
+                    ));
+                } else {
+                    changes += usize::from(changed);
                 }
             }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
     assert_eq!(stale_readies, 2, "READY found a stale guild when seeded");
+    assert!(
+        changes > 0,
+        "no event changed the cache: nothing was checked"
+    );
 }
 
 // ---------------------------------------------------------------------------
