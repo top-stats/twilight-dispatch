@@ -980,6 +980,8 @@ async fn everything_the_cache_does_is_reachable_through_the_runner() {
     // What the cache sends -> the STATE_* combinations it is unreachable in.
     let mut dead: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, state) in cache_states() {
+        // Events the runner skips in this state whose cache update was run.
+        let mut checked = 0;
         for fixture in &fixtures {
             if runner_event(fixture, &state).is_some()
                 || deliberately_unparsed(fixture.kind, &state)
@@ -990,6 +992,7 @@ async fn everything_the_cache_does_is_reachable_through_the_runner() {
                 let Some(sent) = cache_commands(fixture, &state, cache).await else {
                     continue;
                 };
+                checked += 1;
                 let changes = writes(&sent);
                 if !changes.is_empty() {
                     let sends = format!(
@@ -1001,6 +1004,7 @@ async fn everything_the_cache_does_is_reachable_through_the_runner() {
                 }
             }
         }
+        assert!(checked > 0, "with {name} no event was checked");
     }
     assert!(
         dead.is_empty(),
@@ -1027,6 +1031,7 @@ async fn everything_the_runner_parses_is_used() {
             .filter(|f| runner_event(f, &state).is_some())
             .map(|f| f.kind)
             .collect();
+        assert!(!parsed.is_empty(), "with {name} the runner parses nothing");
         for kind in parsed {
             if !state.enabled {
                 if !PARSED_WITHOUT_THE_CACHE.contains(&kind) {
@@ -1071,6 +1076,21 @@ fn stored_values(writes: &[&[String]]) -> Vec<(String, String)> {
     values
 }
 
+/// The list fields of twilight's `Guild`, read from the vendored source.
+fn guild_lists() -> BTreeSet<String> {
+    let source = read_repo_file("vendor/twilight-model/src/guild/mod.rs");
+    let fields = block_after(&source, "pub struct Guild ").expect("Guild moved: update this guard");
+    fields
+        .lines()
+        .filter_map(|line| {
+            let (name, kind) = line.trim().strip_prefix("pub ")?.split_once(':')?;
+            let kind = kind.trim();
+            let kind = kind.strip_prefix("Option<").unwrap_or(kind);
+            kind.starts_with("Vec<").then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// GUILD_UPDATE copies everything but SPLIT_GUILD_FIELDS into the guild blob,
 /// so a list GUILD_CREATE moves into its own keys but that is missing from
 /// SPLIT_GUILD_FIELDS comes back into the blob (and goes stale there).
@@ -1085,6 +1105,25 @@ async fn split_guild_fields_are_what_guild_create_moves_out() {
         panic!("an available guild");
     };
     let parsed = serde_json::to_value(&parsed).unwrap();
+
+    // Only a list the fixture fills shows whether it is moved out, so a list
+    // a twilight upgrade adds to `Guild` has to be filled in `full_guild()`.
+    let lists = guild_lists();
+    assert!(lists.len() > 5, "only {lists:?}: parser out of date?");
+    let unfilled: Vec<&String> = lists
+        .iter()
+        .filter(|field| {
+            parsed
+                .get(field.as_str())
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        })
+        .collect();
+    assert_eq!(
+        unfilled,
+        Vec::<&String>::new(),
+        "lists full_guild() leaves empty"
+    );
 
     let sent = cache_commands(create, &state_all(), Cache::Nothing)
         .await
@@ -1139,8 +1178,22 @@ async fn guild_update_keeps_every_field_it_does_not_split() {
     let after = get(&mut conn, &key).await.unwrap();
 
     let split = |field: &str| SPLIT_GUILD_FIELDS.contains(&field);
+    let before = before.as_object().unwrap();
+    // Both halves below check something.
+    assert!(
+        before
+            .keys()
+            .any(|field| !split(field) && !carried.contains_key(field)),
+        "GUILD_UPDATE carries every field of the blob: nothing to keep"
+    );
+    assert!(
+        carried
+            .iter()
+            .any(|(field, value)| !split(field) && before.get(field) != Some(value)),
+        "GUILD_UPDATE changes no field of the blob"
+    );
     let empty = json!([]);
-    for (field, value) in before.as_object().unwrap() {
+    for (field, value) in before {
         let expected = if split(field) {
             &empty
         } else {
@@ -1729,6 +1782,7 @@ impl<'de> Visitor<'de> for UniqueKeys {
 /// structs (flatten) can repeat a key.
 #[tokio::test]
 async fn the_cache_stores_no_key_twice() {
+    let mut checked = BTreeSet::new();
     for fixture in universe() {
         for cache in CACHES {
             let Some(sent) = cache_commands(&fixture, &state_all(), cache).await else {
@@ -1737,7 +1791,14 @@ async fn the_cache_stores_no_key_twice() {
             for (key, value) in stored_values(&writes(&sent)) {
                 serde_json::from_str::<UniqueKeys>(&value)
                     .unwrap_or_else(|err| panic!("{}: {key} {err}: {value}", fixture.label));
+                checked.extend(key.split(':').next().map(str::to_owned));
             }
         }
     }
+    // A value stored some other way than SET / MSET is not checked at all.
+    let unchecked: Vec<&str> = CACHED_PREFIXES
+        .into_iter()
+        .filter(|prefix| !checked.contains(*prefix))
+        .collect();
+    assert!(unchecked.is_empty(), "no value checked under {unchecked:?}");
 }
