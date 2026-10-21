@@ -1196,7 +1196,7 @@ async fn guild_update_keeps_every_field_it_does_not_split() {
 
     let split = |field: &str| SPLIT_GUILD_FIELDS.contains(&field);
     let before = before.as_object().unwrap();
-    // Both halves below check something.
+    // Each of the three properties is checked on at least one field.
     assert!(
         before
             .keys()
@@ -1208,6 +1208,15 @@ async fn guild_update_keeps_every_field_it_does_not_split() {
             .iter()
             .any(|(field, value)| !split(field) && before.get(field) != Some(value)),
         "GUILD_UPDATE changes no field of the blob"
+    );
+    // An empty list copied into the blob still reads `[]` there.
+    assert!(
+        before.keys().any(|field| split(field)
+            && carried
+                .get(field)
+                .and_then(Value::as_array)
+                .is_some_and(|list| !list.is_empty())),
+        "GUILD_UPDATE carries no split list of the blob: nothing to keep out"
     );
     let empty = json!([]);
     for (field, value) in before {
