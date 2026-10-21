@@ -297,6 +297,35 @@ mod tests {
         assert!(*min > 800 && *max < 1200, "uneven: {counts:?}");
     }
 
+    /// Guilds created around the same time have ids that differ only in the
+    /// last few timestamp bits, or only below the timestamp (the fields of
+    /// Discord's id generators). A mixer that lets those few bits reach the
+    /// worker index only weakly loads some workers twice as much as others.
+    #[test]
+    fn snowflakes_of_one_moment_spread_over_workers() {
+        let workers = 32;
+        // 2023-11-14T22:13:20Z, as milliseconds since Discord's epoch.
+        let at = (1_700_000_000_000u64 - 1_420_070_400_000) << 22;
+        let moments: [(&str, Vec<u64>); 2] = [
+            (
+                "consecutive milliseconds",
+                (0..32_000u64).map(|ms| at + (ms << 22)).collect(),
+            ),
+            (
+                "one millisecond",
+                (0..32_000u64).map(|low| at | low).collect(),
+            ),
+        ];
+        for (moment, ids) in moments {
+            let mut counts = vec![0usize; workers];
+            for id in ids {
+                counts[Route::Guild(id).worker(workers)] += 1;
+            }
+            let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+            assert!(*min > 800 && *max < 1200, "{moment}: uneven: {counts:?}");
+        }
+    }
+
     #[test]
     fn outgoing_keeps_shape_and_raw_data() {
         let env = Envelope::parse(MESSAGE).unwrap();
