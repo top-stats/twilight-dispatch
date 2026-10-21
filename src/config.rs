@@ -777,6 +777,26 @@ pub(crate) mod tests {
         assert_eq!((config.workers, config.large_threshold), (1024, 50));
     }
 
+    /// The metrics server binds PROMETHEUS_HOST, so it is resolved here; the
+    /// loopback names that /etc/hosts usually has are accepted too.
+    #[test]
+    fn prometheus_host_is_an_ip_address_or_a_loopback_name() {
+        for (value, expected) in [
+            ("localhost", "127.0.0.1"),
+            ("ip6-localhost", "::1"),
+            (" 10.0.0.5 ", "10.0.0.5"),
+            ("::", "::"),
+        ] {
+            let config = with(&[("PROMETHEUS_HOST", value)]).unwrap();
+            assert_eq!(config.prometheus_host, expected, "{value:?}");
+        }
+        assert_eq!(
+            with(&[("PROMETHEUS_HOST", "")]).unwrap().prometheus_host,
+            "0.0.0.0"
+        );
+        assert_invalid("PROMETHEUS_HOST", &[("PROMETHEUS_HOST", "10.0.0.256")]);
+    }
+
     #[test]
     fn shipped_env_example_loads() {
         let mut env = shipped_env();

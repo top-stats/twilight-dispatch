@@ -374,6 +374,53 @@ mod tests {
         assert!(matches!(validate(&d), Err(InvalidCommand::TooLarge(_))));
     }
 
+    /// Discord closes the connection for payloads that "exceed 4096 bytes",
+    /// so one of exactly 4096 bytes is still sent.
+    #[test]
+    fn the_size_limit_is_inclusive() {
+        let data = |len: usize| {
+            let overhead = json!({"op": 3, "d": {"status": ""}}).to_string().len();
+            json!({"op": 3, "d": {"status": "x".repeat(len - overhead)}})
+        };
+        let send = |data: &Value| validate(&delivery(json!({"op": 0, "shard": 0, "data": data})));
+
+        let largest = data(MAX_PAYLOAD_BYTES);
+        assert_eq!(largest.to_string().len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(send(&largest), Ok(ShardCommand::Send(largest.to_string())));
+        assert_eq!(
+            send(&data(MAX_PAYLOAD_BYTES + 1)),
+            Err(InvalidCommand::TooLarge(MAX_PAYLOAD_BYTES + 1))
+        );
+    }
+
+    /// Dropped commands are logged with the reason, which has to say what
+    /// was wrong with them.
+    #[test]
+    fn rejections_say_what_is_wrong() {
+        let reasons: Vec<String> = [
+            InvalidCommand::Malformed("expected value at line 1".into()),
+            InvalidCommand::MissingData,
+            InvalidCommand::NotAnObject,
+            InvalidCommand::OpcodeNotAllowed(Some(2)),
+            InvalidCommand::OpcodeNotAllowed(None),
+            InvalidCommand::TooLarge(5000),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let distinct: std::collections::HashSet<&String> = reasons.iter().collect();
+        assert_eq!(distinct.len(), reasons.len(), "{reasons:?}");
+        assert!(
+            reasons[0].contains("expected value at line 1"),
+            "{reasons:?}"
+        );
+        assert!(reasons[3].contains('2'), "{reasons:?}");
+        assert!(
+            reasons[5].contains("5000") && reasons[5].contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "{reasons:?}"
+        );
+    }
+
     #[test]
     fn malformed_bodies_are_errors() {
         assert!(matches!(
