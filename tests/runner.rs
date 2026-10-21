@@ -69,7 +69,7 @@ use twilight_gateway::{
 use twilight_http::Client;
 
 /// Every test runs its own shard id of this many.
-const TOTAL: u32 = 32;
+const TOTAL: u32 = 64;
 const TOKEN: &str = "runner-token";
 /// Tests with the cache disabled never write to Redis, so they share one.
 const IDLE_DB: u8 = 0;
@@ -1885,7 +1885,7 @@ async fn a_reconnect_request_while_shutting_down_is_not_counted() {
     };
     let fake = FakeDiscord::start().await;
     let relay = Relay::start(&fake.gateway.url()).await;
-    let shard = 14;
+    let shard = 32;
     let mut running = start(&relay.url(), shard, redis, Opts::default());
     let mut conn = identified(&fake, shard, "A", QUIET).await;
     running.recorder.wait_published(1).await;
