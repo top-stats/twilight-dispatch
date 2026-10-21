@@ -36,8 +36,6 @@ Configuration is read from environment variables (or `.env`); see
 - Every log line of a shard, twilight's own included, is prefixed with
   `shard{id=N}:`. Logs have ANSI colours only when stdout is a terminal and
   `NO_COLOR` is not set.
-- The image runs as the unprivileged user `10001:10001`; a `.env` mounted
-  into `/usr/app` must be readable by it.
 - On SIGTERM shards are closed resumably, queued events are flushed and the
   sessions are saved, so the next start resumes them. Set
   `stop_grace_period: 30s` in Swarm / Compose (Docker's default is 10s).
@@ -132,9 +130,8 @@ missing service into a failure). The broker outage tests also need
 no build step catches: a vendored twilight crate that is no longer the one
 built (an unused `[patch.crates-io]` entry only warns), a patch hunk without
 its marker or a `PATCHES.md` naming something that does not exist, a second
-rustls in `Cargo.lock`, an image that runs as root, and in CI an action not
-pinned to a commit, a checkout that keeps the token or a job without a
-timeout.
+rustls in `Cargo.lock`, and in CI an action not pinned to a commit, a
+checkout that keeps the token or a job without a timeout.
 
 CI (`.github/workflows/docker.yml`) runs the same checks on every push and
 pull request on GitHub-hosted runners, as separate jobs (format; clippy and

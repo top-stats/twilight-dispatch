@@ -26,10 +26,6 @@ ENV RUST_LOG=info
 
 COPY --from=builder /usr/build/target/release/twilight-dispatch /usr/app/twilight-dispatch
 
-# Not root: the service writes no files and listens above port 1024. A
-# mounted /usr/app/.env must be readable by this user.
-USER 10001:10001
-
 # SIGTERM closes the shards resumably and saves their sessions. Give it time
 # (stop_grace_period in Swarm / Compose; Docker's default is 10s).
 STOPSIGNAL SIGTERM

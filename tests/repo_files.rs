@@ -5,7 +5,6 @@
 //! - the bits of the channel flags the vendored twilight-model adds;
 //! - one rustls for twilight and the service (main() installs the crypto
 //!   provider twilight's TLS connector needs);
-//! - the Docker image does not run as root;
 //! - CI: actions pinned to commits and kept current by Dependabot, checkouts
 //!   that do not keep the token, no default token permissions and a timeout
 //!   on every job.
@@ -217,31 +216,6 @@ fn twilight_and_the_service_share_one_rustls() {
     let lockfile = read_repo_file("Cargo.lock");
     let entries = lock_entries(&lockfile, "rustls");
     assert_eq!(entries.len(), 1, "rustls is built once: {entries:#?}");
-}
-
-// ---------------------------------------------------------------------------
-// Docker image
-
-/// The image runs the service as an unprivileged user: it writes no files and
-/// listens above port 1024.
-#[test]
-fn the_image_does_not_run_as_root() {
-    let dockerfile = read_repo_file("Dockerfile");
-    let lines: Vec<&str> = dockerfile.lines().map(str::trim).collect();
-    let stage = lines
-        .iter()
-        .rposition(|line| line.starts_with("FROM "))
-        .expect("a FROM line");
-    let user = lines[stage..]
-        .iter()
-        .rev()
-        .find_map(|line| line.strip_prefix("USER "))
-        .expect("the final stage sets USER");
-    let name = user.split_once(':').map_or(user, |(name, _)| name);
-    assert!(
-        !name.is_empty() && name != "root" && name != "0",
-        "the final stage runs as {user:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
