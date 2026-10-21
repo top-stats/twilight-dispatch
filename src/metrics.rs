@@ -27,6 +27,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use prometheus::{
+    core::{MetricVec, MetricVecBuilder},
     register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
     Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
@@ -64,6 +65,36 @@ impl<T> Deref for Metric<T> {
     }
 }
 
+/// A vector metric whose number of labels is part of its type.
+///
+/// prometheus' `with_label_values` panics when it gets a different number of
+/// values than the metric has labels, and release builds abort on a panic.
+/// `N` is the length of the label array the metric is declared with, so a
+/// call site that was not updated when a label was added or removed fails to
+/// compile instead of aborting the process the first time it runs:
+///
+/// ```compile_fail
+/// twilight_dispatch::metrics::GATEWAY_EVENTS.with_label_values(&["READY"]);
+/// ```
+///
+/// The same call with both values compiles, so the first example fails for
+/// the count rather than for a typo:
+///
+/// ```no_run
+/// twilight_dispatch::metrics::GATEWAY_EVENTS.with_label_values(&["READY", "0"]);
+/// ```
+///
+/// It does not deref to the vector, which would let a call skip the check.
+pub struct Labelled<V, const N: usize>(V);
+
+impl<B: MetricVecBuilder, const N: usize> Labelled<MetricVec<B>, N> {
+    /// The child for these label values, given in the order the labels are
+    /// declared in.
+    pub fn with_label_values(&self, values: &[&str; N]) -> B::M {
+        self.0.with_label_values(values)
+    }
+}
+
 trait Register: Sync {
     fn register(&self);
 }
@@ -82,10 +113,12 @@ pub fn init() {
     LazyLock::force(&REGISTERED);
 }
 
+// A vector's `N` is the length of the label array it registers, so the two
+// cannot disagree.
 macro_rules! counter_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
-        pub static $name: Metric<IntCounterVec> =
-            Metric::new(|| register_int_counter_vec!($metric, $help, $labels).unwrap());
+        pub static $name: Metric<Labelled<IntCounterVec, { $labels.len() }>> =
+            Metric::new(|| Labelled(register_int_counter_vec!($metric, $help, $labels).unwrap()));
     };
 }
 macro_rules! counter {
@@ -102,8 +135,8 @@ macro_rules! gauge {
 }
 macro_rules! gauge_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
-        pub static $name: Metric<IntGaugeVec> =
-            Metric::new(|| register_int_gauge_vec!($metric, $help, $labels).unwrap());
+        pub static $name: Metric<Labelled<IntGaugeVec, { $labels.len() }>> =
+            Metric::new(|| Labelled(register_int_gauge_vec!($metric, $help, $labels).unwrap()));
     };
 }
 
