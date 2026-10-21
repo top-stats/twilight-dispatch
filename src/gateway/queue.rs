@@ -9,7 +9,7 @@
 //! start.
 //!
 //! [`RedisQueue`] keeps the local queue for the daily session start limit and
-//! its reset (and the buckets of a lowered SHARDS_CONCURRENCY), and then also
+//! its reset (and the buckets of a lowered `SHARDS_CONCURRENCY`), and then also
 //! takes the bucket's key (`gateway_identify:<bucket>`) in Redis before the
 //! shard may identify. The key is a rate limit, not a lock: it is never
 //! released but expires one identify interval (plus a margin) after it was
@@ -50,7 +50,7 @@ pub const IDENTIFY_MARGIN: Duration = Duration::from_millis(500);
 
 /// How long a shard waits for Redis to answer before it identifies with the
 /// local queue only. Redis answers in well under a millisecond unless it is
-/// down or busy (a large GUILD_CREATE transaction can hold it for a while,
+/// down or busy (a large `GUILD_CREATE` transaction can hold it for a while,
 /// which is why the connection's own timeout is longer); identifies must not
 /// wait for an unreachable Redis.
 pub const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -84,10 +84,12 @@ pub struct RedisQueue {
     shared: Arc<Shared>,
 }
 
+/// The state of a [`RedisQueue`] that its clones and their waiting shards
+/// share.
 struct Shared {
     redis: Redis,
     /// Discord's `max_concurrency`, not the local queue's: Discord's buckets
-    /// are the same for every process, whatever SHARDS_CONCURRENCY lowered
+    /// are the same for every process, whatever `SHARDS_CONCURRENCY` lowered
     /// the local queue to.
     max_concurrency: u32,
     /// How long a taken bucket stays taken: the identify interval plus
@@ -149,7 +151,7 @@ impl Queue for RedisQueue {
     fn enqueue(&self, shard: u32) -> oneshot::Receiver<()> {
         let (mut tx, rx) = oneshot::channel();
         let local = self.local.enqueue(shard);
-        let shared = self.shared.clone();
+        let state = Arc::clone(&self.shared);
         tokio::spawn(async move {
             // A shard stops waiting when its connection ends. Then it neither
             // uses a local permit (the local queue skips a request whose
@@ -164,7 +166,7 @@ impl Queue for RedisQueue {
                 () = tx.closed() => return,
             }
             tokio::select! {
-                () = shared.take_turn(shard) => {
+                () = state.take_turn(shard) => {
                     let _ = tx.send(());
                 }
                 () = tx.closed() => {}
@@ -182,12 +184,12 @@ impl Shared {
         let bucket = shard % self.max_concurrency;
         // Dropped unchanged if the shard stops waiting, which hands the turn
         // to the next shard of the bucket.
-        let mut last = self.turns[bucket as usize].lock().await;
-        if let Some(last) = *last {
+        let mut turn = self.turns[bucket as usize].lock().await;
+        if let Some(last) = *turn {
             tokio::time::sleep_until(last + self.hold).await;
         }
         self.take_bucket(bucket).await;
-        *last = Some(Instant::now());
+        *turn = Some(Instant::now());
     }
 
     /// Wait until the bucket's key was free and is ours now, or Redis answered
@@ -197,8 +199,8 @@ impl Shared {
         let hold_ms = u64::try_from(self.hold.as_millis()).unwrap_or(u64::MAX);
         let mut take = TAKE.key(&key);
         take.arg(&self.owner).arg(hold_ms);
+        let mut conn = self.redis.clone();
         loop {
-            let mut conn = self.redis.clone();
             match tokio::time::timeout(REDIS_TIMEOUT, take.invoke_async::<u64>(&mut conn)).await {
                 Ok(Ok(0)) => {
                     self.answered();
