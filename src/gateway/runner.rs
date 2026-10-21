@@ -278,7 +278,16 @@ pub async fn run<C>(
         // is safe to wait for the workers before reading again.
         if runner.paused_at.is_some() {
             if runner.is_disconnected() {
-                runner.flush_held().await;
+                // But not past a shutdown, which would then wait until `app`
+                // aborts the runner: `flush_held` keeps what it did not queue
+                // yet, and `close` gives that until its deadline.
+                tokio::select! {
+                    () = runner.flush_held() => {}
+                    () = shutdown_requested(&mut shutdown) => {
+                        runner.close().await;
+                        return;
+                    }
+                }
                 // From now on the runner waits for the old connection to
                 // finish closing; /healthcheck reports it if that never ends.
                 runner
@@ -294,11 +303,9 @@ pub async fn run<C>(
         }
 
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    runner.close().await;
-                    return;
-                }
+            () = shutdown_requested(&mut shutdown) => {
+                runner.close().await;
+                return;
             }
             item = runner.shard.next() => {
                 if !runner.on_item(item).await {
@@ -308,6 +315,11 @@ pub async fn run<C>(
             }
         }
     }
+}
+
+/// Resolves once a shutdown is requested, or can no longer be (`app` is gone).
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
 impl<C> Runner<C>
@@ -655,12 +667,20 @@ where
     /// Wait until every held job is queued. Only called once no heartbeat is
     /// owed (the shard is disconnected) or when the shard is done.
     async fn flush_held(&mut self) {
-        for (worker, job) in std::mem::take(&mut self.held) {
-            if self.ctx.workers[worker].send(job).await.is_err() {
-                warn!(
+        while let Some(&(worker, _)) = self.held.front() {
+            // A job leaves `held` only with its queue slot, so a wait that is
+            // cut short (shutdown, deadline) keeps every job not queued yet,
+            // in order, and queues none twice.
+            let permit = self.ctx.workers[worker].reserve().await;
+            let Some((_, job)) = self.held.pop_front() else {
+                break;
+            };
+            match permit {
+                Ok(permit) => permit.send(job),
+                Err(_) => warn!(
                     "[Shard {}] Worker {} is gone, dropping event",
                     self.id, worker
-                );
+                ),
             }
         }
         if self.paused_at.take().is_some() {

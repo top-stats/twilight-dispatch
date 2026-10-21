@@ -905,9 +905,10 @@ async fn a_pause_whose_close_is_never_answered_does_not_stay_connected() {
     running.stop().await;
 }
 
-/// A shutdown while the runner waits for the workers keeps every held event:
-/// `run()` returns once they are queued, opens no new connection and keeps
-/// the session at the last received sequence.
+/// A shutdown while the runner waits for the workers keeps every held event
+/// (the wait it cuts short drops none): `run()` returns once they are queued,
+/// opens no new connection and keeps the session at the last received
+/// sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_during_a_pause_waits_for_the_held_events() {
     let _metrics = METRICS.read().await;
@@ -942,6 +943,56 @@ async fn shutdown_during_a_pause_waits_for_the_held_events() {
     assert_eq!(
         running.handle.session_info(),
         Some(session("A", FULL, &fake.gateway.resume_url()))
+    );
+}
+
+/// As above with workers that stay stuck: the held events get the close
+/// timeout, not until `app` aborts the runner. What was not queued is
+/// replayed on resume; nothing is published twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_during_a_pause_waits_for_stuck_workers_once() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let shard = 33;
+    let opts = Opts {
+        open: false,
+        ..Opts::default()
+    };
+    let mut running = start(&fake.gateway.url(), shard, redis, opts);
+
+    let mut conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_entered(1).await;
+    send_typing(&conn, 2..=FULL).await;
+    assert_eq!(conn.expect_close().await, Some(4000));
+    running
+        .wait_snapshot("the pause", |s| s.status == "Disconnected")
+        .await;
+
+    let stopping = Instant::now();
+    running.shutdown.send_replace(true);
+    eventually("run() to return", || running.finished().then_some(())).await;
+    let took = stopping.elapsed();
+    assert!(
+        took >= CLOSE_TIMEOUT - Duration::from_millis(500)
+            && took < CLOSE_TIMEOUT + Duration::from_secs(1),
+        "shutdown took {took:?}"
+    );
+    assert!(!running.snapshot().active);
+
+    running.recorder.open();
+    running.join(WAIT).await;
+    // READY waited at the gate and 2..=FULL - 1 in the queue; FULL was held.
+    assert_ids(
+        &running.recorder.published(),
+        &running.ids("A", 1..=FULL - 1),
+    );
+    assert_eq!(fake.gateway.connections(), 1, "opened a connection");
+    assert_eq!(
+        running.handle.session_info(),
+        Some(session("A", FULL - 1, &fake.gateway.resume_url()))
     );
 }
 
