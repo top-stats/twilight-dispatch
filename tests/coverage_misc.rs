@@ -70,6 +70,8 @@ struct Posted {
     method: String,
     path: String,
     body: Value,
+    /// When the request arrived, before it was answered.
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -183,6 +185,46 @@ impl FakeRest {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+
+    /// Post `message` to the shard log, followed by a guild message that
+    /// shows when it was handled. Returns its request, or `None` if it was
+    /// dropped.
+    async fn post_shard(&self, log: &DiscordLog, message: &str) -> Option<Posted> {
+        // Every call adds at least the guild message, so the count is a
+        // unique marker.
+        let before = self.posted().len();
+        log.shard(0, message);
+        log.guild_join("handled", before as u64);
+        let handled = format!("handled ({before})");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let posted = self.posted();
+            if let Some(at) = posted.iter().position(|p| description(p) == handled) {
+                let sent = &posted[before..at];
+                assert!(
+                    sent.len() <= 1 && sent.iter().all(|p| title(p) == message),
+                    "{sent:?}"
+                );
+                return sent.first().cloned();
+            }
+            assert!(Instant::now() < deadline, "no {handled} in {posted:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Post `message` to the shard log until it is sent: while the channel
+    /// is paused, each copy is dropped. One copy at a time, so none is queued
+    /// behind one that is being sent.
+    async fn post_shard_until_sent(&self, log: &DiscordLog, message: &str) -> Posted {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(sent) = self.post_shard(log, message).await {
+                return sent;
+            }
+            assert!(Instant::now() < deadline, "{message:?} was never sent");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 impl Drop for FakeRest {
@@ -224,6 +266,7 @@ async fn respond(
         method,
         path: path.clone(),
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+        at: Instant::now(),
     });
     let _ = open.wait_for(|open| *open).await;
     let (status, body) = state
@@ -1086,10 +1129,9 @@ async fn an_invalid_token_disables_every_channel() {
 
 /// twilight-http reports no status for an error whose body is not Discord's
 /// JSON error (a Cloudflare or proxy page), so the channel is paused for a
-/// while rather than disabled; the pause itself is unit-tested in
-/// discord_log.rs.
+/// while rather than disabled; how the pause ends is tested below.
 #[tokio::test]
-async fn permanent_errors_without_a_json_body_disable_the_channel() {
+async fn error_pages_without_a_status_pause_the_channel() {
     logs();
     let rest = FakeRest::start().await;
     rest.respond_with(SHARD_LOG, 403, "<html>Access denied</html>");
@@ -1104,7 +1146,7 @@ async fn permanent_errors_without_a_json_body_disable_the_channel() {
     assert_eq!(
         lines,
         [(shards.as_str(), "rejected")],
-        "a 403 page stops the posts to that channel only"
+        "a 403 page pauses that channel only"
     );
 
     // The same for an HTML 404, and for the guild channel.
@@ -1119,6 +1161,49 @@ async fn permanent_errors_without_a_json_body_disable_the_channel() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(rest.posted().len(), 2, "{:?}", rest.posted());
     assert_eq!(title(&posted[1]), "shards still work");
+}
+
+/// A paused channel is posted to again once the pause is over, so a passing
+/// 502 page from Cloudflare does not lose it. Each further error page doubles
+/// the pause, and a successful post resets it.
+#[tokio::test]
+async fn a_pause_ends_and_a_successful_post_resets_it() {
+    /// The first pause. The message right after an error page has to be
+    /// handled within it.
+    const PAUSE: Duration = Duration::from_millis(50);
+    logs();
+    let rest = FakeRest::start().await;
+    let error_page = "<html>502 Bad Gateway</html>";
+    rest.respond_with(SHARD_LOG, 502, error_page);
+    let pauses = PAUSE..=Duration::from_secs(60);
+    let log = DiscordLog::with_pauses(rest.client(), SHARD_LOG, GUILD_LOG, pauses);
+
+    // The first error page pauses the channel: the next message is dropped.
+    let first = rest.post_shard(&log, "first 502").await.expect("sent");
+    assert!(rest.post_shard(&log, "dropped").await.is_none(), "paused");
+
+    // Once the pause is over, messages are sent again, and each error page
+    // doubles the pause. A pause starts after its request arrived, so the
+    // next request arrives at least the pause later.
+    let second = rest.post_shard_until_sent(&log, "second 502").await;
+    assert!(second.at.duration_since(first.at) >= PAUSE);
+    let third = rest.post_shard_until_sent(&log, "third 502").await;
+    assert!(third.at.duration_since(second.at) >= PAUSE * 2);
+    rest.respond_with(SHARD_LOG, 200, "{}");
+    let ok = rest.post_shard_until_sent(&log, "200").await;
+    assert!(ok.at.duration_since(third.at) >= PAUSE * 4);
+
+    // The 200 reset the pause: the next error page pauses the channel for
+    // the minimum again, not for 8 times as long.
+    rest.respond_with(SHARD_LOG, 502, error_page);
+    let again = rest
+        .post_shard(&log, "502 after a 200")
+        .await
+        .expect("sent");
+    assert!(rest.post_shard(&log, "dropped").await.is_none(), "paused");
+    let after = rest.post_shard_until_sent(&log, "after the pause").await;
+    let pause = after.at.duration_since(again.at);
+    assert!(pause >= PAUSE && pause < PAUSE * 4, "paused for {pause:?}");
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@
 //! reconnect storm cannot spawn an unbounded number of REST calls.
 //!
 //! Repeated invalid requests (401/403) count towards Discord's Cloudflare ban
-//! limit, so a channel that keeps rejecting posts is not posted to again:
+//! limit, so a channel that rejects posts is disabled or paused:
 //! - A channel that answers 401/403/404 with Discord's JSON error is disabled.
 //!   After a 401 twilight refuses every request with the token, so the other
 //!   channel is disabled on its next message without another request.
@@ -22,6 +22,7 @@
 use crate::constants::{JOIN_COLOR, LEAVE_COLOR};
 
 use std::{
+    ops::RangeInclusive,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -81,8 +82,8 @@ impl ChannelState {
     }
 
     /// Pause after an error response without a status; returns for how long.
-    fn pause(&mut self, now: Instant) -> Duration {
-        let pause = self.backoff.clamp(PAUSE_MIN, PAUSE_MAX);
+    fn pause(&mut self, now: Instant, pauses: &RangeInclusive<Duration>) -> Duration {
+        let pause = self.backoff.clamp(*pauses.start(), *pauses.end());
         self.backoff = pause * 2;
         self.paused_until = Some(now + pause);
         pause
@@ -107,6 +108,24 @@ impl DiscordLog {
     }
 
     pub fn new(client: Arc<Client>, log_channel: u64, log_guild_channel: u64) -> Self {
+        Self::with_pauses(
+            client,
+            log_channel,
+            log_guild_channel,
+            PAUSE_MIN..=PAUSE_MAX,
+        )
+    }
+
+    /// [`DiscordLog::new`] with other bounds for the pause after an error
+    /// response without a status, so a test can see a pause end without
+    /// waiting a minute. Only for tests.
+    #[doc(hidden)]
+    pub fn with_pauses(
+        client: Arc<Client>,
+        log_channel: u64,
+        log_guild_channel: u64,
+        pauses: RangeInclusive<Duration>,
+    ) -> Self {
         let shards = Id::<ChannelMarker>::new_checked(log_channel);
         let guilds = Id::<ChannelMarker>::new_checked(log_guild_channel);
         if shards.is_none() && guilds.is_none() {
@@ -145,7 +164,7 @@ impl DiscordLog {
                         state.disabled = true;
                     }
                     Failure::Unknown => {
-                        let pause = state.pause(Instant::now());
+                        let pause = state.pause(Instant::now(), &pauses);
                         warn!(
                             "Pausing Discord log channel {} for {:?} after an error: {}",
                             channel, pause, err
@@ -280,11 +299,12 @@ mod tests {
 
     #[test]
     fn pauses_double_up_to_an_hour_until_a_post_succeeds() {
+        let pauses = PAUSE_MIN..=PAUSE_MAX;
         let start = Instant::now();
         let mut state = ChannelState::default();
         assert!(state.accepts(start));
 
-        assert_eq!(state.pause(start), PAUSE_MIN);
+        assert_eq!(state.pause(start, &pauses), PAUSE_MIN);
         assert!(!state.accepts(start));
         assert!(!state.accepts(start + PAUSE_MIN - Duration::from_millis(1)));
         assert!(state.accepts(start + PAUSE_MIN));
@@ -292,7 +312,7 @@ mod tests {
         let mut now = start + PAUSE_MIN;
         let mut minutes = Vec::new();
         for _ in 0..8 {
-            let pause = state.pause(now);
+            let pause = state.pause(now, &pauses);
             minutes.push(pause.as_secs() / 60);
             assert!(!state.accepts(now));
             now += pause;
@@ -302,7 +322,11 @@ mod tests {
 
         state.posted();
         assert!(state.accepts(now));
-        assert_eq!(state.pause(now), PAUSE_MIN, "a successful post resets it");
+        assert_eq!(
+            state.pause(now, &pauses),
+            PAUSE_MIN,
+            "a successful post resets it"
+        );
     }
 
     #[test]
