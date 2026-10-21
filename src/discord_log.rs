@@ -1,5 +1,5 @@
-//! Optional status messages posted to Discord channels (LOG_CHANNEL and
-//! LOG_GUILD_CHANNEL).
+//! Optional status messages posted to Discord channels (`LOG_CHANNEL` and
+//! `LOG_GUILD_CHANNEL`).
 //!
 //! Messages go through one bounded queue that a single task drains, so a
 //! reconnect storm cannot spawn an unbounded number of REST calls.
@@ -19,7 +19,10 @@
 //! Any other failure (a 5xx with a JSON body, a timeout) only loses that
 //! message.
 
-use crate::constants::{JOIN_COLOR, LEAVE_COLOR};
+use crate::{
+    constants::{JOIN_COLOR, LEAVE_COLOR},
+    util::ErrorChain,
+};
 
 use std::{
     ops::RangeInclusive,
@@ -36,6 +39,8 @@ use twilight_model::{
     util::Timestamp,
 };
 
+/// Capacity of the posting queue: how many messages may wait for the posting
+/// task. Further ones are dropped.
 const QUEUE: usize = 256;
 /// The first pause of a channel after an error response without a status.
 const PAUSE_MIN: Duration = Duration::from_secs(60);
@@ -46,17 +51,24 @@ const PAUSE_MAX: Duration = Duration::from_secs(60 * 60);
 /// too, so it checks the pauses production gets rather than a copy of them.
 const PAUSES: RangeInclusive<Duration> = PAUSE_MIN..=PAUSE_MAX;
 
+/// Which log channel a message is for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
+    /// Shard lifecycle messages (`LOG_CHANNEL`).
     Shards,
+    /// Guild joins and leaves (`LOG_GUILD_CHANNEL`).
     Guilds,
 }
 
+/// A message waiting for the posting task.
 struct Post {
     target: Target,
     embed: Embed,
 }
 
+/// Posts status messages to the log channels. A single task posts them one
+/// at a time from a bounded queue; when the queue is full a message is
+/// dropped, so logging never blocks. Clones share the queue.
 #[derive(Clone)]
 pub struct DiscordLog {
     tx: Option<mpsc::Sender<Post>>,
@@ -79,6 +91,7 @@ impl ChannelState {
         !self.disabled && self.paused_until.is_none_or(|until| now >= until)
     }
 
+    /// A post succeeded: end the pause, and start the next one at the minimum.
     fn posted(&mut self) {
         self.paused_until = None;
         self.backoff = Duration::ZERO;
@@ -110,6 +123,15 @@ impl DiscordLog {
         Self { tx: None }
     }
 
+    /// A logger posting shard lifecycle messages to `log_channel`
+    /// (`LOG_CHANNEL`) and guild joins and leaves to `log_guild_channel`
+    /// (`LOG_GUILD_CHANNEL`). A channel id of 0 turns that channel off; with
+    /// both off this is [`DiscordLog::disabled`].
+    ///
+    /// # Panics
+    ///
+    /// When called outside a Tokio runtime with at least one channel set: it
+    /// spawns the posting task.
     pub fn new(client: Arc<Client>, log_channel: u64, log_guild_channel: u64) -> Self {
         Self::with_pauses(client, log_channel, log_guild_channel, PAUSES)
     }
@@ -117,6 +139,11 @@ impl DiscordLog {
     /// [`DiscordLog::new`] with other bounds for the pause after an error
     /// response without a status, so a test can see a pause end without
     /// waiting a minute. Only for tests.
+    ///
+    /// # Panics
+    ///
+    /// As [`DiscordLog::new`]: when called outside a Tokio runtime with at
+    /// least one channel set.
     #[doc(hidden)]
     pub fn with_pauses(
         client: Arc<Client>,
@@ -146,18 +173,18 @@ impl DiscordLog {
                     continue;
                 }
                 let embeds = [post.embed];
-                let err = match client.create_message(*channel).embeds(&embeds).await {
-                    Ok(_) => {
-                        state.posted();
-                        continue;
-                    }
-                    Err(err) => err,
+                let Err(err) = client.create_message(*channel).embeds(&embeds).await else {
+                    state.posted();
+                    continue;
                 };
+                // twilight's `Display` leaves out the cause of a failed
+                // request (connection refused, TLS, an invalid field).
+                let reason = ErrorChain(&err);
                 match classify(err.kind()) {
                     Failure::Permanent => {
                         error!(
                             "Disabling Discord log channel {} after a permanent error: {}",
-                            channel, err
+                            channel, reason
                         );
                         state.disabled = true;
                     }
@@ -165,10 +192,10 @@ impl DiscordLog {
                         let pause = state.pause(Instant::now(), &pauses);
                         warn!(
                             "Pausing Discord log channel {} for {:?} after an error: {}",
-                            channel, pause, err
+                            channel, pause, reason
                         );
                     }
-                    Failure::Transient => warn!("Failed to post message to Discord: {}", err),
+                    Failure::Transient => warn!("Failed to post message to Discord: {}", reason),
                 }
             }
         });
@@ -192,6 +219,7 @@ impl DiscordLog {
         );
     }
 
+    /// A guild join message naming the guild and its id.
     pub fn guild_join(&self, name: &str, id: u64) {
         self.send(
             Target::Guilds,
@@ -204,6 +232,7 @@ impl DiscordLog {
         );
     }
 
+    /// A guild leave message naming the guild and its id.
     pub fn guild_leave(&self, name: &str, id: u64) {
         self.send(
             Target::Guilds,
@@ -221,6 +250,7 @@ fn now() -> Option<Timestamp> {
     Timestamp::from_secs(OffsetDateTime::now_utc().unix_timestamp()).ok()
 }
 
+/// How a failed post affects its channel, by twilight's error kind.
 fn classify(kind: &ErrorType) -> Failure {
     match kind {
         ErrorType::Unauthorized => Failure::Permanent,
