@@ -22,7 +22,7 @@ use std::fmt::Display;
 /// all). That is why the parent is spelled out per prefix in [`scope`]
 /// instead of being guessed from the key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Scope {
+enum Scope {
     /// `guild:<id>` and `bot_user`: no parent.
     Global,
     /// `<prefix>:<guild>:<id>`: also in `guild_keys:<guild>`. Private
@@ -38,7 +38,7 @@ pub enum Scope {
 /// The scope of every key prefix the cache writes, `None` for anything else.
 /// A new prefix has to be added here; a unit test checks that every `*_KEY`
 /// constant is.
-pub fn scope(prefix: &str) -> Option<Scope> {
+fn scope(prefix: &str) -> Option<Scope> {
     match prefix {
         GUILD_KEY | BOT_USER_KEY => Some(Scope::Global),
         CHANNEL_KEY | ROLE_KEY | EMOJI_KEY | MEMBER_KEY | PRESENCE_KEY | VOICE_KEY => {
@@ -53,6 +53,7 @@ pub fn scope(prefix: &str) -> Option<Scope> {
 /// Where a logical key is stored, and which index sets reference it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyPlan {
+    /// The key the value lives under in Redis, as [`stored_key`] gives it.
     pub stored: String,
     /// `(set, member)` pairs; the member is always the stored key.
     pub indexes: Vec<(String, String)>,
@@ -70,8 +71,10 @@ pub fn stored_key(key: &str) -> String {
 /// Compute the stored key and index-set memberships of a logical key.
 ///
 /// - `<prefix>:...` is indexed in `<prefix>_keys`.
-/// - `<prefix>:<parent>:<id>` is also indexed under its parent, as its
-///   [`Scope`] says.
+/// - `<prefix>:<parent>:<id>` is also indexed under its parent, as the
+///   prefix's scope says: `channel_keys:<parent>` for messages,
+///   `guild_keys:<parent>` and `thread_keys:<parent>` for threads, and
+///   `guild_keys:<parent>` for everything else.
 /// - Keys without a `:` (for example `bot_user`) are not indexed.
 pub fn plan(key: &str) -> KeyPlan {
     let stored = stored_key(key);
@@ -92,11 +95,13 @@ pub fn plan(key: &str) -> KeyPlan {
                 // mean reading every key of the guild.
                 indexes.push((thread_index(parent), stored.clone()));
             }
-            Some(Scope::Guild) => indexes.push((guild_index(parent), stored.clone())),
-            // The cache writes neither: global keys have no parent segment,
-            // and every prefix it writes has a scope. Planning stays total
-            // with the rule of earlier versions (the segment is a guild).
-            Some(Scope::Global) | None => indexes.push((guild_index(parent), stored.clone())),
+            // Guild children, and two cases the cache never writes: a global
+            // key with a parent segment and a prefix without a scope. Those
+            // keep the rule of earlier versions (the segment is a guild), so
+            // planning stays total.
+            Some(Scope::Guild | Scope::Global) | None => {
+                indexes.push((guild_index(parent), stored.clone()));
+            }
         }
     }
 
@@ -158,6 +163,14 @@ pub fn guild_id_of(stored: &str) -> Option<u64> {
 }
 
 /// Which shard a guild lives on (Discord's sharding formula).
+///
+/// # Panics
+///
+/// Panics when `shard_total` is 0.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the remainder is below shard_total, which is a u32; From is not const"
+)]
 pub const fn shard_for_guild(guild_id: u64, shard_total: u32) -> u32 {
     ((guild_id >> 22) % shard_total as u64) as u32
 }
@@ -166,9 +179,9 @@ pub const fn shard_for_guild(guild_id: u64, shard_total: u32) -> u32 {
 ///
 /// After a fresh IDENTIFY, READY lists every guild of the shard, so anything
 /// else cached for that shard was left while we were disconnected.
-pub fn stale_guilds(
+pub fn stale_guilds<S: std::hash::BuildHasher>(
     cached: impl IntoIterator<Item = u64>,
-    ready: &std::collections::HashSet<u64>,
+    ready: &std::collections::HashSet<u64, S>,
     shard: u32,
     shard_total: u32,
 ) -> Vec<u64> {

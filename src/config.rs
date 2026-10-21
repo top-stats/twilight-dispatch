@@ -14,47 +14,91 @@ use twilight_model::gateway::{
     Intents,
 };
 
+/// Default of `PROMETHEUS_PORT`: the port of the metrics and `/healthcheck`
+/// server, and the one `twilight-dispatch healthcheck` probes when it is unset.
+pub const DEFAULT_PROMETHEUS_PORT: u16 = 8005;
+
+/// The service's settings, read from environment variables by
+/// [`Config::from_env`]. `.env.example` describes every variable; values that
+/// are empty or only whitespace count as unset.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Discord bot token (`BOT_TOKEN`, required).
     pub bot_token: String,
-    /// `None` means "use Discord's recommended shard count, all shards".
+    /// The shards this process runs (`SHARDS_START`, `SHARDS_END`,
+    /// `SHARDS_TOTAL`). `None` (all three unset) means "use Discord's
+    /// recommended shard count, all shards".
     pub shards: Option<ShardRange>,
-    /// Upper bound for identify concurrency; Discord's value is used if lower,
-    /// and a value that does not divide it is lowered further (see
-    /// `gateway::concurrency`).
+    /// Upper bound for identify concurrency (`SHARDS_CONCURRENCY`); Discord's
+    /// value is used if lower, and a value that does not divide it is lowered
+    /// further (see `gateway::concurrency`).
     pub shards_concurrency: Option<u16>,
+    /// Whether to declare the `gateway.recv` queue and bind it to every event
+    /// (`DEFAULT_QUEUE`, default `true`).
     pub default_queue: bool,
-    /// Publisher confirms (`AMQP_CONFIRMS`): an event counts as published
-    /// only once the broker confirmed it. Off by default, because each worker
-    /// then waits for one broker disk sync per event.
+    /// Publisher confirms (`AMQP_CONFIRMS`, default `false`): an event counts
+    /// as published only once the broker confirmed it. Off by default, because
+    /// with confirms each worker waits for one broker disk sync per event.
     pub amqp_confirms: bool,
+    /// Whether shards resume the sessions saved in Redis by the previous run
+    /// (`RESUME`, default `true`). Only when `SHARDS_TOTAL` is set and the
+    /// same as in that run.
     pub resume: bool,
+    /// Gateway intents sent in the identify (`INTENTS`, required, as bits).
     pub intents: Intents,
+    /// Member count from which Discord sends a guild without its offline
+    /// members (`LARGE_THRESHOLD`, 50 to 250, default 250).
     pub large_threshold: u64,
+    /// Presence status (`STATUS`, default `online`).
     pub status: Status,
+    /// Activity type (`ACTIVITY_TYPE`, default 0, playing).
     pub activity_type: ActivityType,
+    /// Activity name (`ACTIVITY_NAME`, default empty).
     pub activity_name: String,
+    /// Activity state (`ACTIVITY_STATE`). A custom status (type 4) is shown
+    /// from the state, which then defaults to `activity_name`.
     pub activity_state: Option<String>,
+    /// Stream URL of a streaming activity (`ACTIVITY_URL`, type 1).
     pub activity_url: Option<String>,
+    /// Discord channel for shard status messages (`LOG_CHANNEL`; 0, the
+    /// default, disables them).
     pub log_channel: u64,
+    /// Discord channel for guild join and leave messages
+    /// (`LOG_GUILD_CHANNEL`; 0, the default, disables them).
     pub log_guild_channel: u64,
+    /// What the Redis state cache stores (the `STATE_*` variables).
     pub state: StateConfig,
+    /// Broker URL: `AMQP_URL`, or one built from `RABBIT_HOST` (required
+    /// then), `RABBIT_PORT` (5672), `RABBIT_USERNAME` and `RABBIT_PASSWORD`
+    /// (`guest`) and `RABBIT_VHOST` (`/`), with `heartbeat=30`.
     pub amqp_url: String,
+    /// Redis URL: `REDIS_URL`, or one built from `REDIS_HOST` (required then),
+    /// `REDIS_PORT` (6379), `REDIS_USERNAME`, `REDIS_PASSWORD` and `REDIS_DB`
+    /// (0).
     pub redis_url: String,
+    /// IP address the metrics and health server binds (`PROMETHEUS_HOST`,
+    /// default `0.0.0.0`; `localhost` and `ip6-localhost` are resolved).
     pub prometheus_host: String,
+    /// Port of the metrics and health server (`PROMETHEUS_PORT`, default
+    /// [`DEFAULT_PROMETHEUS_PORT`]).
     pub prometheus_port: u16,
-    /// Number of ordered workers that cache and publish events.
+    /// Number of ordered workers that cache and publish events (`WORKERS`, 1
+    /// to 1024, default 32).
     pub workers: usize,
-    /// Time limit for one cache update before the event is published without it.
+    /// Time limit for one cache update before the event is published without
+    /// it (`CACHE_TIMEOUT_MS`, at least 100 ms, default 10 s).
     pub cache_timeout: Duration,
-    /// A shard that has received nothing for this long is reported unhealthy.
+    /// A shard that has received nothing for this long is reported unhealthy
+    /// (`SHARD_SILENCE_SECS`, at least 120 s, default 180 s).
     pub shard_silence: Duration,
     /// Send Discord REST requests to this proxy instead of discord.com
-    /// (e.g. twilight-http-proxy), as `http://host:port` or `https://host:port`.
+    /// (`DISCORD_API_PROXY`, e.g. twilight-http-proxy), given as
+    /// `http://host:port` or `https://host:port`.
     pub discord_api_proxy: Option<DiscordProxy>,
-    /// Connect shards to this gateway URL instead of wss://gateway.discord.gg
-    /// (e.g. a gateway proxy). Resumes still go to Discord's resume URL.
-    /// Trimmed and without a trailing `/`, as twilight appends `/?v=10&...`.
+    /// Connect shards to this gateway URL instead of
+    /// `wss://gateway.discord.gg` (`DISCORD_GATEWAY_URL`, e.g. a gateway
+    /// proxy). Resumes still go to Discord's resume URL. Trimmed and without
+    /// a trailing `/`, as twilight appends `/?v=10&...`.
     pub discord_gateway_url: Option<String>,
 }
 
@@ -142,48 +186,103 @@ fn is_host_and_port(uri: &hyper::Uri) -> bool {
         }
 }
 
-/// The part of the configuration the state cache needs.
+/// `value` with everything between the scheme's `://` (or the start, when
+/// there is none) and the last `@` replaced by `***`, so that a rejected URL
+/// does not put its credentials into the logs, even ones with an unescaped
+/// `/`, `?` or `#`. A value without an `@` is returned unchanged.
+fn redact_userinfo(value: &str) -> String {
+    let Some(at) = value.rfind('@') else {
+        return value.to_owned();
+    };
+    let start = value[..at].find("://").map_or(0, |i| i + "://".len());
+    format!("{}***{}", &value[..start], &value[at..])
+}
+
+/// The part of the configuration the state cache needs (the `STATE_*`
+/// variables). In one from [`Config::from_lookup`] every flag is off when
+/// `enabled` is.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent switch per STATE_* variable; tests build it field by field"
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateConfig {
+    /// Whether to keep a state cache in Redis at all (`STATE_ENABLED`,
+    /// default `true`). Without it events are published without `old`.
     pub enabled: bool,
+    /// Cache guild members (`STATE_MEMBER`, default `false`); the bot's own
+    /// member is cached either way.
     pub member: bool,
+    /// Milliseconds after which a cached member expires; 0 means never
+    /// (`STATE_MEMBER_TTL`, default 0).
     pub member_ttl: u64,
+    /// Cache messages (`STATE_MESSAGE`, default `false`).
     pub message: bool,
+    /// Milliseconds after which a cached message expires; 0 means never
+    /// (`STATE_MESSAGE_TTL`, default 0).
     pub message_ttl: u64,
+    /// Cache presences (`STATE_PRESENCE`, default `false`).
     pub presence: bool,
+    /// Cache emojis (`STATE_EMOJI`, default `false`).
     pub emoji: bool,
+    /// Cache voice states (`STATE_VOICE`, default `false`).
     pub voice: bool,
+    /// Attach the previous cached value as `old` to published events
+    /// (`STATE_OLD`, default `false`).
     pub old: bool,
 }
 
+/// The shards one process runs: `start..=end` of `total`. A range from
+/// [`Config::from_lookup`] is never empty: `start <= end < total`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardRange {
+    /// First shard id (`SHARDS_START`, default 0).
     pub start: u32,
+    /// Last shard id, inclusive (`SHARDS_END`, default `total - 1`).
     pub end: u32,
+    /// Shard count of the whole bot, across all its processes
+    /// (`SHARDS_TOTAL`).
     pub total: u32,
 }
 
 impl ShardRange {
+    /// The shard ids, `start..=end`.
     pub fn ids(self) -> std::ops::RangeInclusive<u32> {
         self.start..=self.end
     }
 
-    #[allow(clippy::len_without_is_empty)] // a range always has at least one shard
+    /// The number of shards, `end - start + 1`. Assumes `start <= end`, which
+    /// holds for every range [`Config::from_lookup`] returns.
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "a range always has at least one shard"
+    )]
     pub fn len(self) -> u32 {
         self.end - self.start + 1
     }
 
+    /// Whether `shard` is one of the range's shards.
     pub fn contains(self, shard: u32) -> bool {
         self.ids().contains(&shard)
     }
 }
 
+/// Why the configuration cannot be used. `Display` names the variable, so
+/// the error can be logged as it is.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ConfigError {
+    /// This required variable is unset or blank.
     Missing(&'static str),
+    /// A variable has a value that cannot be used.
     Invalid {
+        /// The variable.
         name: &'static str,
+        /// The value as set, except that the checks of a parsed number report
+        /// that number (for `SHARDS_END`, the effective last shard) and that
+        /// the credentials of a rejected `DISCORD_API_PROXY` or
+        /// `DISCORD_GATEWAY_URL` are replaced by `***`.
         value: String,
+        /// What is wrong with it, or which values are accepted.
         reason: String,
     },
 }
@@ -205,115 +304,37 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Reads one environment variable: its value, or `None` when it is unset.
 type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 impl Config {
+    /// Reads the configuration from the process environment (into which
+    /// `main` loads `.env` first).
+    ///
+    /// # Errors
+    ///
+    /// The first problem found: [`ConfigError::Missing`] when a required
+    /// variable is unset or blank, [`ConfigError::Invalid`] when a value
+    /// cannot be parsed or is out of range.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(&|name| std::env::var(name).ok())
     }
 
+    /// Reads the configuration through `lookup`, which returns the value of a
+    /// variable or `None` when it is unset (tests pass a map).
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::from_env`].
     pub fn from_lookup(lookup: Lookup<'_>) -> Result<Self, ConfigError> {
         let env = Env(lookup);
 
-        let shards = match (
-            env.optional::<u32>("SHARDS_START")?,
-            env.optional::<u32>("SHARDS_END")?,
-            env.optional::<u32>("SHARDS_TOTAL")?,
-        ) {
-            (None, None, None) => None,
-            (start, end, Some(total)) => {
-                let start = start.unwrap_or(0);
-                let end = end.unwrap_or(total.saturating_sub(1));
-                if total == 0 || start > end || end >= total {
-                    return Err(ConfigError::Invalid {
-                        name: "SHARDS_END",
-                        value: end.to_string(),
-                        reason: format!(
-                            "need SHARDS_START <= SHARDS_END < SHARDS_TOTAL (got {start}..={end} of {total})"
-                        ),
-                    });
-                }
-                Some(ShardRange { start, end, total })
-            }
-            _ => return Err(ConfigError::Missing("SHARDS_TOTAL")),
-        };
-
-        let intents_bits: u64 = env.required("INTENTS")?;
-        let intents = Intents::from_bits(intents_bits).ok_or_else(|| ConfigError::Invalid {
-            name: "INTENTS",
-            value: intents_bits.to_string(),
-            reason: format!(
-                "unknown intent bits {:#x}",
-                intents_bits & !Intents::all().bits()
-            ),
-        })?;
-
-        let large_threshold: u64 = env.optional("LARGE_THRESHOLD")?.unwrap_or(250);
-        if !(50..=250).contains(&large_threshold) {
-            return Err(ConfigError::Invalid {
-                name: "LARGE_THRESHOLD",
-                value: large_threshold.to_string(),
-                reason: "Discord accepts 50 to 250".into(),
-            });
-        }
-
-        let state_enabled = env.optional("STATE_ENABLED")?.unwrap_or(true);
-        let state = StateConfig {
-            enabled: state_enabled,
-            member: state_enabled && env.optional("STATE_MEMBER")?.unwrap_or(false),
-            member_ttl: env.optional("STATE_MEMBER_TTL")?.unwrap_or(0),
-            message: state_enabled && env.optional("STATE_MESSAGE")?.unwrap_or(false),
-            message_ttl: env.optional("STATE_MESSAGE_TTL")?.unwrap_or(0),
-            presence: state_enabled && env.optional("STATE_PRESENCE")?.unwrap_or(false),
-            emoji: state_enabled && env.optional("STATE_EMOJI")?.unwrap_or(false),
-            voice: state_enabled && env.optional("STATE_VOICE")?.unwrap_or(false),
-            old: state_enabled && env.optional("STATE_OLD")?.unwrap_or(false),
-        };
-
-        let amqp_url = match env.string("AMQP_URL") {
-            Some(url) => url,
-            None => {
-                let vhost = env.string("RABBIT_VHOST").unwrap_or_else(|| "/".into());
-                // heartbeat=30: LavinMQ's default (300 s) takes 10 minutes to
-                // notice a dead connection.
-                format!(
-                    "amqp://{}:{}@{}:{}/{}?heartbeat=30",
-                    encode(
-                        &env.string("RABBIT_USERNAME")
-                            .unwrap_or_else(|| "guest".into())
-                    ),
-                    encode(
-                        &env.string("RABBIT_PASSWORD")
-                            .unwrap_or_else(|| "guest".into())
-                    ),
-                    env.string("RABBIT_HOST")
-                        .ok_or(ConfigError::Missing("RABBIT_HOST"))?,
-                    env.optional::<u16>("RABBIT_PORT")?.unwrap_or(5672),
-                    encode(&vhost),
-                )
-            }
-        };
-
-        let redis_url = match env.string("REDIS_URL") {
-            Some(url) => url,
-            None => {
-                let auth = match (env.string("REDIS_USERNAME"), env.string("REDIS_PASSWORD")) {
-                    (None, None) => String::new(),
-                    (user, pass) => format!(
-                        "{}:{}@",
-                        encode(&user.unwrap_or_default()),
-                        encode(&pass.unwrap_or_default())
-                    ),
-                };
-                format!(
-                    "redis://{auth}{}:{}/{}",
-                    env.string("REDIS_HOST")
-                        .ok_or(ConfigError::Missing("REDIS_HOST"))?,
-                    env.optional::<u16>("REDIS_PORT")?.unwrap_or(6379),
-                    env.optional::<u32>("REDIS_DB")?.unwrap_or(0),
-                )
-            }
-        };
+        let shards = env.shards()?;
+        let intents = env.intents()?;
+        let large_threshold = env.large_threshold()?;
+        let state = env.state()?;
+        let amqp_url = env.amqp_url()?;
+        let redis_url = env.redis_url()?;
 
         let workers: usize = env.optional("WORKERS")?.unwrap_or(32);
         if !(1..=1024).contains(&workers) {
@@ -341,24 +362,10 @@ impl Config {
                 reason: "need at least 120 seconds".into(),
             });
         }
-        let prometheus_host = env
-            .string("PROMETHEUS_HOST")
-            .unwrap_or_else(|| "0.0.0.0".into());
-        let prometheus_host = match parse_host(&prometheus_host) {
-            Some(ip) => ip.to_string(),
-            None => {
-                return Err(ConfigError::Invalid {
-                    name: "PROMETHEUS_HOST",
-                    value: prometheus_host,
-                    reason: "must be an IP address or localhost".into(),
-                })
-            }
-        };
+        let prometheus_host = env.prometheus_host()?;
 
         Ok(Self {
-            bot_token: env
-                .string("BOT_TOKEN")
-                .ok_or(ConfigError::Missing("BOT_TOKEN"))?,
+            bot_token: env.required_string("BOT_TOKEN")?,
             shards,
             shards_concurrency: env.optional("SHARDS_CONCURRENCY")?,
             default_queue: env.optional("DEFAULT_QUEUE")?.unwrap_or(true),
@@ -379,7 +386,9 @@ impl Config {
             amqp_url,
             redis_url,
             prometheus_host,
-            prometheus_port: env.optional("PROMETHEUS_PORT")?.unwrap_or(8005),
+            prometheus_port: env
+                .optional("PROMETHEUS_PORT")?
+                .unwrap_or(DEFAULT_PROMETHEUS_PORT),
             workers,
             cache_timeout: Duration::from_millis(cache_timeout_ms),
             shard_silence: Duration::from_secs(shard_silence_secs),
@@ -387,7 +396,7 @@ impl Config {
                 Some(value) => Some(DiscordProxy::parse(&value).ok_or_else(|| {
                     ConfigError::Invalid {
                         name: "DISCORD_API_PROXY",
-                        value: value.clone(),
+                        value: redact_userinfo(&value),
                         reason: "expected http://host:port or https://host:port \
                                  (no path, query or credentials)"
                             .into(),
@@ -399,7 +408,7 @@ impl Config {
                 Some(value) => Some(parse_gateway_url(&value).ok_or_else(|| {
                     ConfigError::Invalid {
                         name: "DISCORD_GATEWAY_URL",
-                        value: value.clone(),
+                        value: redact_userinfo(&value),
                         reason: "expected ws:// or wss:// with a host, an optional port and \
                                  path, and no query, fragment or credentials"
                             .into(),
@@ -410,7 +419,8 @@ impl Config {
         })
     }
 
-    /// Variables that older versions required but that no longer do anything.
+    /// Variables that older versions required but that no longer do anything,
+    /// among those `lookup` finds set to a non-blank value.
     pub fn obsolete_variables(lookup: Lookup<'_>) -> Vec<&'static str> {
         OBSOLETE_VARIABLES
             .iter()
@@ -423,13 +433,21 @@ impl Config {
 /// Reported at startup when set, so deployments learn they can drop them.
 const OBSOLETE_VARIABLES: &[&str] = &["CLUSTERS", "SHARDS_WAIT"];
 
+/// The variables, read through a `Lookup`.
 struct Env<'a>(Lookup<'a>);
 
 impl Env<'_> {
+    /// The value of `name`, or `None` when it is unset or blank. Not trimmed.
     fn string(&self, name: &str) -> Option<String> {
         (self.0)(name).filter(|value| !value.trim().is_empty())
     }
 
+    /// `name` as `string` returns it, or `Missing` when it is unset or blank.
+    fn required_string(&self, name: &'static str) -> Result<String, ConfigError> {
+        self.string(name).ok_or(ConfigError::Missing(name))
+    }
+
+    /// `name` parsed with `parse_value`, or `None` when it is unset or blank.
     fn optional<T: DeserializeOwned>(&self, name: &'static str) -> Result<Option<T>, ConfigError> {
         self.string(name)
             .map(|value| {
@@ -442,8 +460,138 @@ impl Env<'_> {
             .transpose()
     }
 
+    /// `name` parsed with `parse_value`, or `Missing` when it is unset or
+    /// blank.
     fn required<T: DeserializeOwned>(&self, name: &'static str) -> Result<T, ConfigError> {
         self.optional(name)?.ok_or(ConfigError::Missing(name))
+    }
+
+    /// `SHARDS_START`, `SHARDS_END` and `SHARDS_TOTAL`: `None` when all three
+    /// are unset. `SHARDS_START` defaults to the first shard and `SHARDS_END`
+    /// to the last; `SHARDS_TOTAL` is required once either is set.
+    fn shards(&self) -> Result<Option<ShardRange>, ConfigError> {
+        match (
+            self.optional::<u32>("SHARDS_START")?,
+            self.optional::<u32>("SHARDS_END")?,
+            self.optional::<u32>("SHARDS_TOTAL")?,
+        ) {
+            (None, None, None) => Ok(None),
+            (start, end, Some(total)) => {
+                let start = start.unwrap_or(0);
+                let end = end.unwrap_or(total.saturating_sub(1));
+                if total == 0 || start > end || end >= total {
+                    return Err(ConfigError::Invalid {
+                        name: "SHARDS_END",
+                        value: end.to_string(),
+                        reason: format!(
+                            "need SHARDS_START <= SHARDS_END < SHARDS_TOTAL (got {start}..={end} of {total})"
+                        ),
+                    });
+                }
+                Ok(Some(ShardRange { start, end, total }))
+            }
+            _ => Err(ConfigError::Missing("SHARDS_TOTAL")),
+        }
+    }
+
+    /// `INTENTS`, which must not have bits of unknown intents.
+    fn intents(&self) -> Result<Intents, ConfigError> {
+        let intents_bits: u64 = self.required("INTENTS")?;
+        Intents::from_bits(intents_bits).ok_or_else(|| ConfigError::Invalid {
+            name: "INTENTS",
+            value: intents_bits.to_string(),
+            reason: format!(
+                "unknown intent bits {:#x}",
+                intents_bits & !Intents::all().bits()
+            ),
+        })
+    }
+
+    /// `LARGE_THRESHOLD` (default 250), which Discord accepts from 50 to 250.
+    fn large_threshold(&self) -> Result<u64, ConfigError> {
+        let large_threshold: u64 = self.optional("LARGE_THRESHOLD")?.unwrap_or(250);
+        if !(50..=250).contains(&large_threshold) {
+            return Err(ConfigError::Invalid {
+                name: "LARGE_THRESHOLD",
+                value: large_threshold.to_string(),
+                reason: "Discord accepts 50 to 250".into(),
+            });
+        }
+        Ok(large_threshold)
+    }
+
+    /// The `STATE_*` variables. The flags are only read when `STATE_ENABLED`
+    /// is on, so a bad value in one of them is no error while it is off.
+    fn state(&self) -> Result<StateConfig, ConfigError> {
+        let enabled = self.optional("STATE_ENABLED")?.unwrap_or(true);
+        Ok(StateConfig {
+            enabled,
+            member: enabled && self.optional("STATE_MEMBER")?.unwrap_or(false),
+            member_ttl: self.optional("STATE_MEMBER_TTL")?.unwrap_or(0),
+            message: enabled && self.optional("STATE_MESSAGE")?.unwrap_or(false),
+            message_ttl: self.optional("STATE_MESSAGE_TTL")?.unwrap_or(0),
+            presence: enabled && self.optional("STATE_PRESENCE")?.unwrap_or(false),
+            emoji: enabled && self.optional("STATE_EMOJI")?.unwrap_or(false),
+            voice: enabled && self.optional("STATE_VOICE")?.unwrap_or(false),
+            old: enabled && self.optional("STATE_OLD")?.unwrap_or(false),
+        })
+    }
+
+    /// `AMQP_URL`, or a URL built from the `RABBIT_*` variables with their
+    /// parts percent-encoded.
+    fn amqp_url(&self) -> Result<String, ConfigError> {
+        if let Some(url) = self.string("AMQP_URL") {
+            return Ok(url);
+        }
+        let virtual_host = self.string("RABBIT_VHOST");
+        let username = self.string("RABBIT_USERNAME");
+        let password = self.string("RABBIT_PASSWORD");
+        let host = self.required_string("RABBIT_HOST")?;
+        let port = self.optional::<u16>("RABBIT_PORT")?.unwrap_or(5672);
+        // heartbeat=30: LavinMQ's default (300 s) takes 10 minutes to notice a
+        // dead connection.
+        Ok(format!(
+            "amqp://{}:{}@{host}:{port}/{}?heartbeat=30",
+            encode(username.as_deref().unwrap_or("guest")),
+            encode(password.as_deref().unwrap_or("guest")),
+            encode(virtual_host.as_deref().unwrap_or("/")),
+        ))
+    }
+
+    /// `REDIS_URL`, or a URL built from the `REDIS_*` variables with the
+    /// credentials percent-encoded.
+    fn redis_url(&self) -> Result<String, ConfigError> {
+        if let Some(url) = self.string("REDIS_URL") {
+            return Ok(url);
+        }
+        let username = self.string("REDIS_USERNAME");
+        let password = self.string("REDIS_PASSWORD");
+        let auth = match (username, password) {
+            (None, None) => String::new(),
+            (username, password) => format!(
+                "{}:{}@",
+                encode(&username.unwrap_or_default()),
+                encode(&password.unwrap_or_default())
+            ),
+        };
+        let host = self.required_string("REDIS_HOST")?;
+        let port = self.optional::<u16>("REDIS_PORT")?.unwrap_or(6379);
+        let db = self.optional::<u32>("REDIS_DB")?.unwrap_or(0);
+        Ok(format!("redis://{auth}{host}:{port}/{db}"))
+    }
+
+    /// `PROMETHEUS_HOST` (default `0.0.0.0`) as an IP address, for binding.
+    fn prometheus_host(&self) -> Result<String, ConfigError> {
+        let configured = self.string("PROMETHEUS_HOST");
+        let host = configured.as_deref().unwrap_or("0.0.0.0");
+        match parse_host(host) {
+            Some(ip) => Ok(ip.to_string()),
+            None => Err(ConfigError::Invalid {
+                name: "PROMETHEUS_HOST",
+                value: host.to_owned(),
+                reason: "must be an IP address or localhost".into(),
+            }),
+        }
     }
 }
 
@@ -469,20 +617,21 @@ pub fn parse_value<T: DeserializeOwned>(value: &str) -> Option<T> {
 /// kept: earlier versions put credentials into the URL verbatim, so a
 /// deployment may already have encoded them itself.
 fn encode(value: &str) -> String {
+    use std::fmt::Write as _;
+
     let bytes = value.as_bytes();
     let mut out = String::with_capacity(value.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
+    for (i, &byte) in bytes.iter().enumerate() {
+        // `%XX`, an escape already there.
         let escape = byte == b'%'
             && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
             && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') || escape {
-            out.push(byte as char);
+            out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            // Writing to a `String` cannot fail.
+            let _ = write!(out, "%{byte:02X}");
         }
-        i += 1;
     }
     out
 }
@@ -1142,5 +1291,24 @@ pub(crate) mod tests {
         );
         assert_eq!(parse_value::<Status>("dnd"), Some(Status::DoNotDisturb));
         assert_eq!(parse_value::<u64>(""), None);
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    /// Both callers parse `scheme://...`, which `http::Uri` only accepts with
+    /// an authority, so no configured value gets here without one. The check
+    /// still rejects such a URI instead of relying on that.
+    #[test]
+    fn a_uri_without_an_authority_is_not_a_host_and_port() {
+        for text in ["/api/v10/gateway/bot", "*"] {
+            let uri: hyper::Uri = text.parse().unwrap();
+            assert!(uri.authority().is_none(), "{text}");
+            assert!(!is_host_and_port(&uri), "{text}");
+        }
+        let uri: hyper::Uri = "ws://gateway:8080".parse().unwrap();
+        assert!(is_host_and_port(&uri));
     }
 }

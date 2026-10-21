@@ -29,6 +29,8 @@ pub struct SeqToken {
     seq: u64,
 }
 
+/// The resume point of one shard: which dispatched sequence numbers of the
+/// current session are still in flight, and which recently failed.
 #[derive(Debug, Default)]
 pub struct SeqTracker {
     epoch: u64,
@@ -42,6 +44,8 @@ pub struct SeqTracker {
 }
 
 impl SeqTracker {
+    /// A tracker before any session: nothing in flight and a resume point of
+    /// 0 until [`Self::new_session`] or [`Self::dispatch`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -111,11 +115,15 @@ impl SeqTracker {
         token.epoch == self.epoch
     }
 
-    /// The sequence that is safe to resume from.
+    /// The sequence that is safe to resume from: one below the lowest payload
+    /// still in flight or failed within [`FAILED_RETENTION`], or the highest
+    /// sequence seen when there is none.
     pub fn resume_seq(&self) -> u64 {
         self.resume_seq_at(Instant::now())
     }
 
+    /// [`Self::resume_seq`] at `now`, which decides which failures are still
+    /// within [`FAILED_RETENTION`].
     pub fn resume_seq_at(&self, now: Instant) -> u64 {
         let failed = self
             .failed
@@ -133,6 +141,8 @@ impl SeqTracker {
         }
     }
 
+    /// How many dispatched payloads of the current session are neither
+    /// completed nor failed yet (a sequence dispatched twice counts twice).
     pub fn in_flight(&self) -> usize {
         self.in_flight.values().sum()
     }

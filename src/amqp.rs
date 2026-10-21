@@ -1,4 +1,4 @@
-//! AMQP connection supervision (production broker: LavinMQ).
+//! AMQP connection supervision (production broker: `LavinMQ`).
 //!
 //! lapin connections and channels never come back on their own once they are
 //! closed. Before, a single broker restart made every later publish fail and
@@ -16,13 +16,14 @@
 //! By default a publish succeeds once lapin wrote the message to the socket,
 //! so a broker crash or a connection drop right after the write can lose it.
 //! With publisher confirms (`AMQP_CONFIRMS`) it succeeds only once the broker
-//! confirmed it: the worker lets the resume point pass the event only then,
-//! and a message lost with the connection is retried or replayed by Discord.
+//! confirmed it: the worker lets the saved resume point pass the event only
+//! then, and a message lost with the connection is retried or, after a
+//! restart that resumes the saved session, replayed by Discord.
 //! A confirm that is lost with the connection makes the publish retry a
 //! message the broker already has, so consumers can get an event twice
 //! (at-least-once; they dedupe by `message_id`). Confirms are off by default
-//! because each worker then waits for one broker disk sync per event (see
-//! README, `WORKERS`).
+//! because, when on, each worker waits for one broker disk sync per event
+//! (see README, `WORKERS`).
 
 use crate::{
     constants::{EXCHANGE, QUEUE_RECV, QUEUE_SEND, SHARD_EXCHANGE},
@@ -42,7 +43,7 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex as StdMutex, PoisonError,
+        Arc, Mutex as StdMutex, MutexGuard, PoisonError,
     },
     task::Poll,
     time::{Duration, Instant},
@@ -63,11 +64,17 @@ pub const PUBLISH_ATTEMPTS: u32 = 3;
 pub const PREFETCH: u16 = 100;
 /// How often the supervisor checks the link without being woken.
 const CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Backoff cap for reconnect attempts that time out and for links that break
+/// right after connecting.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// A connection with its channels.
+/// A connection with its channels, as the supervisor installs it. Clones
+/// share the connection and its channels.
 #[derive(Clone)]
 pub struct Link {
+    /// Numbers the links of an [`Amqp`] in the order they were opened,
+    /// from 1. [`Amqp::mark_broken`] takes it, so that a failure seen on an
+    /// old link cannot drop a newer one.
     pub generation: u64,
     connection: Arc<Connection>,
     /// In confirm mode when [`Amqp`] uses publisher confirms.
@@ -88,6 +95,10 @@ impl Link {
     }
 }
 
+/// The supervised AMQP connection of this process (see the module docs). It
+/// publishes the gateway events to [`EXCHANGE`] and gives the command
+/// consumer the current [`Link`]. [`Amqp::connect`] starts the supervisor and
+/// [`Amqp::close`] stops it.
 pub struct Amqp {
     url: String,
     default_queue: bool,
@@ -103,13 +114,25 @@ pub struct Amqp {
 }
 
 impl Amqp {
-    /// Connect, declare the topology and start the supervisor. Fails if the
-    /// broker is unreachable. Publishes without confirms.
+    /// Connect, declare the topology and start the supervisor. Publishes
+    /// without confirms. With `default_queue`, also declares the
+    /// `gateway.recv` queue and binds it to every event.
+    ///
+    /// # Errors
+    ///
+    /// Fails when connecting, opening the channels or declaring the
+    /// exchanges and queues fails, or takes longer than [`CONNECT_TIMEOUT`].
+    /// This first connection is not retried.
     pub async fn connect(url: String, default_queue: bool) -> ApiResult<Arc<Self>> {
         Self::connect_with(url, default_queue, false).await
     }
 
     /// [`Amqp::connect`], with publisher confirms when `confirms` is set.
+    ///
+    /// # Errors
+    ///
+    /// As [`Amqp::connect`]; with `confirms` also when the broker refuses to
+    /// put the publishing channel in confirm mode.
     pub async fn connect_with(
         url: String,
         default_queue: bool,
@@ -131,10 +154,15 @@ impl Amqp {
         Ok(amqp)
     }
 
+    /// Whether a link is installed and both its connection and its
+    /// publishing channel are open. Feeds the `amqp_connected` gauge and the
+    /// health check.
     pub fn is_connected(&self) -> bool {
         self.link.borrow().as_ref().is_some_and(Link::is_healthy)
     }
 
+    /// Whether [`Amqp::close`] was called: the supervisor and the command
+    /// consumer stop, and publishes fail.
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
     }
@@ -144,13 +172,20 @@ impl Amqp {
         self.link.subscribe()
     }
 
+    /// Make `link` the current link, which ends the outage.
     fn install(&self, link: Link) {
         self.link.send_modify(|current| {
             *current = Some(link);
-            if let Ok(mut down_since) = self.down_since.lock() {
-                *down_since = None;
-            }
+            *self.lock_down_since() = None;
         });
+    }
+
+    /// `down_since`, locked. Nothing panics while holding it, and its value
+    /// is valid whatever happened, so a poisoned lock is used as it is.
+    fn lock_down_since(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.down_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Drop the link if it still is `generation` (`None`: whatever it is) and
@@ -165,9 +200,7 @@ impl Amqp {
             };
             if matches {
                 *current = None;
-                if let Ok(mut down_since) = self.down_since.lock() {
-                    down_since.get_or_insert_with(Instant::now);
-                }
+                self.lock_down_since().get_or_insert_with(Instant::now);
             }
             matches
         });
@@ -176,13 +209,15 @@ impl Amqp {
 
     /// How much of the outage budget is left (all of it when connected).
     fn outage_budget_left(&self) -> Duration {
-        let down_since = self.down_since.lock().ok().and_then(|d| *d);
+        let down_since = *self.lock_down_since();
         match down_since {
             Some(since) => OUTAGE_BUDGET.saturating_sub(since.elapsed()),
             None => OUTAGE_BUDGET,
         }
     }
 
+    /// Open a connection with its channels and declare the topology, within
+    /// [`CONNECT_TIMEOUT`].
     async fn open(&self) -> ApiResult<Link> {
         let attempt = async {
             let connection = Connection::connect(
@@ -238,6 +273,8 @@ impl Amqp {
         }
         self.wake.notify_one();
         let ready = rx.wait_for(|link| link.as_ref().is_some_and(Link::is_healthy));
+        // Not returned directly: as the tail expression, the matched result
+        // (a `watch::Ref` borrowing `rx`) would only be dropped after `rx`.
         let link = match tokio::time::timeout(budget, ready).await {
             Ok(Ok(link)) => link.clone(),
             _ => None,
@@ -248,6 +285,13 @@ impl Amqp {
     /// Publish to the gateway exchange (and wait for the broker's confirm
     /// when confirms are on). Waits for a reconnect within the outage budget
     /// and tries a message at most [`PUBLISH_ATTEMPTS`] times.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection is closing, when no healthy link is back
+    /// within what is left of [`OUTAGE_BUDGET`], or when every attempt failed
+    /// (an error, a timeout after [`PUBLISH_TIMEOUT`] or, with confirms, a
+    /// nack). Each failed publish counts in `amqp_publish_failures`.
     pub async fn publish(
         &self,
         routing_key: &str,
@@ -351,6 +395,9 @@ impl Amqp {
         }
     }
 
+    /// Shut down: stop the supervisor, drop the link (which ends the command
+    /// consumer) and close the connection, waiting at most 1 s for the
+    /// broker. Publishes fail from then on.
     pub async fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.wake.notify_one();
@@ -389,8 +436,8 @@ async fn supervise(amqp: Arc<Amqp>) {
                     backoff = Duration::from_millis(250);
                 }
                 tokio::select! {
-                    _ = amqp.wake.notified() => {}
-                    _ = tokio::time::sleep(CHECK_INTERVAL) => {}
+                    () = amqp.wake.notified() => {}
+                    () = tokio::time::sleep(CHECK_INTERVAL) => {}
                 }
                 continue;
             }
@@ -410,7 +457,7 @@ async fn supervise(amqp: Arc<Amqp>) {
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
 
-        let attempt = Instant::now();
+        let started = Instant::now();
         match amqp.open().await {
             Ok(link) if amqp.is_closing() => {
                 let _ = link.connection.close(200, "shutting down".into()).await;
@@ -423,7 +470,7 @@ async fn supervise(amqp: Arc<Amqp>) {
                 installed_at = Some(Instant::now());
             }
             Err(err) => {
-                let timed_out = attempt.elapsed() >= CONNECT_TIMEOUT;
+                let timed_out = started.elapsed() >= CONNECT_TIMEOUT;
                 let cap = if timed_out {
                     MAX_BACKOFF
                 } else {
@@ -448,9 +495,34 @@ const DURABLE_QUEUE: QueueDeclareOptions = QueueDeclareOptions {
     nowait: false,
 };
 
+/// The durable exchange options used by every version of this service; the
+/// broker rejects a declaration with different flags.
+const DURABLE_EXCHANGE: ExchangeDeclareOptions = ExchangeDeclareOptions {
+    passive: false,
+    durable: true,
+    auto_delete: false,
+    internal: false,
+    nowait: false,
+};
+
+/// The options of this process' own command queue: exclusive to its
+/// connection and deleted with it.
+const OWN_QUEUE: QueueDeclareOptions = QueueDeclareOptions {
+    passive: false,
+    durable: false,
+    exclusive: true,
+    auto_delete: true,
+    nowait: false,
+};
+
 /// Prepare the consume channel: declare `gateway.send`, set the prefetch,
 /// and declare this process' own exclusive queue bound to [`SHARD_EXCHANGE`]
 /// for every shard it runs. Returns the name of that queue.
+///
+/// # Errors
+///
+/// Returns the broker's error when a declaration, the prefetch or a binding
+/// fails, for example because the channel or its connection closed.
 pub async fn declare_consume(
     consume: &Channel,
     shards: impl IntoIterator<Item = u32>,
@@ -464,17 +536,7 @@ pub async fn declare_consume(
     // Server-named, deleted with the connection: while this process is down
     // nothing is routed to it (the broker drops commands for its shards).
     let own = consume
-        .queue_declare(
-            "".into(),
-            QueueDeclareOptions {
-                passive: false,
-                durable: false,
-                exclusive: true,
-                auto_delete: true,
-                nowait: false,
-            },
-            FieldTable::default(),
-        )
+        .queue_declare("".into(), OWN_QUEUE, FieldTable::default())
         .await?;
     let name = own.name().to_string();
     for shard in shards {
@@ -491,19 +553,14 @@ pub async fn declare_consume(
     Ok(name)
 }
 
-/// Declare the exchange and queues (idempotent).
+/// Declare both exchanges and, with `default_queue`, `gateway.recv` bound to
+/// every event (idempotent).
 async fn declare(publish: &Channel, default_queue: bool) -> ApiResult<()> {
     publish
         .exchange_declare(
             EXCHANGE.into(),
             ExchangeKind::Topic,
-            ExchangeDeclareOptions {
-                passive: false,
-                durable: true,
-                auto_delete: false,
-                internal: false,
-                nowait: false,
-            },
+            DURABLE_EXCHANGE,
             FieldTable::default(),
         )
         .await?;
@@ -511,13 +568,7 @@ async fn declare(publish: &Channel, default_queue: bool) -> ApiResult<()> {
         .exchange_declare(
             SHARD_EXCHANGE.into(),
             ExchangeKind::Direct,
-            ExchangeDeclareOptions {
-                passive: false,
-                durable: true,
-                auto_delete: false,
-                internal: false,
-                nowait: false,
-            },
+            DURABLE_EXCHANGE,
             FieldTable::default(),
         )
         .await?;
@@ -538,4 +589,102 @@ async fn declare(publish: &Channel, default_queue: bool) -> ApiResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod outage_clock_tests {
+    use super::*;
+
+    /// An [`Amqp`] that never connected: no link and no supervisor.
+    fn unconnected() -> Amqp {
+        Amqp {
+            url: String::new(),
+            default_queue: false,
+            confirms: false,
+            link: watch::Sender::new(None),
+            wake: Notify::new(),
+            generation: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            down_since: StdMutex::new(None),
+        }
+    }
+
+    fn down_since(amqp: &Amqp) -> Option<Instant> {
+        let locked = amqp.down_since.lock();
+        *locked.unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Poison `down_since` as a panic while holding it would, leaving
+    /// `value` in it.
+    fn poison(amqp: &Amqp, value: Option<Instant>) {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut down_since = amqp.down_since.lock().unwrap();
+            *down_since = value;
+            panic!("poisoning down_since");
+        }));
+        assert!(panicked.is_err());
+        assert!(amqp.down_since.is_poisoned());
+    }
+
+    /// Without an outage publishes may wait for the whole budget.
+    #[test]
+    fn without_an_outage_the_whole_budget_is_left() {
+        assert_eq!(unconnected().outage_budget_left(), OUTAGE_BUDGET);
+    }
+
+    /// A report while there is no link (a caller that noticed late) neither
+    /// starts an outage nor restarts the one going on.
+    #[test]
+    fn reports_without_a_link_leave_the_outage_alone() {
+        let amqp = unconnected();
+        amqp.mark_broken(None);
+        amqp.mark_broken(Some(1));
+        assert!(amqp.link.borrow().is_none());
+        assert_eq!(down_since(&amqp), None, "an outage was started");
+        assert_eq!(amqp.outage_budget_left(), OUTAGE_BUDGET);
+
+        let since = Instant::now();
+        *amqp.down_since.lock().unwrap() = Some(since);
+        amqp.mark_broken(None);
+        assert_eq!(down_since(&amqp), Some(since), "the outage restarted");
+    }
+
+    /// A poisoned lock still holds the start of the outage: the budget runs
+    /// down rather than being renewed for every publish.
+    #[test]
+    fn a_poisoned_outage_clock_still_counts_down() {
+        let amqp = unconnected();
+        poison(&amqp, Some(Instant::now()));
+        std::thread::sleep(Duration::from_millis(20));
+        let left = amqp.outage_budget_left();
+        assert!(left < OUTAGE_BUDGET, "the outage was ignored");
+    }
+
+    /// With a poisoned lock, dropping the link still starts the outage and
+    /// installing the next one still ends it.
+    #[tokio::test]
+    async fn a_poisoned_outage_clock_still_starts_and_ends_outages() {
+        let Ok(url) = std::env::var("TEST_AMQP_URL") else {
+            assert!(
+                std::env::var_os("REQUIRE_SERVICES").is_none(),
+                "TEST_AMQP_URL is not set but REQUIRE_SERVICES is"
+            );
+            return;
+        };
+        let amqp = Amqp::connect(url, false).await.unwrap();
+        poison(&amqp, None);
+        // Nothing is awaited until the check, so the supervisor cannot
+        // reconnect in between.
+        amqp.mark_broken(None);
+        assert!(down_since(&amqp).is_some(), "the outage did not start");
+        for _ in 0..200 {
+            if amqp.is_connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(amqp.is_connected(), "not reconnected within 10 s");
+        assert_eq!(down_since(&amqp), None, "the outage did not end");
+        amqp.close().await;
+    }
 }

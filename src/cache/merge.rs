@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 
 /// Guild fields that are stored under their own keys (and kept as empty
-/// arrays in the guild blob by GUILD_CREATE). Threads are cached under their
+/// arrays in the guild blob by `GUILD_CREATE`). Threads are cached under their
 /// own keys too but also stay in the blob, as in earlier versions.
 pub const SPLIT_GUILD_FIELDS: [&str; 6] = [
     "channels",
@@ -14,12 +14,13 @@ pub const SPLIT_GUILD_FIELDS: [&str; 6] = [
     "voice_states",
 ];
 
-/// Apply a GUILD_UPDATE to the cached guild blob.
+/// Apply a `GUILD_UPDATE` to the cached guild blob.
 ///
-/// GUILD_UPDATE carries a plain guild object without the GUILD_CREATE extra
-/// fields (`member_count`, `joined_at`, `large`, `threads`, ...), so it is
-/// merged into the cached blob instead of replacing it. Fields that GUILD_CREATE
-/// splits out into their own keys are never copied back into the blob.
+/// `GUILD_UPDATE` carries a plain guild object without the `GUILD_CREATE`
+/// extra fields (`member_count`, `joined_at`, `large`, `threads`, ...), so it
+/// is merged into the cached blob instead of replacing it. Fields that
+/// `GUILD_CREATE` splits out into their own keys are never copied back into
+/// the blob. A cached READY or outage stub is replaced, not merged into.
 pub fn merge_guild_update(cached: Option<Value>, update: Value) -> Value {
     let Value::Object(update) = update else {
         return cached.unwrap_or(update);
@@ -50,35 +51,34 @@ pub fn merge_guild_update(cached: Option<Value>, update: Value) -> Value {
     Value::Object(merged)
 }
 
-/// GUILD_DELETE with `unavailable: true` is an outage, not a removal: keep the
-/// cached guild and its children, only flag it.
+/// `GUILD_DELETE` with `unavailable: true` is an outage, not a removal: keep
+/// the cached guild and its children, only flag it.
+///
+/// Without a cached guild this is a stub of only `id` and `unavailable`, the
+/// same one READY stores for guilds that are not cached yet.
 pub fn mark_unavailable(cached: Option<Value>, guild_id: u64) -> Value {
-    match cached {
-        Some(Value::Object(mut guild)) => {
-            guild.insert("unavailable".into(), Value::Bool(true));
-            Value::Object(guild)
-        }
-        _ => {
-            let mut guild = Map::new();
-            guild.insert("id".into(), Value::String(guild_id.to_string()));
-            guild.insert("unavailable".into(), Value::Bool(true));
-            Value::Object(guild)
-        }
-    }
+    let mut guild = if let Some(Value::Object(guild)) = cached {
+        guild
+    } else {
+        let mut stub = Map::new();
+        stub.insert("id".into(), Value::String(guild_id.to_string()));
+        stub
+    };
+    guild.insert("unavailable".into(), Value::Bool(true));
+    Value::Object(guild)
 }
 
-/// Adjust the cached `member_count` after GUILD_MEMBER_ADD / REMOVE.
+/// Adjust the cached `member_count` after `GUILD_MEMBER_ADD` /
+/// `GUILD_MEMBER_REMOVE`, saturating at 0 and `u64::MAX`.
 /// Returns `None` when the blob has no count to adjust.
 pub fn adjust_member_count(cached: Value, delta: i64) -> Option<Value> {
     let Value::Object(mut guild) = cached else {
         return None;
     };
-    let count = guild.get("member_count")?.as_u64()?;
-    let count = if delta.is_negative() {
-        count.saturating_sub(delta.unsigned_abs())
-    } else {
-        count.saturating_add(delta as u64)
-    };
+    let count = guild
+        .get("member_count")?
+        .as_u64()?
+        .saturating_add_signed(delta);
     guild.insert("member_count".into(), Value::from(count));
     Some(Value::Object(guild))
 }
@@ -169,5 +169,34 @@ mod tests {
     fn stubs_are_detected() {
         assert!(is_stub(&json!({"id": "1", "unavailable": true})));
         assert!(!is_stub(&cached_guild()));
+    }
+}
+
+#[cfg(test)]
+mod edge_cases {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_cached_value_that_is_not_an_object_becomes_a_stub() {
+        for cached in [json!([1]), json!("guild"), Value::Null] {
+            assert_eq!(
+                mark_unavailable(Some(cached), 7),
+                json!({"id": "7", "unavailable": true})
+            );
+        }
+    }
+
+    #[test]
+    fn member_counts_saturate_at_both_ends() {
+        let count = |cached: u64, delta: i64| {
+            let adjusted = adjust_member_count(json!({"member_count": cached}), delta);
+            adjusted.unwrap()["member_count"].as_u64()
+        };
+        assert_eq!(count(u64::MAX - 1, 5), Some(u64::MAX));
+        assert_eq!(count(u64::MAX, i64::MAX), Some(u64::MAX));
+        assert_eq!(count(u64::MAX, i64::MIN), Some(u64::MAX / 2));
+        assert_eq!(count(5, i64::MIN), Some(0));
+        assert_eq!(count(0, i64::MAX), Some(u64::MAX / 2));
     }
 }

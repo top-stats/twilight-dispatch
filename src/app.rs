@@ -4,7 +4,7 @@ use crate::{
     amqp::Amqp,
     cache, commands,
     config::Config,
-    constants::{CACHE_JOB_INTERVAL_MS, EXPIRY_KEYS, SHARDS_KEY, STARTED_KEY},
+    constants::{CACHE_JOB_INTERVAL_MS, EXPIRY_KEYS, SHARDS_KEY, STARTED_KEY, STATUSES_KEY},
     discord_log::DiscordLog,
     gateway::{
         self,
@@ -15,23 +15,26 @@ use crate::{
         worker::{self, Breaker, WorkerContext},
     },
     metrics,
-    models::{ApiResult, FormattedDateTime},
+    models::{ApiResult, FormattedDateTime, SessionInfo},
     redis_conn,
     util::Throttle,
 };
 
+use redis::aio::ConnectionLike;
 use std::{
+    collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
+use twilight_gateway::Shard;
 use twilight_http::Client;
 
 /// Shutdown budget. Docker and Swarm kill the container 10 s after SIGTERM by
-/// default (raise stop_grace_period for more headroom). A runner closes its
+/// default (raise `stop_grace_period` for more headroom). A runner closes its
 /// shard within `runner::CLOSE_TIMEOUT`, also when the shutdown finds it in a
 /// backpressure pause or in READY's cache update; one aborted before that
 /// would not mirror its final session, so the runners get a second more.
@@ -45,13 +48,27 @@ const SAVE_SHUTDOWN: Duration = Duration::from_secs(1);
 /// an older version is still running next to this one (rolling update).
 const LEGACY_EXPIRY_EVERY: u32 = 60;
 
-/// Run until SIGTERM / SIGINT.
+/// Run until SIGTERM / SIGINT (see [`shutdown_signal`]), then shut down
+/// gracefully as [`run_until`] does.
+///
+/// # Errors
+///
+/// As [`run_until`]: when startup fails.
 pub async fn run(config: Config) -> ApiResult<()> {
     run_until(config, shutdown_signal()).await
 }
 
 /// Run until `shutdown` completes, then shut down gracefully (the shards are
-/// closed resumably and their sessions saved).
+/// closed resumably and their sessions saved). A shutdown during startup
+/// stops it and returns `Ok`.
+///
+/// # Errors
+///
+/// When startup fails: the metrics address (`PROMETHEUS_HOST`,
+/// `PROMETHEUS_PORT`) cannot be bound (`ApiError::Io`, before any service is
+/// contacted), or a request to Redis, the broker or Discord fails (for
+/// example, Discord rejects the token). Once started, it returns `Ok` when
+/// shut down.
 pub async fn run_until(
     config: Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -68,7 +85,9 @@ pub async fn run_until(
     };
     tokio::pin!(stopped);
 
-    // Fail fast on a bad metrics address, before touching any service.
+    // Fail fast on a bad metrics address, before touching any service. The
+    // parse only guards hand-built Configs: `Config::from_lookup` already
+    // stores PROMETHEUS_HOST as a parsed IP address.
     let address = SocketAddr::new(
         config
             .prometheus_host
@@ -76,7 +95,12 @@ pub async fn run_until(
             .map_err(|err| format!("invalid PROMETHEUS_HOST: {err}"))?,
         config.prometheus_port,
     );
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(address).await.map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("cannot listen on {address} (PROMETHEUS_HOST, PROMETHEUS_PORT): {err}"),
+        )
+    })?;
 
     let Some(started) = until_stopped(&mut stopped, start(config, listener)).await else {
         info!("Stopped during startup");
@@ -90,16 +114,18 @@ pub async fn run_until(
     Ok(())
 }
 
+/// `work`'s result, or `None` (dropping `work`) if `stopped` completes first.
 async fn until_stopped<T>(
     stopped: &mut (impl Future<Output = ()> + Unpin),
     work: impl Future<Output = T>,
 ) -> Option<T> {
     tokio::select! {
-        _ = stopped => None,
+        () = stopped => None,
         result = work => Some(result),
     }
 }
 
+/// Everything a running service owns, for `Started::shutdown`.
 struct Started {
     redis: redis_conn::Redis,
     amqp: Arc<Amqp>,
@@ -111,6 +137,9 @@ struct Started {
     background: JoinSet<()>,
 }
 
+/// Connect to Redis, the broker and Discord, then start the metrics server
+/// on `listener`, the background jobs, the workers, the shard runners and
+/// the command consumer.
 async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     let redis = redis_conn::connect(&config.redis_url).await?;
     migrate_legacy_expiry(&mut redis.clone()).await;
@@ -127,19 +156,7 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     info!("Logged in as {} ({})", user.name, user.id);
 
     let mut conn = redis.clone();
-    let previous_total: Option<String> = redis::cmd("GET")
-        .arg(SHARDS_KEY)
-        .query_async(&mut conn)
-        .await?;
-    let saved = match (config.resume, config.shards) {
-        // Sessions are only valid for the shard count they were created with.
-        (true, Some(range))
-            if previous_total.as_deref() == Some(range.total.to_string().as_str()) =>
-        {
-            sessions::load(&mut conn, range.ids()).await?
-        }
-        _ => Default::default(),
-    };
+    let saved = saved_sessions(&mut conn, &config).await?;
 
     // Discord's identify limit is per bot, so the shards take turns with
     // those of the bot's other processes (they share this Redis). On a
@@ -163,35 +180,9 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     );
     info!("Resuming {} sessions", created.resumed.len());
 
-    let handles: Vec<Arc<ShardHandle>> = created
-        .shards
-        .iter()
-        .map(|shard| {
-            let id = shard.id().number();
-            let resumed = created.resumed.get(&id);
-            let handle = ShardHandle::new(id, Some(shard.sender()), resumed.map(|s| s.sequence));
-            if let Some(resumed) = resumed {
-                handle.update(|s| {
-                    s.session_id = Some(resumed.session_id.clone());
-                    s.resume_url = resumed.resume_url.clone();
-                });
-            }
-            Arc::new(handle)
-        })
-        .collect();
+    let handles = shard_handles(&created.shards, &created.resumed);
     let registry = Arc::new(Registry::new(handles.iter().cloned()));
-
-    redis::pipe()
-        .cmd("SET")
-        .arg(STARTED_KEY)
-        .arg(serde_json::to_string(&FormattedDateTime::now())?)
-        .ignore()
-        .cmd("SET")
-        .arg(SHARDS_KEY)
-        .arg(range.total.to_string())
-        .ignore()
-        .query_async::<()>(&mut conn)
-        .await?;
+    mark_started(&mut conn, range.total).await?;
 
     let mut background = JoinSet::new();
     background.spawn(metrics::run_server(listener));
@@ -230,12 +221,10 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut runners = JoinSet::new();
     for (shard, handle) in created.shards.into_iter().zip(handles) {
-        runners.spawn(runner::run(
-            shard,
-            handle,
-            runner_ctx.clone(),
-            shutdown_rx.clone(),
-        ));
+        // twilight-gateway's own log lines name no shard; the span does.
+        let span = info_span!("shard", id = handle.id);
+        let task = runner::run(shard, handle, runner_ctx.clone(), shutdown_rx.clone());
+        runners.spawn(task.instrument(span));
     }
     drop(runner_ctx);
 
@@ -256,6 +245,77 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         consumer,
         background,
     })
+}
+
+/// The saved sessions of the configured shards, or none when `RESUME` is off,
+/// no shard range is configured, or the last start used another shard total.
+async fn saved_sessions(
+    conn: &mut redis_conn::Redis,
+    config: &Config,
+) -> ApiResult<HashMap<u32, SessionInfo>> {
+    let previous_total = redis::cmd("GET")
+        .arg(SHARDS_KEY)
+        .query_async::<Option<String>>(conn)
+        .await?;
+    match (config.resume, config.shards) {
+        // Sessions are only valid for the shard count they were created with.
+        (true, Some(range))
+            if previous_total.as_deref() == Some(range.total.to_string().as_str()) =>
+        {
+            sessions::load(conn, range.ids()).await
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// A handle per shard, holding the session the shard resumes, if any.
+fn shard_handles<Q>(
+    shards: &[Shard<Q>],
+    resumed: &HashMap<u32, SessionInfo>,
+) -> Vec<Arc<ShardHandle>> {
+    shards
+        .iter()
+        .map(|shard| {
+            let id = shard.id().number();
+            let session = resumed.get(&id);
+            let handle = ShardHandle::new(id, Some(shard.sender()), session.map(|s| s.sequence));
+            if let Some(session) = session {
+                handle.update(|s| {
+                    s.session_id = Some(session.session_id.clone());
+                    s.resume_url.clone_from(&session.resume_url);
+                });
+            }
+            Arc::new(handle)
+        })
+        .collect()
+}
+
+/// Record the start time and the shard total; the next start resumes the
+/// saved sessions only if its shard total is the same.
+///
+/// A new shard total also clears the gateway statuses: every process keeps
+/// the entries of the shards it does not run, so entries of shards that no
+/// longer exist would otherwise keep their last status forever.
+async fn mark_started(conn: &mut redis_conn::Redis, shard_total: u32) -> ApiResult<()> {
+    let total = shard_total.to_string();
+    let previous_total = redis::cmd("GET")
+        .arg(SHARDS_KEY)
+        .query_async::<Option<String>>(conn)
+        .await?;
+    let mut pipe = redis::pipe();
+    pipe.cmd("SET")
+        .arg(STARTED_KEY)
+        .arg(serde_json::to_string(&FormattedDateTime::now())?)
+        .ignore()
+        .cmd("SET")
+        .arg(SHARDS_KEY)
+        .arg(total.as_str())
+        .ignore();
+    if previous_total.as_deref() != Some(total.as_str()) {
+        pipe.cmd("DEL").arg(STATUSES_KEY).ignore();
+    }
+    pipe.query_async::<()>(conn).await?;
+    Ok(())
 }
 
 impl Started {
@@ -307,7 +367,8 @@ pub fn http_client(config: &Config) -> Client {
     }
 }
 
-async fn migrate_legacy_expiry(conn: &mut redis_conn::Redis) {
+/// Move the legacy expiry hash into the sorted set, logging the outcome.
+async fn migrate_legacy_expiry<C: ConnectionLike + Send>(conn: &mut C) {
     match cache::jobs::migrate_legacy_expiry(conn).await {
         Ok(0) => {}
         Ok(count) => info!("Migrated {} expiry entries from {}", count, EXPIRY_KEYS),
@@ -315,7 +376,20 @@ async fn migrate_legacy_expiry(conn: &mut redis_conn::Redis) {
     }
 }
 
-async fn expiry_job(mut conn: redis_conn::Redis) {
+/// Every second: delete the cache keys whose deadline passed; every
+/// `LEGACY_EXPIRY_EVERY` ticks, also migrate the legacy expiry hash again.
+/// Runs until the task is aborted.
+async fn expiry_job(conn: redis_conn::Redis) {
+    let interval = Duration::from_millis(CACHE_JOB_INTERVAL_MS);
+    expiry_loop(conn, interval, LEGACY_EXPIRY_EVERY).await;
+}
+
+/// `expiry_job` with its timing as parameters: a tick every `interval`, and
+/// the legacy migration after every `legacy_every`th tick.
+async fn expiry_loop<C>(mut conn: C, interval: Duration, legacy_every: u32)
+where
+    C: ConnectionLike + Send,
+{
     let throttle = Throttle::default();
     let mut ticks = 0u32;
     loop {
@@ -329,10 +403,10 @@ async fn expiry_job(mut conn: redis_conn::Redis) {
             }
         }
         ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(LEGACY_EXPIRY_EVERY) {
+        if ticks.is_multiple_of(legacy_every) {
             migrate_legacy_expiry(&mut conn).await;
         }
-        tokio::time::sleep(Duration::from_millis(CACHE_JOB_INTERVAL_MS)).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -396,5 +470,153 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("SIG{signal} did not end the wait"));
         }
+    }
+}
+
+#[cfg(test)]
+mod expiry_job_tests {
+    use super::*;
+    use redis::{Arg, Cmd, Pipeline, RedisFuture, RedisResult, Value};
+    use std::sync::Mutex;
+
+    /// A Redis for the expiry job that records the name of every command. It
+    /// answers that there is nothing to do (no key is due, the legacy hash is
+    /// empty), or, when `down`, fails every command like a Redis that cannot
+    /// be reached.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        names: Arc<Mutex<Vec<String>>>,
+        down: bool,
+    }
+
+    impl Recorder {
+        fn names(&self) -> Vec<String> {
+            self.names.lock().unwrap().clone()
+        }
+    }
+
+    impl ConnectionLike for Recorder {
+        fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+            let name = match cmd.args_iter().next() {
+                Some(Arg::Simple(name)) => String::from_utf8_lossy(name).into_owned(),
+                _ => "<cursor>".to_owned(),
+            };
+            let reply: RedisResult<Value> = if self.down {
+                let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+                Err(refused.into())
+            } else if name == "HSCAN" {
+                // Cursor 0 and no fields: the scan is over.
+                let done = vec![Value::BulkString(b"0".to_vec()), Value::Array(vec![])];
+                Ok(Value::Array(done))
+            } else {
+                Ok(Value::Array(vec![]))
+            };
+            self.names.lock().unwrap().push(name);
+            Box::pin(async move { reply })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> RedisFuture<'a, Vec<Value>> {
+            panic!("nothing is due, so the expiry job sends no pipeline")
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    /// What `tracing` logs on this thread while the guard of the subscriber
+    /// writing to it lives.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// The commands `expiry_loop(.., every)` sends in `ticks` ticks: each
+    /// tick expires due keys, and every `every`th tick then also migrates
+    /// the legacy hash.
+    fn expected(ticks: usize, every: usize) -> Vec<&'static str> {
+        (1..=ticks)
+            .flat_map(|tick| {
+                let migrates = tick.is_multiple_of(every).then_some("HSCAN");
+                std::iter::once("ZRANGEBYSCORE").chain(migrates)
+            })
+            .collect()
+    }
+
+    /// Run the loop on `conn` for half a second, a tick every millisecond,
+    /// and return the commands it sent with the number of ticks. Every reply
+    /// is ready at once, so the loop only ever waits in its sleep, where the
+    /// timeout drops it after a whole tick.
+    async fn run_for_a_while(conn: &Recorder, every: u32) -> (Vec<String>, usize) {
+        let job = expiry_loop(conn.clone(), Duration::from_millis(1), every);
+        let ended = tokio::time::timeout(Duration::from_millis(500), job).await;
+        assert!(ended.is_err(), "the job ended on its own");
+        let names = conn.names();
+        let ticks = names.iter().filter(|n| *n == "ZRANGEBYSCORE").count();
+        (names, ticks)
+    }
+
+    /// Every tick expires due keys, and every `legacy_every`th tick also
+    /// migrates the legacy hash again, which an older version may still be
+    /// writing during a rolling update. The first tick only expires.
+    #[tokio::test]
+    async fn the_legacy_hash_is_migrated_again_every_few_ticks() {
+        let conn = Recorder::default();
+        let (names, ticks) = run_for_a_while(&conn, 3).await;
+        assert!(ticks >= 3, "{names:?}");
+        assert_eq!(names, expected(ticks, 3));
+    }
+
+    /// While Redis is down the job keeps its pace. The failed expiry goes
+    /// through the throttle (logged once per 5 s, not every tick); a failed
+    /// migration, about once a minute in production, is logged each time.
+    #[tokio::test]
+    async fn the_job_logs_failures_and_carries_on() {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        // The current-thread runtime polls the job on this thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let conn = Recorder {
+            down: true,
+            ..Recorder::default()
+        };
+        let (names, ticks) = run_for_a_while(&conn, 2).await;
+        assert!(ticks >= 4, "{names:?}");
+        assert_eq!(names, expected(ticks, 2));
+
+        let text = logs.text();
+        let expiry = text.matches("Failed to delete expired keys: ").count();
+        assert_eq!(expiry, 1, "{text}");
+        assert!(text.contains("(0 similar suppressed)"), "{text}");
+        let migrations = text
+            .matches("Failed to migrate legacy expiry entries: ")
+            .count();
+        assert_eq!(migrations, ticks / 2, "{text}");
     }
 }

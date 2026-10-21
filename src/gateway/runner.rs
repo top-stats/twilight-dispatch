@@ -3,13 +3,15 @@
 //!
 //! twilight-gateway only heartbeats, identifies and reconnects while the shard
 //! is being polled, so nothing slow is awaited here: cache updates and
-//! publishing happen in the workers. Two exceptions, both bounded and both
-//! cut short by a shutdown (which then has [`CLOSE_TIMEOUT`] in all):
-//! - READY's cache update (at most [`READY_TIMEOUT`]), which must land before
-//!   the guilds that follow it so they are not mistaken for new joins;
+//! publishing happen in the workers. Two exceptions, both cut short by a
+//! shutdown (which then has [`CLOSE_TIMEOUT`] in all):
+//! - READY's cache update, which must land before the guilds that follow it
+//!   so they are not mistaken for new joins; it is bounded by the smaller of
+//!   `CACHE_TIMEOUT_MS` and [`READY_TIMEOUT`];
 //! - backpressure: when a worker queue is full the shard is first closed
-//!   resumably (so no heartbeat is owed), then the runner waits for room and
-//!   lets the shard reconnect; Discord replays what was not received.
+//!   resumably (so no heartbeat is owed), then the runner waits for room for
+//!   as long as that takes (this wait has no time bound) and lets the shard
+//!   reconnect; Discord replays what was not received.
 
 use super::{
     payload::{self, Envelope, Route},
@@ -23,7 +25,7 @@ use crate::{
     discord_log::DiscordLog,
     metrics::{GATEWAY_EVENTS, GATEWAY_PARSE_ERRORS, SHARD_EVENTS},
     models::FormattedDateTime,
-    util::Throttle,
+    util::{ErrorChain, Throttle},
 };
 
 use futures_util::StreamExt;
@@ -45,7 +47,10 @@ use twilight_gateway::{
     CloseFrame, Message, Shard, ShardState,
 };
 use twilight_model::{
-    gateway::event::{Event, GatewayEventDeserializer},
+    gateway::{
+        event::{Event, GatewayEventDeserializer},
+        OpCode,
+    },
     id::{marker::UserMarker, Id},
 };
 
@@ -61,13 +66,24 @@ pub const FATAL_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Upper bound for READY's inline cache update, well below the ~41 s heartbeat.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many characters of a message twilight rejected are logged.
+const MAX_LOGGED_PAYLOAD: usize = 512;
 
+/// What the shard runners of a process share.
 pub struct RunnerContext<C> {
+    /// Which events are cached (the `STATE_*` settings).
     pub state: StateConfig,
+    /// The worker queues (`WORKERS` of them); a payload goes to the one its
+    /// [`Route`] picks, so the events of one guild stay in order.
     pub workers: Vec<mpsc::Sender<Job>>,
+    /// Redis, for READY's cache update, which the runner applies itself.
     pub redis: C,
+    /// Where shard lifecycle messages are posted (`LOG_CHANNEL`).
     pub discord: DiscordLog,
+    /// The bot's user id, for the context of READY's cache update.
     pub bot_id: Id<UserMarker>,
+    /// The time limit of a cache update (`CACHE_TIMEOUT_MS`); READY's is
+    /// also capped at [`READY_TIMEOUT`].
     pub cache_timeout: Duration,
 }
 
@@ -112,6 +128,12 @@ pub fn wants_typed(kind: &str, state: &StateConfig) -> bool {
 /// way [`prepare`] does. A payload `prepare` calls malformed is an error too,
 /// so a caller cannot mistake broken input for a payload without an event;
 /// every payload that parses is an event, so it is never `Ok(None)`.
+///
+/// # Errors
+///
+/// Why the payload did not parse: its envelope does not (it is not JSON or
+/// has no `op`, for example), or it is not a valid event of the kind its `op`
+/// and `t` name.
 pub fn parse_event(json: &str) -> Result<Option<Event>, String> {
     let envelope = Envelope::parse(json).map_err(|err| err.to_string())?;
     parse_typed(json, &envelope).map(Some)
@@ -142,6 +164,8 @@ fn parse_typed(json: &str, envelope: &Envelope<'_>) -> Result<Event, String> {
         })
 }
 
+/// Whether a gateway close `code` is one of [`FATAL_CLOSE_CODES`], after which
+/// the shard must not reconnect.
 pub fn is_fatal_close(code: u16) -> bool {
     FATAL_CLOSE_CODES.contains(&code)
 }
@@ -150,37 +174,48 @@ pub fn is_fatal_close(code: u16) -> bool {
 /// model cannot parse still starts a new session.
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 pub struct ReadySession {
+    /// The id of the new session, which a resume names.
     pub session_id: String,
+    /// The gateway URL to resume this session on.
     pub resume_gateway_url: String,
 }
 
-#[derive(Deserialize)]
-struct ReadyEnvelope {
-    d: ReadySession,
-}
-
 /// What a raw gateway message is, before anything is done with it.
-// Short-lived (one per message), so the size difference does not matter.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "short-lived (one per message), so the size difference does not matter"
+)]
 #[derive(Debug)]
 pub enum Prepared {
     /// A dispatch to cache and publish.
     Dispatch {
+        /// The event name (`t`), such as `GUILD_CREATE`.
         kind: String,
+        /// The sequence number (`s`).
         seq: Option<u64>,
+        /// What orders the payload: it picks the worker.
         route: Route,
+        /// The typed event, when [`wants_typed`] asks for it and it parsed.
         event: Option<Event>,
         /// For READY: the new session.
         ready: Option<ReadySession>,
+        /// Why the typed event did not parse; the payload is published anyway.
         parse_error: Option<String>,
     },
+    /// Op 10: a connection started.
     Hello,
+    /// Op 7: Discord asks the shard to reconnect.
     Reconnect,
+    /// Op 9: Discord invalidated the session.
     InvalidSession {
+        /// Whether the session may be resumed (`d` is `true`).
         resumable: bool,
     },
-    /// Heartbeats, ACKs and anything else the shard handles itself.
+    /// Heartbeats, ACKs and anything else the shard handles itself, and a
+    /// dispatch without an event name (`t`).
     Other,
+    /// A message whose envelope (`op`, `s`, `t`, `d`) does not parse, such as
+    /// one that is not JSON or has no `op`: why.
     Malformed(String),
 }
 
@@ -190,26 +225,24 @@ pub fn prepare(json: &str, state: &StateConfig) -> Prepared {
         Ok(envelope) => envelope,
         Err(err) => return Prepared::Malformed(err.to_string()),
     };
-    match envelope.op {
-        0 => {}
-        7 => return Prepared::Reconnect,
-        9 => {
+    match OpCode::from(envelope.op) {
+        Some(OpCode::Dispatch) => {}
+        Some(OpCode::Reconnect) => return Prepared::Reconnect,
+        Some(OpCode::InvalidSession) => {
             let resumable = envelope.d.is_some_and(|d| d.get() == "true");
             return Prepared::InvalidSession { resumable };
         }
-        10 => return Prepared::Hello,
+        Some(OpCode::Hello) => return Prepared::Hello,
         _ => return Prepared::Other,
     }
     let Some(kind) = envelope.kind().map(ToOwned::to_owned) else {
         return Prepared::Other;
     };
     let route = payload::route(envelope.kind(), envelope.d);
-    let ready = if kind == "READY" {
-        serde_json::from_str::<ReadyEnvelope>(json)
-            .ok()
-            .map(|r| r.d)
-    } else {
-        None
+    // Only the session fields of `d`, so a READY the model rejects has them.
+    let ready = match envelope.d {
+        Some(d) if kind == "READY" => serde_json::from_str::<ReadySession>(d.get()).ok(),
+        _ => None,
     };
     let (event, parse_error) = if wants_typed(&kind, state) {
         match parse_typed(json, &envelope) {
@@ -229,16 +262,20 @@ pub fn prepare(json: &str, state: &StateConfig) -> Prepared {
     }
 }
 
+/// The state of one shard's [`run`].
 struct Runner<C, Q> {
     shard: Shard<Q>,
     handle: Arc<ShardHandle>,
     ctx: Arc<RunnerContext<C>>,
     id: u32,
+    /// The status last recorded by [`Runner::refresh`].
     last_status: &'static str,
+    /// The current gateway session, handed to every job.
     session: Option<Arc<str>>,
     /// Jobs waiting for room in a full worker queue, in order.
     held: VecDeque<(usize, Job)>,
-    /// When the shard was closed because of backpressure.
+    /// Since when jobs are held because a worker queue was full; the shard is
+    /// closed resumably then, unless it was disconnected already.
     paused_at: Option<Instant>,
     /// While shutting down: when [`Runner::close`] has to be done.
     close_deadline: Option<tokio::time::Instant>,
@@ -250,7 +287,9 @@ struct Runner<C, Q> {
     reconnect_counted: bool,
     /// A connection started (HELLO) whose end was not counted yet.
     connection_open: bool,
+    /// Throttles the warning about dispatches the cache could not parse.
     parse_errors: Throttle,
+    /// Throttles the warnings about messages twilight or [`prepare`] rejected.
     receive_errors: Throttle,
 }
 
@@ -333,6 +372,13 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
+/// The first `chars` characters of `text`, or all of it when it is shorter.
+fn prefix(text: &str, chars: usize) -> &str {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
 impl<C, Q> Runner<C, Q>
 where
     C: ConnectionLike + Clone + Send + Sync + 'static,
@@ -351,14 +397,11 @@ where
                     GATEWAY_PARSE_ERRORS.with_label_values(&["SHARD"]).inc();
                 }
                 if let Some(suppressed) = self.receive_errors.check() {
-                    warn!(
-                        "[Shard {}] Gateway error: {} ({} similar suppressed)",
-                        self.id, err, suppressed
-                    );
+                    self.log_receive_error(&err, suppressed);
                 }
             }
             Some(Ok(Message::Close(frame))) => {
-                self.on_close(frame.as_ref().map(|f| (f.code, f.reason.to_string())))
+                self.on_close(frame.map(|f| (f.code, f.reason.into_owned())));
             }
             Some(Ok(Message::Text(json))) => self.on_text(json).await,
         }
@@ -366,6 +409,31 @@ where
         true
     }
 
+    /// Log an error twilight yielded instead of a message, with the cause its
+    /// `Display` leaves out. A message twilight rejected is shown cut to
+    /// [`MAX_LOGGED_PAYLOAD`] characters rather than in full, as its `Display`
+    /// has it (a READY can be megabytes).
+    fn log_receive_error(&self, err: &ReceiveMessageError, suppressed: u64) {
+        if let ReceiveMessageErrorType::Deserializing { event } = err.kind() {
+            let bytes = event.len();
+            let cause = std::error::Error::source(err)
+                .map_or_else(String::new, |source| format!(": {}", ErrorChain(source)));
+            let start = prefix(event, MAX_LOGGED_PAYLOAD);
+            warn!(
+                "[Shard {}] Gateway error: could not parse a {}-byte message{} ({} similar suppressed): {}",
+                self.id, bytes, cause, suppressed, start
+            );
+        } else {
+            let err = ErrorChain(err);
+            warn!(
+                "[Shard {}] Gateway error: {} ({} similar suppressed)",
+                self.id, err, suppressed
+            );
+        }
+    }
+
+    /// Record the end of the connection by a close, with the frame's code and
+    /// reason when it had one.
     fn on_close(&mut self, frame: Option<(u16, String)>) {
         match &frame {
             Some((code, reason)) if !reason.is_empty() => info!(
@@ -397,7 +465,7 @@ where
                 error!(
                     "[Shard {}] Close code {} is not reconnectable",
                     self.id, code
-                )
+                );
             }
             // The close answering Discord's request (`reconnect_requested`).
             _ if counted => {}
@@ -455,7 +523,8 @@ where
         let state = self.shard.state();
         let status = status_label(state);
         let latency = self.shard.latency();
-        let latency_ms = latency.recent().first().map_or(0, |d| d.as_millis() as u64);
+        let latency_ms = latency.recent().first().map_or(0, Duration::as_millis);
+        let latency_ms = u64::try_from(latency_ms).unwrap_or(u64::MAX);
         let last_ack = latency.received();
         let session_id = self.shard.session().map(|s| s.id().to_owned());
         let resume_url = self.shard.resume_url().map(ToOwned::to_owned);
@@ -477,15 +546,27 @@ where
         });
     }
 
+    /// Handle a text message from the gateway.
     async fn on_text(&mut self, json: String) {
         let prepared = prepare(&json, &self.ctx.state);
         self.on_prepared(prepared, json).await;
     }
 
+    /// Act on a classified message: record connection changes, and hand a
+    /// dispatch (`json`, the raw payload) to its worker.
     async fn on_prepared(&mut self, prepared: Prepared, json: String) {
         match prepared {
+            // twilight yields a dispatch whose `op`, `s` and `t` its text scan
+            // finds even when it is not valid JSON, and its session sequence
+            // moves past it: the payload is lost, so it is counted.
             Prepared::Malformed(err) => {
-                warn!("[Shard {}] Could not decode payload: {}", self.id, err)
+                GATEWAY_PARSE_ERRORS.with_label_values(&["SHARD"]).inc();
+                if let Some(suppressed) = self.receive_errors.check() {
+                    warn!(
+                        "[Shard {}] Could not decode payload: {} ({} similar suppressed)",
+                        self.id, err, suppressed
+                    );
+                }
             }
             Prepared::Hello => {
                 if self.connection_open {
@@ -592,6 +673,8 @@ where
         }
     }
 
+    /// Start the session READY opens and apply READY to the cache before
+    /// anything that follows it is handled.
     async fn on_ready(
         &mut self,
         seq: Option<u64>,
@@ -600,17 +683,16 @@ where
     ) {
         // Start the new session even if the full READY did not parse.
         self.handle.new_session(seq.unwrap_or(0));
-        match ready {
-            Some(ready) => {
-                info!("[Shard {}] Ready (session: {})", self.id, ready.session_id);
-                self.session = Some(Arc::from(ready.session_id.as_str()));
-                self.handle.update(|s| {
-                    s.session_id = Some(ready.session_id);
-                    s.resume_url = Some(ready.resume_gateway_url);
-                    s.fatal = false;
-                });
-            }
-            None => info!("[Shard {}] Ready", self.id),
+        if let Some(ready) = ready {
+            info!("[Shard {}] Ready (session: {})", self.id, ready.session_id);
+            self.session = Some(Arc::from(ready.session_id.as_str()));
+            self.handle.update(|s| {
+                s.session_id = Some(ready.session_id);
+                s.resume_url = Some(ready.resume_gateway_url);
+                s.fatal = false;
+            });
+        } else {
+            info!("[Shard {}] Ready", self.id);
         }
         if let Some(event) = event {
             self.ready_cache(event).await;
@@ -622,6 +704,9 @@ where
             .shard(READY_COLOR, format!("[Shard {}] Ready", self.id));
     }
 
+    /// Apply READY to the cache, waiting at most the smaller of the cache
+    /// timeout and [`READY_TIMEOUT`], and never past the close's deadline
+    /// once a shutdown started.
     async fn ready_cache(&mut self, event: &mut Event) {
         if !self.ctx.state.enabled {
             return;
@@ -694,6 +779,7 @@ where
         }
     }
 
+    /// Whether the shard has no connection, so no heartbeat is owed.
     fn is_disconnected(&self) -> bool {
         matches!(
             self.shard.state(),
@@ -706,17 +792,15 @@ where
     fn try_flush_held(&mut self) -> bool {
         while let Some((worker, job)) = self.held.pop_front() {
             match self.ctx.workers[worker].try_send(job) {
-                Ok(()) => {}
+                // A gone worker's job is dropped: no queue would ever take it.
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
                 Err(TrySendError::Full(job)) => {
                     self.held.push_front((worker, job));
                     return false;
                 }
-                Err(TrySendError::Closed(_)) => {}
             }
         }
-        if self.paused_at.take().is_some() {
-            info!("[Shard {}] Event queue drained; resuming", self.id);
-        }
+        self.end_pause();
         true
     }
 
@@ -731,16 +815,26 @@ where
             let Some((_, job)) = self.held.pop_front() else {
                 break;
             };
-            match permit {
-                Ok(permit) => permit.send(job),
-                Err(_) => warn!(
+            if let Ok(permit) = permit {
+                permit.send(job);
+            } else {
+                warn!(
                     "[Shard {}] Worker {} is gone, dropping event",
                     self.id, worker
-                ),
+                );
             }
         }
-        if self.paused_at.take().is_some() {
-            info!("[Shard {}] Event queue drained; resuming", self.id);
+        self.end_pause();
+    }
+
+    /// End the backpressure pause, if there is one, and log how long it took.
+    fn end_pause(&mut self) {
+        if let Some(since) = self.paused_at.take() {
+            let paused_for = since.elapsed();
+            info!(
+                "[Shard {}] Event queue drained after {:?}; resuming",
+                self.id, paused_for
+            );
         }
     }
 
@@ -767,13 +861,13 @@ where
                     // session for good (twilight ignores the code, as it
                     // closed first): recorded as it is without a shutdown.
                     Ok(Some(Ok(Message::Close(Some(frame))))) if is_fatal_close(frame.code) => {
-                        self.on_close(Some((frame.code, frame.reason.to_string())));
+                        self.on_close(Some((frame.code, frame.reason.into_owned())));
                         fatal = true;
                         break;
                     }
                     // twilight ends the stream only after yielding the fatal
                     // close above, so `None` does not get here first.
-                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
+                    Ok(Some(Ok(Message::Close(_))) | None) | Err(_) => break,
                     Ok(Some(Ok(Message::Text(json)))) => json,
                     // The connection is gone (it dropped instead of
                     // answering the close) and twilight failed to reconnect.
@@ -1040,5 +1134,277 @@ mod tests {
         for code in [1000, 1001, 4000, 4007, 4009] {
             assert!(!is_fatal_close(code));
         }
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    use crate::models::SessionInfo;
+    use twilight_gateway::{queue::InMemoryQueue, Intents, ShardId};
+
+    /// A Redis that never answers; nothing here gets as far as using it.
+    #[derive(Clone)]
+    struct NoRedis;
+
+    impl ConnectionLike for NoRedis {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, redis::Value> {
+            Box::pin(std::future::pending())
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a redis::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    /// A job with sequence `seq`.
+    fn job(seq: u64) -> Job {
+        Job {
+            shard: 0,
+            seq: Some(seq),
+            token: None,
+            session: None,
+            json: String::new(),
+            event: None,
+        }
+    }
+
+    /// A runner with these worker queues whose shard never connected: it owes
+    /// no heartbeat, so a full queue holds jobs without queueing a close.
+    /// `Shard::new` spawns its identify queue, so the tests run in a runtime.
+    fn runner(workers: Vec<mpsc::Sender<Job>>) -> Runner<NoRedis, InMemoryQueue> {
+        // twilight's TLS connector needs a crypto provider; main() installs it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Runner {
+            shard: Shard::new(ShardId::ONE, "t".to_owned(), Intents::empty()),
+            handle: Arc::new(ShardHandle::new(0, None, None)),
+            ctx: Arc::new(RunnerContext {
+                state: StateConfig::default(),
+                workers,
+                redis: NoRedis,
+                discord: DiscordLog::disabled(),
+                bot_id: Id::new(1),
+                cache_timeout: Duration::from_secs(1),
+            }),
+            id: 0,
+            last_status: "Disconnected",
+            session: None,
+            held: VecDeque::new(),
+            paused_at: None,
+            close_deadline: None,
+            shutdown: watch::channel(false).1,
+            reconnect_counted: false,
+            connection_open: false,
+            parse_errors: Throttle::default(),
+            receive_errors: Throttle::default(),
+        }
+    }
+
+    /// The worker and the sequence of every held job, in order.
+    fn held(r: &Runner<NoRedis, InMemoryQueue>) -> Vec<(usize, Option<u64>)> {
+        r.held
+            .iter()
+            .map(|(worker, job)| (*worker, job.seq))
+            .collect()
+    }
+
+    /// Once one worker's queue is full, a job for another worker that has
+    /// room is held behind it instead of overtaking it, and the held jobs are
+    /// queued in order once there is room, which ends the pause.
+    #[tokio::test]
+    async fn held_jobs_keep_their_order_across_workers() {
+        let (tx0, mut rx0) = mpsc::channel(1);
+        let (tx1, mut rx1) = mpsc::channel(1);
+        assert!(tx0.try_send(job(1)).is_ok());
+        let mut r = runner(vec![tx0, tx1]);
+
+        r.enqueue(0, job(2));
+        r.enqueue(1, job(3));
+        assert!(rx1.try_recv().is_err(), "overtook the held job");
+        assert!(r.paused_at.is_some());
+        assert!(!r.try_flush_held(), "worker 0 is still full");
+        assert_eq!(held(&r), [(0, Some(2)), (1, Some(3))]);
+        assert!(r.paused_at.is_some());
+
+        assert_eq!(rx0.try_recv().unwrap().seq, Some(1));
+        assert!(r.try_flush_held());
+        assert!(r.held.is_empty());
+        assert!(r.paused_at.is_none());
+        assert_eq!(rx0.try_recv().unwrap().seq, Some(2));
+        assert_eq!(rx1.try_recv().unwrap().seq, Some(3));
+    }
+
+    /// A job for a worker that is gone is dropped: holding it would pause the
+    /// shard for good, as no queue would ever take it.
+    #[tokio::test]
+    async fn a_gone_worker_drops_its_job_without_pausing() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut r = runner(vec![tx]);
+        r.enqueue(0, job(1));
+        assert!(r.held.is_empty());
+        assert!(r.paused_at.is_none());
+    }
+
+    /// A held job whose worker went away meanwhile is dropped by
+    /// `try_flush_held`, which goes on with the jobs behind it.
+    #[tokio::test]
+    async fn try_flush_held_drops_the_jobs_of_a_gone_worker() {
+        let (tx0, rx0) = mpsc::channel(1);
+        let (tx1, mut rx1) = mpsc::channel(1);
+        assert!(tx0.try_send(job(1)).is_ok());
+        let mut r = runner(vec![tx0, tx1]);
+        r.enqueue(0, job(2));
+        r.enqueue(1, job(3));
+        drop(rx0);
+
+        assert!(r.try_flush_held());
+        assert!(r.held.is_empty());
+        assert!(r.paused_at.is_none());
+        assert_eq!(rx1.try_recv().unwrap().seq, Some(3));
+    }
+
+    /// As above for `flush_held`: it does not wait for room in the queue of
+    /// a worker that is gone.
+    #[tokio::test]
+    async fn flush_held_drops_the_jobs_of_a_gone_worker() {
+        let (tx0, rx0) = mpsc::channel(1);
+        let (tx1, mut rx1) = mpsc::channel(1);
+        assert!(tx0.try_send(job(1)).is_ok());
+        let mut r = runner(vec![tx0, tx1]);
+        r.enqueue(0, job(2));
+        r.enqueue(1, job(3));
+        drop(rx0);
+
+        let flushed = tokio::time::timeout(Duration::from_secs(5), r.flush_held()).await;
+        assert!(flushed.is_ok(), "waited for a worker that is gone");
+        assert!(r.held.is_empty());
+        assert!(r.paused_at.is_none());
+        assert_eq!(rx1.try_recv().unwrap().seq, Some(3));
+    }
+
+    /// A close frame without a status code ends the connection like any
+    /// resumable close: the snapshot drops the last close code and the end
+    /// of the connection is recorded.
+    #[tokio::test]
+    async fn a_close_without_a_code_ends_the_connection() {
+        let mut r = runner(Vec::new());
+        r.handle.update(|s| s.close_code = Some(4000));
+        r.connection_open = true;
+
+        r.on_close(None);
+        assert_eq!(r.handle.snapshot().close_code, None);
+        assert!(!r.connection_open);
+    }
+
+    /// A READY whose session fields cannot be read still starts a new session
+    /// at its sequence, so payloads of the previous one no longer hold the
+    /// resume point back; the session id and resume URL stay as they were.
+    #[tokio::test]
+    async fn a_ready_without_its_session_fields_still_starts_a_session() {
+        let mut r = runner(Vec::new());
+        r.handle.update(|s| {
+            s.session_id = Some("OLD".to_owned());
+            s.resume_url = Some("wss://old".to_owned());
+        });
+        let previous = r.handle.dispatch(9).expect("a token");
+
+        r.on_ready(Some(3), None, None).await;
+        assert!(!r.handle.is_current(previous));
+        assert!(r.session.is_none());
+        assert_eq!(
+            r.handle.session_info(),
+            Some(SessionInfo {
+                session_id: "OLD".to_owned(),
+                sequence: 3,
+                resume_url: Some("wss://old".to_owned()),
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+
+    /// What is logged of a message twilight rejected is cut by characters,
+    /// never inside one.
+    #[test]
+    fn prefix_cuts_whole_characters() {
+        assert_eq!(prefix("abc", 5), "abc");
+        assert_eq!(prefix("abc", 3), "abc");
+        assert_eq!(prefix("abc", 2), "ab");
+        assert_eq!(prefix("abc", 0), "");
+        assert_eq!(prefix("", 3), "");
+        assert_eq!(prefix("h\u{e9}llo", 2), "h\u{e9}");
+        assert_eq!(prefix("\u{1f600}\u{1f600}", 1), "\u{1f600}");
+        let long = "\u{e9}".repeat(MAX_LOGGED_PAYLOAD * 2);
+        let cut = prefix(&long, MAX_LOGGED_PAYLOAD);
+        assert_eq!(cut.chars().count(), MAX_LOGGED_PAYLOAD);
+        assert_eq!(cut.len(), MAX_LOGGED_PAYLOAD * 2);
+    }
+
+    /// Op codes go through twilight's `OpCode`: what the shard handles itself
+    /// (heartbeat requests, ACKs), what only clients send, unknown op codes
+    /// and a dispatch without `t` are `Other`; an `op` that is no `u8` makes
+    /// the message malformed.
+    #[test]
+    fn op_codes_map_through_twilight() {
+        for json in [
+            r#"{"op":1,"d":null}"#,
+            r#"{"op":11}"#,
+            r#"{"op":2,"d":{}}"#,
+            r#"{"op":6,"d":{}}"#,
+            r#"{"op":200,"d":null}"#,
+            r#"{"op":0,"s":3,"t":null,"d":{}}"#,
+        ] {
+            assert!(
+                matches!(prepare(json, &StateConfig::default()), Prepared::Other),
+                "{json}"
+            );
+        }
+        assert!(matches!(
+            prepare(r#"{"op":256}"#, &StateConfig::default()),
+            Prepared::Malformed(_)
+        ));
+    }
+
+    /// The session `prepare` reads from a READY with this `d`.
+    fn ready_session(d: &str) -> Option<ReadySession> {
+        let json = format!(r#"{{"t":"READY","s":1,"op":0,"d":{d}}}"#);
+        match prepare(&json, &StateConfig::default()) {
+            Prepared::Dispatch { ready, .. } => ready,
+            other => panic!("{json}: {other:?}"),
+        }
+    }
+
+    /// READY's session is read from its `d` alone: a `d` without
+    /// `resume_gateway_url`, a `d` of null and session fields nested deeper
+    /// give none, and escapes in it are decoded.
+    #[test]
+    fn readys_session_is_read_from_its_d() {
+        assert_eq!(ready_session(r#"{"session_id":"abc"}"#), None);
+        assert_eq!(ready_session("null"), None);
+        let nested = r#"{"user":{"session_id":"x","resume_gateway_url":"wss://x"}}"#;
+        assert_eq!(ready_session(nested), None);
+        assert_eq!(
+            ready_session(r#"{"session_id":"a\u0062c","resume_gateway_url":"wss://r"}"#),
+            Some(ReadySession {
+                session_id: "abc".to_owned(),
+                resume_gateway_url: "wss://r".to_owned(),
+            })
+        );
     }
 }

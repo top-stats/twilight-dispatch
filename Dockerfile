@@ -30,7 +30,8 @@ COPY --from=builder /usr/build/target/release/twilight-dispatch /usr/app/twiligh
 # (stop_grace_period in Swarm / Compose; Docker's default is 10s).
 STOPSIGNAL SIGTERM
 
-# Unhealthy only when a connected shard is stuck (see /healthcheck).
+# Unhealthy only when a shard is stuck: connected but silent, or waiting on a
+# close that never finishes (see /healthcheck in the README).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
     CMD ["/usr/app/twilight-dispatch", "healthcheck"]
 

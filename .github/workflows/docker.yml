@@ -12,14 +12,73 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# No token permissions unless a job asks for them (every job does).
+permissions: {}
+
+# Actions are pinned to the commit of a release (the comment names it), so a
+# moved tag cannot change what runs; Dependabot (.github/dependabot.yml)
+# proposes updates. Checkouts do not keep the token in .git/config: no job
+# pushes to git, and the image job runs on a persistent self-hosted runner.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Superseded pull request runs are cancelled; image builds always finish.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Runs on GitHub-hosted runners so pull requests (including ones from forks
-  # of this public repository) never execute on the self-hosted runner.
+  # fmt, clippy, test and coverage run on GitHub-hosted runners so pull
+  # requests (including ones from forks of this public repository) never
+  # execute on the self-hosted runner. They are separate jobs so that one
+  # failing check does not hide the result of the others.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Same toolchain as rust-toolchain.toml and the Docker image.
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Broken intra-doc links and other rustdoc warnings.
+      - name: Docs
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -47,20 +106,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Same toolchain as rust-toolchain.toml and the Docker image.
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Wait for Redis and LavinMQ
         run: |
@@ -77,24 +132,117 @@ jobs:
       - name: Test
         run: cargo test --locked --no-fail-fast
 
+  # Line coverage of the service code, with the lines no test runs listed in
+  # the log. Counted: src/, including its #[cfg(test)] modules; not tests/,
+  # vendor/ or the test-only src/model_patches.rs. A test that runs the binary
+  # counts only when the child inherits LLVM_PROFILE_FILE (tests/cli.rs clears
+  # the environment, so its runs are not counted).
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+      lavinmq:
+        image: cloudamqp/lavinmq:2.10.1
+        ports:
+          - 5672:5672
+          - 15672:15672
+
+    env:
+      CARGO_TERM_COLOR: always
+      REQUIRE_SERVICES: '1'
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
+      TEST_AMQP_HTTP: 127.0.0.1:15672
+      IGNORE_FILES: '/(vendor|tests)/|/src/model_patches\.rs$'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Wait for Redis and LavinMQ
+        run: |
+          for port in 6379 5672 15672; do
+            for _ in $(seq 1 60); do
+              if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null || { echo "port $port is not reachable"; exit 1; }
+          done
+
+      - name: Test with coverage
+        run: cargo llvm-cov --no-report --locked --no-fail-fast
+
+      - name: Coverage report
+        if: ${{ !cancelled() }}
+        run: |
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_FILES" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_FILES" --summary-only | tee summary.txt
+          { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Lines no test runs:"
+          awk -F'[:,]' '
+            function flush() {
+              if (start >= 0) out = out " " (start == prev ? start : start "-" prev)
+              start = prev = -1
+            }
+            /^SF:/ { file = substr($0, 4); sub(/.*\/src\//, "src/", file); out = ""; start = prev = -1 }
+            /^DA:/ && $3 == 0 {
+              line = $2 + 0
+              if (line == prev + 1) { prev = line } else { flush(); start = prev = line }
+            }
+            /^end_of_record/ { flush(); if (out != "") print file ":" out }
+          ' lcov.info | sort
+
+      - name: Upload lcov.info
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcov
+          path: lcov.info
+
   build-and-push:
-    needs: test
+    needs: [fmt, clippy, test]
     # Only pushes publish an image; pull requests stop after the tests.
     if: github.event_name == 'push'
     runs-on: self-hosted
+    # A hung build or push would otherwise hold the runner for 6 hours.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -102,7 +250,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -115,7 +263,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           push: true

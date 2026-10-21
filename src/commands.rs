@@ -1,14 +1,33 @@
-//! Validation of gateway commands received from the broker (`gateway.send`).
+//! Gateway commands received from the broker (`gateway.send`): their
+//! validation, and the consumer that runs them on this process' shards or
+//! forwards them to the process running theirs.
 //!
 //! Anything sent to the gateway that Discord rejects closes the shard's
 //! connection (4001 unknown opcode, 4002 decode error, 4005 already
-//! authenticated...), so commands are checked before they reach a shard.
+//! authenticated...), so the opcode and the payload size are checked before a
+//! command reaches a shard. The payload itself is not: a command whose `d`
+//! Discord cannot decode still closes the connection with 4002, and the shard
+//! resumes.
 
-use crate::constants::QUEUE_SEND;
+use crate::{
+    amqp::{declare_consume, Amqp},
+    constants::{QUEUE_SEND, SHARD_EXCHANGE},
+    gateway::registry::Registry,
+    metrics::GATEWAY_COMMANDS,
+    util::Throttle,
+};
 
+use futures_util::StreamExt;
+use lapin::{
+    options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions},
+    types::FieldTable,
+    BasicProperties, Channel, Consumer,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::{sync::Arc, time::Duration};
+use twilight_gateway::CloseFrame;
 
 /// Discord rejects gateway payloads larger than this.
 /// <https://discord.com/developers/docs/events/gateway#sending-events>
@@ -21,17 +40,28 @@ pub const MAX_PAYLOAD_BYTES: usize = 4096;
 /// 31 Request Soundboard Sounds, 43 Request Channel Info.
 pub const ALLOWED_OPCODES: [u64; 5] = [3, 4, 8, 31, 43];
 
+/// What a delivery asks for: its `op`, a JSON number.
 #[derive(Clone, Copy, Debug, Deserialize_repr, Eq, PartialEq, Serialize_repr)]
 #[repr(u8)]
 pub enum DeliveryOpcode {
+    /// Send the delivery's `data` over the shard's websocket.
     Send = 0,
+    /// Reconnect the shard; it resumes its session.
     Reconnect = 1,
 }
 
+/// A delivery on `gateway.send`, as producers publish it:
+/// `{"op": 0, "shard": 3, "data": {"op": 3, "d": {...}}}` to send a command,
+/// `{"op": 1, "shard": 3}` to reconnect a shard.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeliveryInfo {
+    /// What to do.
     pub op: DeliveryOpcode,
+    /// The shard to do it on. A delivery for a shard the bot does not have is
+    /// dropped.
     pub shard: u32,
+    /// For a send, the gateway payload: an object with Discord's `op` and
+    /// `d`. Missing is the same as `null`; a reconnect ignores it.
     #[serde(default)]
     pub data: Option<Value>,
 }
@@ -46,12 +76,22 @@ pub enum ShardCommand {
     Reconnect,
 }
 
+/// Why a delivery was rejected. The `Display` text is the reason logged when
+/// the command is dropped.
 #[derive(Debug, Eq, PartialEq)]
 pub enum InvalidCommand {
+    /// The body is not a [`DeliveryInfo`] in JSON (not JSON at all, an
+    /// unknown `op`, a shard that is not a `u32`...); holds the JSON error.
     Malformed(String),
+    /// A send without `data`, or with `null`.
     MissingData,
+    /// The `data` of a send is not a JSON object.
     NotAnObject,
+    /// The `op` in `data` is not one of [`ALLOWED_OPCODES`]; `None` when it
+    /// is missing or not an unsigned integer.
     OpcodeNotAllowed(Option<u64>),
+    /// `data` is longer than [`MAX_PAYLOAD_BYTES`] as compact JSON; holds its
+    /// length in bytes.
     TooLarge(usize),
 }
 
@@ -61,7 +101,8 @@ impl std::fmt::Display for InvalidCommand {
             Self::Malformed(err) => write!(f, "malformed delivery: {err}"),
             Self::MissingData => f.write_str("send delivery without data"),
             Self::NotAnObject => f.write_str("data is not a JSON object"),
-            Self::OpcodeNotAllowed(op) => write!(f, "gateway opcode {op:?} may not be sent"),
+            Self::OpcodeNotAllowed(Some(op)) => write!(f, "gateway opcode {op} may not be sent"),
+            Self::OpcodeNotAllowed(None) => f.write_str("data has no unsigned integer op"),
             Self::TooLarge(len) => {
                 write!(
                     f,
@@ -72,12 +113,28 @@ impl std::fmt::Display for InvalidCommand {
     }
 }
 
+impl std::error::Error for InvalidCommand {}
+
 /// Parse a raw delivery body.
+///
+/// # Errors
+///
+/// [`InvalidCommand::Malformed`] when the body is not a [`DeliveryInfo`] in
+/// JSON.
 pub fn parse(body: &[u8]) -> Result<DeliveryInfo, InvalidCommand> {
     serde_json::from_slice(body).map_err(|err| InvalidCommand::Malformed(err.to_string()))
 }
 
-/// Turn a delivery into the command to run on its shard.
+/// Turn a delivery into the command to run on its shard. A send becomes the
+/// compact JSON of its `data`.
+///
+/// # Errors
+///
+/// A reconnect never fails. A send fails with [`InvalidCommand::MissingData`]
+/// without `data`, [`InvalidCommand::NotAnObject`] when `data` is not an
+/// object, [`InvalidCommand::OpcodeNotAllowed`] when its `op` is not one of
+/// [`ALLOWED_OPCODES`], and [`InvalidCommand::TooLarge`] when it is longer
+/// than [`MAX_PAYLOAD_BYTES`].
 pub fn validate(delivery: &DeliveryInfo) -> Result<ShardCommand, InvalidCommand> {
     match delivery.op {
         DeliveryOpcode::Reconnect => Ok(ShardCommand::Reconnect),
@@ -88,8 +145,8 @@ pub fn validate(delivery: &DeliveryInfo) -> Result<ShardCommand, InvalidCommand>
             if !op.is_some_and(|op| ALLOWED_OPCODES.contains(&op)) {
                 return Err(InvalidCommand::OpcodeNotAllowed(op));
             }
-            let json = serde_json::to_string(data)
-                .map_err(|err| InvalidCommand::Malformed(err.to_string()))?;
+            // A `Value` displays as its compact JSON, which cannot fail.
+            let json = data.to_string();
             if json.len() > MAX_PAYLOAD_BYTES {
                 return Err(InvalidCommand::TooLarge(json.len()));
             }
@@ -109,21 +166,35 @@ pub enum Plan {
     Drop,
 }
 
+/// Rate limit for the warnings about dropped deliveries: a producer stuck on
+/// an invalid command must not flood the log. The consumer still counts every
+/// drop in `gateway_commands`.
+static DROP_WARNINGS: Throttle = Throttle::new(Duration::from_secs(5));
+
 /// Decide what to do with a delivery. `owned` says whether this process runs
 /// the shard; `total` is the shard count of the bot.
 pub fn plan(body: &[u8], owned: impl Fn(u32) -> bool, total: u32) -> Plan {
     let delivery = match parse(body) {
         Ok(delivery) => delivery,
         Err(err) => {
-            tracing::warn!("Dropping gateway command: {}", err);
+            if let Some(suppressed) = DROP_WARNINGS.check() {
+                tracing::warn!(
+                    "Dropping gateway command: {} ({} similar suppressed)",
+                    err,
+                    suppressed
+                );
+            }
             return Plan::Drop;
         }
     };
     if delivery.shard >= total {
-        tracing::warn!(
-            "Dropping gateway command for invalid shard {}",
-            delivery.shard
-        );
+        if let Some(suppressed) = DROP_WARNINGS.check() {
+            tracing::warn!(
+                "Dropping gateway command for invalid shard {} ({} similar suppressed)",
+                delivery.shard,
+                suppressed
+            );
+        }
         return Plan::Drop;
     }
     if !owned(delivery.shard) {
@@ -132,18 +203,36 @@ pub fn plan(body: &[u8], owned: impl Fn(u32) -> bool, total: u32) -> Plan {
     match validate(&delivery) {
         Ok(command) => Plan::Run(delivery.shard, command),
         Err(err) => {
-            tracing::warn!(
-                "Dropping gateway command for shard {}: {}",
-                delivery.shard,
-                err
-            );
+            if let Some(suppressed) = DROP_WARNINGS.check() {
+                tracing::warn!(
+                    "Dropping gateway command for shard {}: {} ({} similar suppressed)",
+                    delivery.shard,
+                    err,
+                    suppressed
+                );
+            }
             Plan::Drop
         }
     }
 }
 
 /// Time limit for acknowledging or forwarding one delivery.
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Extra time to subscribe per shard of this process: binding its queue to
+/// each shard is one more broker round trip.
+const SUBSCRIBE_PER_BINDING: Duration = Duration::from_millis(50);
+
+/// The longest wait between two attempts to subscribe.
+const MAX_SUBSCRIBE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Time limit for subscribing with `shards` bindings. The declarations, the
+/// bindings and the two consumers are sequential round trips, so a flat limit
+/// could never be met by a process running many shards.
+fn subscribe_timeout(shards: usize) -> Duration {
+    let bindings = u32::try_from(shards).unwrap_or(u32::MAX);
+    ACK_TIMEOUT.saturating_add(SUBSCRIBE_PER_BINDING.saturating_mul(bindings))
+}
 
 /// Consume gateway commands until the connection is closed.
 ///
@@ -152,70 +241,47 @@ const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `gateway.send.shards` exchange with the shard id as routing key; each
 /// process binds an exclusive queue there for the shards it runs. So with
 /// several processes every command reaches the one running its shard (and is
-/// dropped by the broker if none does).
+/// dropped by the broker if none does), though commands for one shard are not
+/// guaranteed to run in the order they were published.
 ///
 /// The consumer follows the AMQP supervisor's current link, so it moves to a
 /// new connection as soon as one is installed. Deliveries are acknowledged
-/// only after they were handled.
-pub async fn run_consumer(
-    amqp: std::sync::Arc<crate::amqp::Amqp>,
-    registry: std::sync::Arc<crate::gateway::registry::Registry>,
-    total: u32,
-) {
-    use crate::{constants::SHARD_EXCHANGE, metrics::GATEWAY_COMMANDS};
-    use futures_util::StreamExt;
-    use lapin::{
-        options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions},
-        types::FieldTable,
-    };
-    use std::time::Duration;
-    use twilight_gateway::CloseFrame;
-
+/// only after they were handled; one that could not be forwarded is requeued,
+/// and the connection is replaced.
+pub async fn run_consumer(amqp: Arc<Amqp>, registry: Arc<Registry>, total: u32) {
     let shards: Vec<u32> = registry.handles().map(|handle| handle.id).collect();
     let mut links = amqp.subscribe();
     let mut backoff = Duration::from_millis(250);
 
     while !amqp.is_closing() {
-        let link = match links.wait_for(Option::is_some).await {
+        // Also wakes up when the connection is closed while there is no link,
+        // as the link then stays `None`.
+        let woken = links.wait_for(|link| link.is_some() || amqp.is_closing());
+        let link = match woken.await {
             Ok(link) => link.clone(),
             Err(_) => return,
         };
-        let Some(link) = link else { continue };
+        let Some(link) = link else { return };
         let channel = link.consume_channel().clone();
 
-        // Declared on every (re)subscribe, in case a queue was deleted.
-        let subscribe = async {
-            let own = crate::amqp::declare_consume(&channel, shards.iter().copied()).await?;
-            let shared = channel
-                .basic_consume(
-                    QUEUE_SEND.into(),
-                    "".into(),
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await?;
-            let own = channel
-                .basic_consume(
-                    own.as_str().into(),
-                    "".into(),
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await?;
-            Ok::<_, lapin::Error>((shared, own))
-        };
-        let (mut shared, mut own) = match tokio::time::timeout(ACK_TIMEOUT, subscribe).await {
+        // The queues are declared on every (re)subscribe, in case one was
+        // deleted.
+        let limit = subscribe_timeout(shards.len());
+        let subscribed = tokio::time::timeout(limit, consume_commands(&channel, &shards)).await;
+        let (mut send_consumer, mut own_consumer) = match subscribed {
             Ok(Ok(consumers)) => consumers,
             Ok(Err(err)) => {
                 tracing::warn!("Failed to consume gateway commands: {}", err);
                 amqp.mark_broken(Some(link.generation));
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff = (backoff * 2).min(MAX_SUBSCRIBE_BACKOFF);
                 continue;
             }
             Err(_) => {
                 tracing::warn!("Timed out subscribing to gateway commands");
                 amqp.mark_broken(Some(link.generation));
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_SUBSCRIBE_BACKOFF);
                 continue;
             }
         };
@@ -225,8 +291,8 @@ pub async fn run_consumer(
             let (delivery, routed_to_us) = tokio::select! {
                 // A new link (or none): leave this connection.
                 _ = links.changed() => break,
-                delivery = shared.next() => (delivery, false),
-                delivery = own.next() => (delivery, true),
+                delivery = send_consumer.next() => (delivery, false),
+                delivery = own_consumer.next() => (delivery, true),
             };
             let delivery = match delivery {
                 Some(Ok(delivery)) => delivery,
@@ -240,57 +306,25 @@ pub async fn run_consumer(
             };
 
             let plan = plan(&delivery.data, |shard| registry.get(shard).is_some(), total);
-            let mut forward_failed = false;
-            match plan {
+            let forward_failed = match plan {
                 Plan::Run(shard, command) => {
-                    let sender = registry
-                        .get(shard)
-                        .and_then(|handle| handle.sender.as_ref());
-                    let sent = match (sender, command) {
-                        (Some(sender), ShardCommand::Send(json)) => sender.send(json).is_ok(),
-                        (Some(sender), ShardCommand::Reconnect) => {
-                            tracing::info!("Reconnecting shard {} on request", shard);
-                            sender.close(CloseFrame::RESUME).is_ok()
-                        }
-                        (None, _) => false,
-                    };
-                    let result = if sent { "sent" } else { "dropped" };
-                    GATEWAY_COMMANDS
-                        .with_label_values(&[shard.to_string().as_str(), result])
-                        .inc();
-                    if !sent {
-                        // The shard stopped for good (fatal close code).
-                        tracing::warn!("Shard {} is not running; dropping its command", shard);
-                    }
+                    run_on_shard(&registry, shard, command);
+                    false
                 }
                 Plan::Forward(shard) if !routed_to_us => {
-                    let forwarded = tokio::time::timeout(
-                        ACK_TIMEOUT,
-                        channel.basic_publish(
-                            SHARD_EXCHANGE.into(),
-                            shard.to_string().as_str().into(),
-                            BasicPublishOptions::default(),
-                            &delivery.data,
-                            delivery.properties.clone(),
-                        ),
-                    )
-                    .await;
-                    forward_failed = !matches!(forwarded, Ok(Ok(_)));
-                    if !forward_failed {
-                        GATEWAY_COMMANDS
-                            .with_label_values(&[shard.to_string().as_str(), "forwarded"])
-                            .inc();
-                    }
+                    !forward(&channel, shard, &delivery.data, &delivery.properties).await
                 }
                 Plan::Forward(shard) => {
                     tracing::warn!("Dropping a command routed here for shard {}, which this process does not run", shard);
+                    false
                 }
                 Plan::Drop => {
                     GATEWAY_COMMANDS.with_label_values(&["", "invalid"]).inc();
+                    false
                 }
-            }
+            };
 
-            let acked = if forward_failed {
+            let answered = if forward_failed {
                 let requeue = BasicNackOptions {
                     multiple: false,
                     requeue: true,
@@ -300,11 +334,106 @@ pub async fn run_consumer(
                 tokio::time::timeout(ACK_TIMEOUT, delivery.acker.ack(BasicAckOptions::default()))
                     .await
             };
-            if forward_failed || !matches!(acked, Ok(Ok(_))) {
+            let acked = match answered {
+                Ok(Ok(_)) => true,
+                Ok(Err(err)) => {
+                    tracing::warn!("Failed to acknowledge a gateway command: {}", err);
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!("Timed out acknowledging a gateway command");
+                    false
+                }
+            };
+            if forward_failed || !acked {
                 tracing::warn!("Failed to handle a gateway command; reconnecting");
                 amqp.mark_broken(Some(link.generation));
                 break;
             }
+        }
+    }
+}
+
+/// Declare the queues (see [`declare_consume`]) and consume `gateway.send`
+/// and this process' own queue, in that order.
+async fn consume_commands(
+    channel: &Channel,
+    shards: &[u32],
+) -> Result<(Consumer, Consumer), lapin::Error> {
+    let own_queue = declare_consume(channel, shards.iter().copied()).await?;
+    let send_consumer = channel
+        .basic_consume(
+            QUEUE_SEND.into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+    let own_consumer = channel
+        .basic_consume(
+            own_queue.as_str().into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+    Ok((send_consumer, own_consumer))
+}
+
+/// Run a command on one of this process' shards and count it as sent, or as
+/// dropped when the shard stopped for good.
+fn run_on_shard(registry: &Registry, shard: u32, command: ShardCommand) {
+    let sender = registry
+        .get(shard)
+        .and_then(|handle| handle.sender.as_ref());
+    let sent = match (sender, command) {
+        (Some(sender), ShardCommand::Send(json)) => sender.send(json).is_ok(),
+        (Some(sender), ShardCommand::Reconnect) => {
+            tracing::info!("Reconnecting shard {} on request", shard);
+            sender.close(CloseFrame::RESUME).is_ok()
+        }
+        (None, _) => false,
+    };
+    let result = if sent { "sent" } else { "dropped" };
+    GATEWAY_COMMANDS
+        .with_label_values(&[shard.to_string().as_str(), result])
+        .inc();
+    if !sent {
+        // The shard stopped for good (fatal close code).
+        tracing::warn!("Shard {} is not running; dropping its command", shard);
+    }
+}
+
+/// Forward a command to the process running `shard`, through
+/// [`SHARD_EXCHANGE`], and count it. Returns whether the broker took it.
+async fn forward(
+    channel: &Channel,
+    shard: u32,
+    payload: &[u8],
+    properties: &BasicProperties,
+) -> bool {
+    let shard_id = shard.to_string();
+    let publish = channel.basic_publish(
+        SHARD_EXCHANGE.into(),
+        shard_id.as_str().into(),
+        BasicPublishOptions::default(),
+        payload,
+        properties.clone(),
+    );
+    match tokio::time::timeout(ACK_TIMEOUT, publish).await {
+        Ok(Ok(_)) => {
+            GATEWAY_COMMANDS
+                .with_label_values(&[shard_id.as_str(), "forwarded"])
+                .inc();
+            true
+        }
+        Ok(Err(err)) => {
+            tracing::warn!("Failed to forward a command for shard {}: {}", shard, err);
+            false
+        }
+        Err(_) => {
+            tracing::warn!("Timed out forwarding a command for shard {}", shard);
+            false
         }
     }
 }
@@ -458,5 +587,33 @@ mod tests {
             .to_string()
             .into_bytes();
         assert_eq!(plan(&invalid, owned, 4), Plan::Drop);
+    }
+}
+
+#[cfg(test)]
+mod subscribe_timeout_tests {
+    use super::*;
+
+    /// Subscribing binds the process' queue once per shard, one broker round
+    /// trip each, so the time limit grows with the shards: a flat 5 s was
+    /// never met by a process running a few hundred shards.
+    #[test]
+    fn the_subscribe_limit_grows_with_the_shards() {
+        assert_eq!(subscribe_timeout(0), ACK_TIMEOUT);
+        assert_eq!(subscribe_timeout(1), ACK_TIMEOUT + SUBSCRIBE_PER_BINDING);
+        assert_eq!(
+            subscribe_timeout(256),
+            Duration::from_secs(5) + Duration::from_millis(50) * 256
+        );
+        assert!(subscribe_timeout(1000) > subscribe_timeout(256));
+    }
+
+    /// More bindings than a `u32` holds count as `u32::MAX`: the limit
+    /// saturates instead of overflowing.
+    #[test]
+    fn the_subscribe_limit_saturates() {
+        let most = usize::try_from(u32::MAX).unwrap();
+        assert_eq!(subscribe_timeout(usize::MAX), subscribe_timeout(most));
+        assert!(subscribe_timeout(most) > subscribe_timeout(1_000_000));
     }
 }

@@ -1,9 +1,11 @@
 //! Prometheus metrics, the /metrics + /healthcheck server and the metrics job.
 //!
-//! Metric names of earlier versions are unchanged. New: `gateway_parse_errors`,
-//! `state_update_errors`, `amqp_publish_failures`, `amqp_reconnects`,
-//! `amqp_connected`, `gateway_shard_fatal`, `gateway_shard_silence_seconds`,
-//! `state_threads`.
+//! Metric names of earlier versions are unchanged. New: `gateway_commands`,
+//! `gateway_parse_errors`, `state_update_errors`, `amqp_publish_failures`,
+//! `amqp_reconnects`, `amqp_connected`, `gateway_shard_fatal`,
+//! `gateway_shard_silence_seconds`, `state_threads`. Every metric's name,
+//! type, help and labels are pinned by
+//! `tests/snapshots/contract__prometheus_metric_names.snap`.
 
 use crate::{
     amqp::Amqp,
@@ -100,8 +102,11 @@ impl<B: MetricVecBuilder, const N: usize> Labelled<MetricVec<B>, N> {
 /// A metric as it is declared, whether or not /metrics lists it yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Descriptor {
+    /// The metric's name, as /metrics lists it.
     pub name: String,
+    /// The help text, the `# HELP` line of /metrics.
     pub help: String,
+    /// `COUNTER` or `GAUGE`, the `# TYPE` line of /metrics.
     pub kind: MetricType,
     /// The label names, in the order `with_label_values` takes the values.
     pub labels: Vec<String>,
@@ -185,27 +190,36 @@ pub fn descriptors() -> Vec<Descriptor> {
 }
 
 // A vector's `N` is the length of the label array it registers, so the two
-// cannot disagree.
+// cannot disagree. Each metric's doc is made from its name, help text and
+// labels, so it cannot drift from what /metrics says.
 macro_rules! counter_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
+        #[doc = concat!("`", $metric, "` (counter): ", $help, ".")]
+        #[doc = ""]
+        #[doc = concat!("Labels, in `with_label_values` order: `", stringify!($labels), "`.")]
         pub static $name: Metric<Labelled<IntCounterVec, { $labels.len() }>> =
             Metric::new(|| Labelled(register_int_counter_vec!($metric, $help, $labels).unwrap()));
     };
 }
 macro_rules! counter {
     ($name:ident, $metric:literal, $help:literal) => {
+        #[doc = concat!("`", $metric, "` (counter): ", $help, ".")]
         pub static $name: Metric<IntCounter> =
             Metric::new(|| register_int_counter!($metric, $help).unwrap());
     };
 }
 macro_rules! gauge {
     ($name:ident, $metric:literal, $help:literal) => {
+        #[doc = concat!("`", $metric, "` (gauge): ", $help, ".")]
         pub static $name: Metric<IntGauge> =
             Metric::new(|| register_int_gauge!($metric, $help).unwrap());
     };
 }
 macro_rules! gauge_vec {
     ($name:ident, $metric:literal, $help:literal, $labels:expr) => {
+        #[doc = concat!("`", $metric, "` (gauge): ", $help, ".")]
+        #[doc = ""]
+        #[doc = concat!("Labels, in `with_label_values` order: `", stringify!($labels), "`.")]
         pub static $name: Metric<Labelled<IntGaugeVec, { $labels.len() }>> =
             Metric::new(|| Labelled(register_int_gauge_vec!($metric, $help, $labels).unwrap()));
     };
@@ -385,12 +399,16 @@ pub static STATE_GAUGES: &[(&str, &Metric<IntGauge>)] = &[
 /// identify limit (Discord resets the token when it runs out).
 #[derive(Clone, Debug, Default)]
 pub struct Health {
+    /// Conditions a restart fixes. Any of them makes /healthcheck answer 503.
     pub problems: Vec<String>,
+    /// Conditions /healthcheck lists that do not fail it: a restart would not
+    /// fix them.
     pub warnings: Vec<String>,
 }
 
 static HEALTH: LazyLock<RwLock<Health>> = LazyLock::new(|| RwLock::new(Health::default()));
 
+/// Replace what /healthcheck reports. The metrics job sets it on every run.
 pub fn set_health(health: Health) {
     if let Ok(mut current) = HEALTH.write() {
         *current = health;
@@ -475,7 +493,11 @@ pub async fn run_server(listener: TcpListener) {
                 .header_read_timeout(Duration::from_secs(10));
             let conn = builder.serve_connection(TokioIo::new(stream), service_fn(serve));
             if let Err(err) = conn.await {
-                if !err.is_incomplete_message() {
+                // A client that gave up halfway through a request, and a
+                // keep-alive connection left idle past the header read timeout
+                // (a scraper between two scrapes: hyper also uses that timeout
+                // as the idle timeout between requests), are not our errors.
+                if !err.is_incomplete_message() && !err.is_timeout() {
                     warn!("Metrics connection error: {}", err);
                 }
             }
@@ -539,7 +561,14 @@ pub fn compute_health_at(
     health
 }
 
-/// Set every state gauge to the size of its cache type.
+/// Set every state gauge to the size of its cache type's `<prefix>_keys`
+/// index, read with one pipeline of `SCARD` commands.
+///
+/// # Errors
+///
+/// When the pipeline fails (Redis is unreachable, or a reply is not an
+/// integer) or returns a different number of counts than there are state
+/// gauges. No gauge is changed then.
 pub async fn update_state_gauges<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<()> {
     let mut pipe = redis::pipe();
     for (prefix, _) in STATE_GAUGES {
@@ -561,7 +590,16 @@ pub async fn update_state_gauges<C: ConnectionLike + Send>(conn: &mut C) -> ApiR
     Ok(())
 }
 
-/// Update gauges and the health state every second.
+/// `value` as a gauge value, or `i64::MAX` when it does not fit (no count or
+/// duration this service reports gets that large).
+fn gauge_value(value: impl TryInto<i64>) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
+}
+
+/// Update the gateway and AMQP gauges, the health state and the state gauges,
+/// then wait `METRICS_JOB_INTERVAL_MS` (one second) and repeat until the task
+/// is aborted. A failed state count is logged and leaves the state gauges as
+/// they were.
 pub async fn run_jobs<C: ConnectionLike + Send>(
     mut conn: C,
     registry: Arc<Registry>,
@@ -570,7 +608,7 @@ pub async fn run_jobs<C: ConnectionLike + Send>(
 ) {
     loop {
         let snapshots = registry.snapshots();
-        GATEWAY_SHARDS.set(snapshots.len() as i64);
+        GATEWAY_SHARDS.set(gauge_value(snapshots.len()));
 
         let mut statuses: HashMap<&'static str, i64> =
             STATUS_LABELS.iter().map(|label| (*label, 0)).collect();
@@ -579,23 +617,21 @@ pub async fn run_jobs<C: ConnectionLike + Send>(
             *statuses.entry(snapshot.status).or_default() += 1;
             GATEWAY_LATENCIES
                 .with_label_values(&[label.as_str()])
-                .set(snapshot.latency_ms as i64);
+                .set(gauge_value(snapshot.latency_ms));
             SHARD_FATAL
                 .with_label_values(&[label.as_str()])
                 .set(i64::from(snapshot.fatal));
             SHARD_SILENCE
                 .with_label_values(&[label.as_str()])
-                .set(snapshot.silence().map_or(0, |s| s.as_secs() as i64));
+                .set(snapshot.silence().map_or(0, |s| gauge_value(s.as_secs())));
         }
         for (status, count) in statuses {
             GATEWAY_STATUSES.with_label_values(&[status]).set(count);
         }
-        AMQP_CONNECTED.set(i64::from(amqp.is_connected()));
-        set_health(compute_health(
-            &snapshots,
-            amqp.is_connected(),
-            shard_silence,
-        ));
+        // Read once, so the gauge and /healthcheck cannot disagree.
+        let amqp_connected = amqp.is_connected();
+        AMQP_CONNECTED.set(i64::from(amqp_connected));
+        set_health(compute_health(&snapshots, amqp_connected, shard_silence));
 
         if let Err(err) = update_state_gauges(&mut conn).await {
             warn!("Failed to get state stats: {}", err);
@@ -621,8 +657,10 @@ pub fn probe_addresses(host: Option<&str>) -> Vec<std::net::IpAddr> {
     }
 }
 
-/// `twilight-dispatch healthcheck`: exit 0 when /healthcheck returns 200.
-/// Used as the Docker HEALTHCHECK, since the runtime image has no curl.
+/// Whether /healthcheck at `address` and `port` answers 200 within 3 seconds.
+/// `twilight-dispatch healthcheck` exits 0 when it does for one of the
+/// [`probe_addresses`]: the Docker HEALTHCHECK, since the runtime image has
+/// no curl.
 pub async fn probe(address: std::net::IpAddr, port: u16) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1002,5 +1040,26 @@ mod tests {
             let line = format!("{} 0", metric.name);
             assert!(response.lines().any(|l| l == line), "{line} in\n{response}");
         }
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn a_value_too_large_for_a_gauge_saturates() {
+        assert_eq!(gauge_value(u64::MAX), i64::MAX);
+        assert_eq!(gauge_value(1_u64 << 63), i64::MAX);
+        assert_eq!(gauge_value(5_u64), 5);
+        assert_eq!(gauge_value(3_usize), 3);
+        assert_eq!(gauge_value(-2_i32), -2);
+    }
+
+    #[test]
+    fn a_metric_is_created_on_first_use() {
+        // At run time: the statics' `Metric::new` runs at compile time.
+        let metric: Metric<String> = Metric::new(|| "created".to_owned());
+        assert_eq!(metric.as_str(), "created");
     }
 }

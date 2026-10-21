@@ -4,6 +4,11 @@
 //! by unix milliseconds). Earlier versions kept them in the hash
 //! [`EXPIRY_KEYS`] and read the whole hash every second, which is O(n) on
 //! Redis' single thread; [`migrate_legacy_expiry`] moves those entries over.
+//!
+//! The service runs these jobs whatever `STATE_ENABLED` says: an instance
+//! with the cache disabled still expires keys left in [`EXPIRY_ZSET`] (for
+//! example by an earlier run with the cache on) and still migrates
+//! [`EXPIRY_KEYS`].
 
 use super::keys::plan;
 use crate::{
@@ -45,7 +50,11 @@ return removed
 static EXPIRE: LazyLock<Script> = LazyLock::new(|| Script::new(EXPIRE_SCRIPT));
 
 /// The script arguments for a list of expired stored keys.
-pub fn expire_args(keys: &[String], now_ms: i64) -> Vec<String> {
+///
+/// `keys` are stored keys. Planning one gives its index sets only when it is
+/// stored under its logical name (every prefix but guild channels), so guild
+/// channels must never get an expiry; only members and messages do.
+fn expire_args(keys: &[String], now_ms: i64) -> Vec<String> {
     let mut args = vec![EXPIRY_ZSET.to_owned(), now_ms.to_string()];
     for key in keys {
         let plan = plan(key);
@@ -56,8 +65,14 @@ pub fn expire_args(keys: &[String], now_ms: i64) -> Vec<String> {
     args
 }
 
-/// Remove every key whose deadline is at or before `now_ms`. Returns how many
-/// keys were removed.
+/// Remove keys whose deadline is at or before `now_ms`, `EXPIRY_BATCH` at a
+/// time, until a batch is not full or removes nothing; anything left is for
+/// the next run. Returns how many keys were removed.
+///
+/// # Errors
+///
+/// Fails when a Redis command or the expiry script fails. Batches removed
+/// before the failure stay removed.
 pub async fn expire_due<C: ConnectionLike + Send>(conn: &mut C, now_ms: i64) -> ApiResult<u64> {
     let mut removed = 0;
     loop {
@@ -89,7 +104,17 @@ pub async fn expire_due<C: ConnectionLike + Send>(conn: &mut C, now_ms: i64) -> 
 
 /// Move entries of the legacy expiry hash into the sorted set. Migrated
 /// fields are removed one batch at a time (not the whole hash), so entries an
-/// older version writes meanwhile are picked up by the next run.
+/// older version writes meanwhile are picked up by the next run. A field an
+/// older version rewrites between the HSCAN that read it and the HDEL is
+/// deleted with it, so its new deadline is lost (the one read is scheduled).
+/// Fields whose value is not a legacy deadline are deleted without being
+/// scheduled. Returns how many entries had a valid deadline.
+///
+/// # Errors
+///
+/// Fails when a Redis command or a batch's transaction fails. Batches
+/// migrated before the failure stay migrated; the rest is left in the hash
+/// for the next run.
 pub async fn migrate_legacy_expiry<C: ConnectionLike + Send>(conn: &mut C) -> ApiResult<u64> {
     let mut cursor: u64 = 0;
     let mut migrated = 0;
@@ -209,5 +234,34 @@ mod tests {
     fn legacy_values_parse() {
         assert_eq!(legacy_deadline(r#""1970-01-01T00:00:01.5""#), Some(1500));
         assert_eq!(legacy_deadline("garbage"), None);
+    }
+}
+
+#[cfg(test)]
+mod index_set_counts {
+    use super::*;
+
+    /// Each key carries its own number of index sets (0, 1 and 3 here), which
+    /// the script uses to find the next key.
+    #[test]
+    fn script_arguments_count_each_keys_own_index_sets() {
+        let keys = ["bot_user", "guild:5", "thread:1:9"].map(str::to_owned);
+        assert_eq!(
+            expire_args(&keys, 7),
+            vec![
+                EXPIRY_ZSET,
+                "7",
+                "bot_user",
+                "0",
+                "guild:5",
+                "1",
+                "guild_keys",
+                "thread:1:9",
+                "3",
+                "thread_keys",
+                "guild_keys:1",
+                "thread_keys:1",
+            ]
+        );
     }
 }

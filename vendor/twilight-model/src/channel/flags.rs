@@ -12,6 +12,7 @@ bitflags! {
         /// New threads in a forum channel require a tag.
         const REQUIRE_TAG = 1 << 4;
         /// Media channel hides the embedded media download options.
+        /// (twilight-dispatch patch)
         const HIDE_MEDIA_DOWNLOAD_OPTIONS = 1 << 15;
         /// The channel is obfuscated: the bot cannot view it, so only a
         /// placeholder is sent. (twilight-dispatch patch)
@@ -24,6 +25,7 @@ bitflags! {
 impl<'de> Deserialize<'de> for ChannelFlags {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Keep unknown bits so cached channels match what Discord sent.
+        // (twilight-dispatch patch, PATCHES.md 2)
         Ok(Self::from_bits_retain(u64::deserialize(deserializer)?))
     }
 }
