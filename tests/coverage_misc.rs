@@ -1205,6 +1205,29 @@ async fn a_pause_ends_and_a_successful_post_resets_it() {
     assert!(pause >= PAUSE && pause < PAUSE * 8, "paused for {pause:?}");
 }
 
+/// Unlike an error page, Discord's JSON 403 disables the channel rather than
+/// pausing it: each further post would be another invalid request towards
+/// the Cloudflare ban limit, so none is sent once a pause would be over.
+#[tokio::test]
+async fn a_permanent_error_disables_rather_than_pauses() {
+    const PAUSE: Duration = Duration::from_millis(50);
+    logs();
+    let rest = FakeRest::start().await;
+    rest.respond_with(
+        SHARD_LOG,
+        403,
+        r#"{"code": 50013, "message": "Missing Permissions"}"#,
+    );
+    let log = DiscordLog::with_pauses(rest.client(), SHARD_LOG, GUILD_LOG, PAUSE..=PAUSE);
+
+    let sent = rest.post_shard(&log, &["rejected"]).await;
+    let titles: Vec<&str> = sent.iter().map(title).collect();
+    assert_eq!(titles, ["rejected"]);
+    tokio::time::sleep(PAUSE * 4).await;
+    let sent = rest.post_shard(&log, &["not sent"]).await;
+    assert!(sent.is_empty(), "the disabled channel got {sent:?}");
+}
+
 #[tokio::test]
 async fn an_invalid_token_without_a_json_body_disables_every_channel() {
     let rest = FakeRest::start().await;
