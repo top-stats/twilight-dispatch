@@ -141,10 +141,11 @@ async fn only_shards_of_one_discord_bucket_take_turns() {
 
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis).await.unwrap();
     let (a, b) = (process(&redis, 16), process(&redis, 16));
-    let started = Instant::now();
+    // Relative to each other: setup (script loading) on a loaded machine
+    // must not count.
     let times = granted_all(vec![a.enqueue(0), b.enqueue(1)]).await;
-    let last = times[1] - started;
-    assert!(last < INTERVAL, "shards 0 and 1 waited {last:?}");
+    let apart = times[0].max(times[1]) - times[0].min(times[1]);
+    assert!(apart < INTERVAL, "shards 0 and 1: {apart:?} apart");
     assert!(pttl(&mut redis, &identify_key(0)).await > 0);
     assert!(pttl(&mut redis, &identify_key(1)).await > 0);
 }
