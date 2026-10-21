@@ -281,6 +281,53 @@ async fn pipe(
     }
 }
 
+/// Confirms are off unless `AMQP_CONFIRMS` is set.
+#[test]
+fn confirms_are_off_unless_configured() {
+    let config = |confirms: Option<&str>| {
+        twilight_dispatch::config::Config::from_lookup(&|name| {
+            match name {
+                "BOT_TOKEN" => Some("token"),
+                "INTENTS" => Some("513"),
+                "AMQP_URL" => Some("amqp://127.0.0.1/%2f"),
+                "REDIS_URL" => Some("redis://127.0.0.1"),
+                "AMQP_CONFIRMS" => confirms,
+                _ => None,
+            }
+            .map(str::to_owned)
+        })
+        .unwrap()
+        .amqp_confirms
+    };
+    assert!(!config(None));
+    assert!(!config(Some("false")));
+    assert!(config(Some("true")));
+}
+
+/// Without confirms (the default) a publish returns once the message is
+/// written, even while the broker's replies are held back.
+#[tokio::test]
+async fn without_confirms_a_publish_returns_once_written() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let proxy = Proxy::start(&url).await;
+    let amqp = Amqp::connect(proxy.url.clone(), true).await.unwrap();
+    purge(&url, QUEUE_RECV).await;
+
+    proxy.hold(false, true);
+    finishes(
+        publish(&amqp, "MESSAGE_CREATE", "0:a:1"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    wait_for_stored(&url, 1).await;
+    proxy.hold(false, false);
+    amqp.close().await;
+}
+
 /// A publish returns only once the broker confirmed it: while the confirm
 /// is held back it keeps waiting, although the broker already stored the
 /// message. Before, it returned as soon as the frames were written.
@@ -291,7 +338,9 @@ async fn publishes_wait_for_the_confirm() {
     };
     let _serial = SERIAL.lock().await;
     let proxy = Proxy::start(&url).await;
-    let amqp = Amqp::connect(proxy.url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(proxy.url.clone(), true, true)
+        .await
+        .unwrap();
     purge(&url, QUEUE_RECV).await;
     let link = generation(&amqp);
 
@@ -331,7 +380,9 @@ async fn a_publish_lost_with_its_connection_is_retried() {
     };
     let _serial = SERIAL.lock().await;
     let proxy = Proxy::start(&url).await;
-    let amqp = Amqp::connect(proxy.url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(proxy.url.clone(), true, true)
+        .await
+        .unwrap();
     purge(&url, QUEUE_RECV).await;
     let link = generation(&amqp).unwrap();
 
@@ -364,7 +415,9 @@ async fn a_publish_whose_confirm_is_lost_is_delivered_at_least_once() {
     };
     let _serial = SERIAL.lock().await;
     let proxy = Proxy::start(&url).await;
-    let amqp = Amqp::connect(proxy.url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(proxy.url.clone(), true, true)
+        .await
+        .unwrap();
     purge(&url, QUEUE_RECV).await;
     let link = generation(&amqp).unwrap();
 
@@ -402,7 +455,9 @@ async fn a_broker_that_never_confirms_fails_the_publish() {
     };
     let _serial = SERIAL.lock().await;
     let proxy = Proxy::start(&url).await;
-    let amqp = Amqp::connect(proxy.url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(proxy.url.clone(), true, true)
+        .await
+        .unwrap();
     purge(&url, QUEUE_RECV).await;
     let failures = AMQP_PUBLISH_FAILURES.get();
 
@@ -471,7 +526,7 @@ async fn a_nacked_publish_fails_and_keeps_the_link() {
         return;
     };
     let _serial = SERIAL.lock().await;
-    let amqp = Amqp::connect(url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(url.clone(), true, true).await.unwrap();
     let nacking = declare_nacking_queue(&url).await;
     purge(&url, QUEUE_RECV).await;
     let link = generation(&amqp);
@@ -510,7 +565,7 @@ async fn concurrent_publishes_get_their_own_confirms() {
         return;
     };
     let _serial = SERIAL.lock().await;
-    let amqp = Amqp::connect(url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(url.clone(), true, true).await.unwrap();
     let nacking = declare_nacking_queue(&url).await;
     purge(&url, QUEUE_RECV).await;
 
@@ -559,7 +614,7 @@ async fn throughput() {
         return;
     };
     let _serial = SERIAL.lock().await;
-    let amqp = Amqp::connect(url.clone(), true).await.unwrap();
+    let amqp = Amqp::connect_with(url.clone(), true, true).await.unwrap();
     purge(&url, QUEUE_RECV).await;
     let body = vec![b'x'; 1024];
 

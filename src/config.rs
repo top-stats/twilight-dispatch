@@ -24,6 +24,10 @@ pub struct Config {
     /// `gateway::concurrency`).
     pub shards_concurrency: Option<u16>,
     pub default_queue: bool,
+    /// Publisher confirms (`AMQP_CONFIRMS`): an event counts as published
+    /// only once the broker confirmed it. Off by default, because each worker
+    /// then waits for one broker disk sync per event.
+    pub amqp_confirms: bool,
     pub resume: bool,
     pub intents: Intents,
     pub large_threshold: u64,
@@ -358,6 +362,7 @@ impl Config {
             shards,
             shards_concurrency: env.optional("SHARDS_CONCURRENCY")?,
             default_queue: env.optional("DEFAULT_QUEUE")?.unwrap_or(true),
+            amqp_confirms: env.optional("AMQP_CONFIRMS")?.unwrap_or(false),
             resume: env.optional("RESUME")?.unwrap_or(true),
             intents,
             large_threshold,

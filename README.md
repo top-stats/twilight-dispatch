@@ -27,9 +27,11 @@ Configuration is read from environment variables (or `.env`); see
   `stop_grace_period: 30s` in Swarm / Compose (Docker's default is 10s).
 - Redis and the broker are reconnected automatically; while Redis is down
   events are still published (without cache updates or `old`).
-- An event counts as published once the broker confirmed it (publisher
-  confirms); only then may the saved resume point pass it. An event the
-  broker nacked, did not confirm within 5 s, or whose connection dropped
+- By default an event counts as published once it is written to the broker
+  connection, so a broker crash or a connection drop right after the write
+  can lose it. With `AMQP_CONFIRMS=true` it counts as published only once the
+  broker confirmed it (publisher confirms); only then may the saved resume
+  point pass it. An event the broker nacked, did not confirm within 5 s, or whose connection dropped
   first is retried and, failing that, replayed by Discord on the next
   resume. Delivery is at-least-once: when the connection drops after the
   broker stored an event but before its confirm arrived, the event is
@@ -37,8 +39,9 @@ Configuration is read from environment variables (or `.env`); see
   `message_id` property (`shard:session:seq`). Each worker waits for its
   confirm before the next event, and LavinMQ confirms only after syncing its
   data directory, so the broker's disk bounds the rate per worker.
-- `WORKERS` is the setting for the publish rate: with one event in flight per
-  worker, the confirmed rate of a process grows with the number of workers.
+- With confirms, `WORKERS` is the setting for the publish rate: with one
+  event in flight per worker, the confirmed rate of a process grows with the
+  number of workers.
   Measured on a dev machine (LavinMQ 2.10 with its default disk sync, 1 KiB
   events): about 200 events/s from one worker, 2.5k/s from 32 and 10k/s from
   128 (about 60k/s from 32 before confirms). Raise it (up to 1024) when shards

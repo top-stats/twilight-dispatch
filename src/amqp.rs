@@ -13,12 +13,16 @@
 //! immediately until the broker is back, so an outage cannot stall the
 //! workers (and with them the shards).
 //!
-//! A publish succeeds only once the broker confirmed it (publisher
-//! confirms): the worker then lets the resume point pass the event, so a
-//! message that was only written to the socket would be lost with the
-//! connection or a broker crash. A confirm that is lost with the connection
-//! makes the publish retry a message the broker already has, so consumers
-//! can get an event twice (at-least-once; they dedupe by `message_id`).
+//! By default a publish succeeds once lapin wrote the message to the socket,
+//! so a broker crash or a connection drop right after the write can lose it.
+//! With publisher confirms (`AMQP_CONFIRMS`) it succeeds only once the broker
+//! confirmed it: the worker lets the resume point pass the event only then,
+//! and a message lost with the connection is retried or replayed by Discord.
+//! A confirm that is lost with the connection makes the publish retry a
+//! message the broker already has, so consumers can get an event twice
+//! (at-least-once; they dedupe by `message_id`). Confirms are off by default
+//! because each worker then waits for one broker disk sync per event (see
+//! README, `WORKERS`).
 
 use crate::{
     constants::{EXCHANGE, QUEUE_RECV, QUEUE_SEND, SHARD_EXCHANGE},
@@ -66,7 +70,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct Link {
     pub generation: u64,
     connection: Arc<Connection>,
-    /// In confirm mode.
+    /// In confirm mode when [`Amqp`] uses publisher confirms.
     publish: Channel,
     /// Held while a publish is queued on `publish`, see [`Amqp::publish`].
     publishing: Arc<StdMutex<()>>,
@@ -87,6 +91,8 @@ impl Link {
 pub struct Amqp {
     url: String,
     default_queue: bool,
+    /// Publisher confirms: a publish succeeds only on the broker's ack.
+    confirms: bool,
     link: watch::Sender<Option<Link>>,
     wake: Notify,
     generation: AtomicU64,
@@ -98,11 +104,21 @@ pub struct Amqp {
 
 impl Amqp {
     /// Connect, declare the topology and start the supervisor. Fails if the
-    /// broker is unreachable.
+    /// broker is unreachable. Publishes without confirms.
     pub async fn connect(url: String, default_queue: bool) -> ApiResult<Arc<Self>> {
+        Self::connect_with(url, default_queue, false).await
+    }
+
+    /// [`Amqp::connect`], with publisher confirms when `confirms` is set.
+    pub async fn connect_with(
+        url: String,
+        default_queue: bool,
+        confirms: bool,
+    ) -> ApiResult<Arc<Self>> {
         let amqp = Arc::new(Self {
             url,
             default_queue,
+            confirms,
             link: watch::Sender::new(None),
             wake: Notify::new(),
             generation: AtomicU64::new(0),
@@ -175,9 +191,11 @@ impl Amqp {
             )
             .await?;
             let publish = connection.create_channel().await?;
-            publish
-                .confirm_select(ConfirmSelectOptions::default())
-                .await?;
+            if self.confirms {
+                publish
+                    .confirm_select(ConfirmSelectOptions::default())
+                    .await?;
+            }
             let consume = connection.create_channel().await?;
             // gateway.send is declared by the consumer, so publishing does not
             // depend on it.
@@ -227,9 +245,9 @@ impl Amqp {
         link
     }
 
-    /// Publish to the gateway exchange and wait for the broker's confirm.
-    /// Waits for a reconnect within the outage budget and tries a message at
-    /// most [`PUBLISH_ATTEMPTS`] times.
+    /// Publish to the gateway exchange (and wait for the broker's confirm
+    /// when confirms are on). Waits for a reconnect within the outage budget
+    /// and tries a message at most [`PUBLISH_ATTEMPTS`] times.
     pub async fn publish(
         &self,
         routing_key: &str,
@@ -245,6 +263,26 @@ impl Amqp {
             let Some(link) = self.healthy_link().await else {
                 break;
             };
+            if !self.confirms {
+                let sent = tokio::time::timeout(
+                    PUBLISH_TIMEOUT,
+                    link.publish.basic_publish(
+                        EXCHANGE.into(),
+                        routing_key.into(),
+                        BasicPublishOptions::default(),
+                        payload,
+                        properties.clone(),
+                    ),
+                )
+                .await;
+                match sent {
+                    Ok(Ok(_confirm)) => return Ok(()),
+                    Ok(Err(err)) => last_error = err.into(),
+                    Err(_) => last_error = "timed out publishing to the AMQP broker".into(),
+                }
+                self.mark_broken(Some(link.generation));
+                continue;
+            }
             let attempt = async {
                 let write = link.publish.basic_publish(
                     EXCHANGE.into(),

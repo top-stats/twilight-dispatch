@@ -115,7 +115,12 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     let redis = redis_conn::connect(&config.redis_url).await?;
     migrate_legacy_expiry(&mut redis.clone()).await;
 
-    let amqp = Amqp::connect(config.amqp_url.clone(), config.default_queue).await?;
+    let amqp = Amqp::connect_with(
+        config.amqp_url.clone(),
+        config.default_queue,
+        config.amqp_confirms,
+    )
+    .await?;
 
     let http = Arc::new(http_client(&config));
     let user = http.current_user().await?.model().await?;
@@ -137,9 +142,12 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     };
 
     // Discord's identify limit is per bot, so the shards take turns with
-    // those of the bot's other processes (they share this Redis).
+    // those of the bot's other processes (they share this Redis). On a
+    // connection of its own, so a turn never waits behind the cache's large
+    // GUILD_CREATE transactions and falls back to local turns.
+    let identify_redis = redis_conn::connect(&config.redis_url).await?;
     let created = gateway::create_with_queue(&config, &http, saved, |local, max_concurrency| {
-        RedisQueue::new(local, max_concurrency, redis.clone())
+        RedisQueue::new(local, max_concurrency, identify_redis)
     })
     .await?;
     let range = created.range;
