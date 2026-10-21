@@ -1235,7 +1235,7 @@ async fn guild_update_keeps_every_field_it_does_not_split() {
 }
 
 // ---------------------------------------------------------------------------
-// Removals of a previous session (worker::only_removes)
+// Jobs of a previous session (worker::only_removes)
 
 /// Whether a job queued in a previous session (before a new READY) whose
 /// update only removes cached state is still applied (`worker::only_removes`).
@@ -1253,6 +1253,33 @@ const STALE_REMOVALS: [(&str, bool); 10] = [
     ("THREAD_UPDATE (archived)", false),
     ("VOICE_STATE_UPDATE (left)", false),
 ];
+
+/// Writes that a job queued in a previous session still applies: nothing
+/// resends them either, and they only change a key that is still cached
+/// (`cache::update_stale`), so they cannot bring back what READY removed.
+const STALE_WRITES: [&str; 1] = ["MESSAGE_UPDATE"];
+
+/// Everything the worker applies of a previous session is decided above, so
+/// `stale_jobs_follow_their_decision` checks it against Redis: an event that
+/// `worker::only_removes` starts letting through fails here until it is.
+#[test]
+fn every_stale_job_the_worker_applies_is_decided() {
+    let state = state_all();
+    let applied: BTreeSet<&str> = universe()
+        .iter()
+        .filter(|fixture| {
+            runner_event(fixture, &state).is_some_and(|event| worker::only_removes(&event))
+        })
+        .map(|fixture| fixture.label)
+        .collect();
+    let decided: BTreeSet<&str> = STALE_REMOVALS
+        .iter()
+        .filter(|(_, applied)| *applied)
+        .map(|(label, _)| *label)
+        .chain(STALE_WRITES)
+        .collect();
+    assert_eq!(applied, decided);
+}
 
 /// Every event whose cache update only deletes has a decision above. Removals
 /// that are skipped after a reconnect stay cached for good unless the new
@@ -1327,7 +1354,7 @@ async fn process(
 }
 
 #[tokio::test]
-async fn stale_removals_follow_their_decision() {
+async fn stale_jobs_follow_their_decision() {
     let Some(mut conn) = redis(2).await else {
         return;
     };
@@ -1345,13 +1372,14 @@ async fn stale_removals_follow_their_decision() {
         publish_errors: Throttle::default(),
     };
     let fixtures = universe();
-    for (label, applied) in STALE_REMOVALS {
+    let writes = STALE_WRITES.map(|label| (label, true));
+    for (label, applied) in STALE_REMOVALS.into_iter().chain(writes) {
         let fixture = find(&fixtures, label);
         seed_guild_and_dm(&mut conn, &fixtures).await;
         let seeded = dump(&mut conn).await;
         process(&ctx, &mut conn, &handle, fixture, false).await;
         let current = dump(&mut conn).await;
-        assert_ne!(current, seeded, "{label} removes nothing that is seeded");
+        assert_ne!(current, seeded, "{label} changes nothing that is seeded");
 
         seed_guild_and_dm(&mut conn, &fixtures).await;
         process(&ctx, &mut conn, &handle, fixture, true).await;

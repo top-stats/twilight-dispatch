@@ -73,11 +73,9 @@ impl Batch {
 
     /// Expire a logical key `ttl_ms` after `now_ms`. A TTL of 0 means "never".
     pub fn expire(&mut self, key: &str, ttl_ms: u64, now_ms: i64) {
-        if ttl_ms == 0 {
-            return;
+        if let Some(deadline) = deadline(ttl_ms, now_ms) {
+            self.expiries.push((plan(key).stored, deadline));
         }
-        let deadline = now_ms.saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
-        self.expiries.push((plan(key).stored, deadline));
     }
 
     /// Remove any pending expiry of a logical key.
@@ -153,6 +151,13 @@ impl Batch {
 
         Ok(())
     }
+}
+
+/// The expiry deadline of a key written at `now_ms` with a TTL of `ttl_ms`,
+/// `None` for a TTL of 0 ("never"). The write that does not go through a
+/// batch (`cache::update_stale`) uses it too, so both set the same deadline.
+pub fn deadline(ttl_ms: u64, now_ms: i64) -> Option<i64> {
+    (ttl_ms != 0).then(|| now_ms.saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX)))
 }
 
 fn command(name: &str, args: impl Iterator<Item = String>) -> Vec<String> {

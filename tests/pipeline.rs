@@ -769,12 +769,13 @@ fn stale_session_decision_table() {
             message(1, 1003, Some(1000), "hello"),
             false,
         ),
-        // Nothing resends messages either, but its read-then-write could
-        // bring back a message of a guild READY removed (see only_removes).
+        // Nothing resends edits either. Its write only goes ahead while the
+        // message is still cached, so it cannot bring back a message of a
+        // guild READY removed (see only_removes).
         (
             "MESSAGE_UPDATE",
             message(1, 1003, Some(1000), "edited"),
-            false,
+            true,
         ),
     ];
     for (kind, d, applied) in cases {

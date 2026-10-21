@@ -3,7 +3,8 @@
 //! The key layout and the JSON stored under each key are a contract with the
 //! consumers of the cache and are kept compatible with earlier versions (see
 //! [`crate::constants`] and [`keys`]). Each gateway event is applied with at
-//! most a few reads followed by one atomic write ([`batch::Batch`]). Events of
+//! most a few reads followed by one atomic write ([`batch::Batch`], or one
+//! script for an edit of a previous session, see [`update_stale`]). Events of
 //! one guild are applied in order by the same worker (see
 //! [`crate::gateway::worker`]), which makes the read-modify-write updates here
 //! safe.
@@ -24,20 +25,20 @@ use crate::{
     config::StateConfig,
     constants::{
         channel_key, emoji_key, guild_key, member_key, message_key, presence_key, role_key,
-        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, GUILD_KEY,
+        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, EXPIRY_ZSET, GUILD_KEY,
     },
     models::ApiResult,
 };
 
-use redis::aio::ConnectionLike;
+use redis::{aio::ConnectionLike, Script};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 use twilight_model::{
     channel::Channel,
     gateway::{
         event::Event,
-        payload::incoming::{GuildCreate, Ready},
+        payload::incoming::{GuildCreate, MessageUpdate, Ready},
         presence::{Presence, Status, UserOrId},
     },
     guild::{Guild, Member},
@@ -299,6 +300,16 @@ fn overlay(cached: Option<Value>, update: Value, keep_if_null: &[&str]) -> Value
         cached.insert(key, value);
     }
     Value::Object(cached)
+}
+
+/// A cached message with a MESSAGE_UPDATE applied. MESSAGE_UPDATE is a full
+/// message now, but its `tts` is always false.
+fn edited_message(previous: Value, data: &MessageUpdate) -> ApiResult<Value> {
+    let mut update = serde_json::to_value(&data.0)?;
+    if let (Some(tts), Value::Object(object)) = (previous.get("tts"), &mut update) {
+        object.insert("tts".into(), tts.clone());
+    }
+    Ok(overlay(Some(previous), update, &[]))
 }
 
 /// A presence user that is only `{"id": ...}` must not replace a cached full user.
@@ -601,14 +612,8 @@ pub async fn update<C: ConnectionLike + Send>(
             if state.message {
                 let key = message_key(data.channel_id, data.id);
                 if let Some(previous) = get(conn, &key).await? {
-                    // MESSAGE_UPDATE is a full message now, but its `tts` is
-                    // always false.
-                    let mut update = serde_json::to_value(&data.0)?;
-                    if let (Some(tts), Value::Object(object)) = (previous.get("tts"), &mut update) {
-                        object.insert("tts".into(), tts.clone());
-                    }
                     outcome.old = old_if(ctx, Some(previous.clone()));
-                    batch.set(&key, &overlay(Some(previous), update, &[]))?;
+                    batch.set(&key, &edited_message(previous, data)?)?;
                     batch.expire(&key, state.message_ttl, ctx.now_ms);
                 }
             }
@@ -697,6 +702,70 @@ pub async fn update<C: ConnectionLike + Send>(
     }
 
     batch.commit(conn).await?;
+    Ok(outcome)
+}
+
+/// SET a key and refresh its expiry, only if the key exists. Index sets are
+/// left alone: an existing key is indexed already, and removals delete a
+/// key, its index entries and its expiry in one transaction. Running before
+/// one, the script changes nothing the removal leaves behind; running after
+/// it, the script writes nothing.
+///
+/// KEYS: the stored key, the expiry zset. ARGV: the value, then the expiry
+/// deadline (left out for a TTL of 0).
+const SET_IF_CACHED_SCRIPT: &str = r"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1])
+if ARGV[2] then
+  redis.call('ZADD', KEYS[2], ARGV[2], KEYS[1])
+end
+return 1
+";
+
+static SET_IF_CACHED: LazyLock<Script> = LazyLock::new(|| Script::new(SET_IF_CACHED_SCRIPT));
+
+/// Apply an event that a previous session of its shard dispatched, after
+/// READY of the current session reconciled the cache. Only for the events
+/// `worker::only_removes` lets through.
+///
+/// READY's reconcile runs in the shard runner, at the same time as the
+/// workers, and can remove a guild between the read and the write of an
+/// update. Removals bring nothing back, so they are applied by [`update`].
+/// A MESSAGE_UPDATE has to read the message to merge the edit into it, so
+/// its write only goes ahead if the message is still cached when it runs
+/// (`SET_IF_CACHED_SCRIPT`). It then stores what [`update`] stores (value
+/// and expiry), but never undoes a removal; `old` is only set when the edit
+/// was written, as [`update`] only sets it for a cached message.
+pub async fn update_stale<C: ConnectionLike + Send>(
+    conn: &mut C,
+    event: &mut Event,
+    ctx: &UpdateContext<'_>,
+) -> ApiResult<Outcome> {
+    let Event::MessageUpdate(data) = event else {
+        return update(conn, event, ctx).await;
+    };
+    let state = ctx.state;
+    let mut outcome = Outcome::default();
+    // As in `update`: with the cache disabled nothing is read or written.
+    if !state.enabled || !state.message {
+        return Ok(outcome);
+    }
+    let key = message_key(data.channel_id, data.id);
+    let Some(previous) = get(conn, &key).await? else {
+        return Ok(outcome);
+    };
+    let edited = serde_json::to_string(&edited_message(previous.clone(), data)?)?;
+    let mut invocation = SET_IF_CACHED.key(plan(&key).stored);
+    invocation.key(EXPIRY_ZSET).arg(edited);
+    if let Some(deadline) = batch::deadline(state.message_ttl, ctx.now_ms) {
+        invocation.arg(deadline);
+    }
+    let written: bool = invocation.invoke_async(conn).await?;
+    if written {
+        outcome.old = old_if(ctx, Some(previous));
+    }
     Ok(outcome)
 }
 

@@ -225,6 +225,7 @@ where
 
     // Jobs of a previous session still in the queue would undo what READY
     // of the new session reconciled; that session re-sends the current state.
+    // Only those that cannot bring anything back are applied (only_removes).
     let current = match (token, ctx.registry.get(shard)) {
         (Some(token), Some(handle)) => handle.is_current(token),
         _ => true,
@@ -232,7 +233,7 @@ where
     let mut outcome = None;
     if let Some(mut event) = event {
         if ctx.state.enabled && (current || only_removes(&event)) {
-            outcome = update_cache(ctx, conn, &mut event).await;
+            outcome = update_cache(ctx, conn, &mut event, current).await;
         }
         log_guild_changes(ctx, &event, outcome.as_ref());
     }
@@ -253,25 +254,28 @@ where
     }
 }
 
-/// Events that only remove cached state. Nothing replays them after a new
-/// session (GUILD_CREATE keeps the messages of channels it lists), and they
-/// cannot bring back anything READY removed, so they are applied even when
-/// they belong to a previous session.
+/// Events that are applied even when they belong to a previous session
+/// (with [`cache::update_stale`]). Nothing replays them after a new session
+/// (GUILD_CREATE keeps the messages of channels it lists), and they cannot
+/// bring back anything READY removed: all but MESSAGE_UPDATE only remove
+/// cached state.
 ///
-/// MESSAGE_UPDATE is not applied across sessions although nothing replays it
-/// either, so such an edit is missing from the cache until the message
-/// expires (a known limitation). It reads the message and writes it back
-/// later, while READY's reconcile runs in the shard runner, not in this
-/// worker (`Runner::ready_cache` -> `cache::ready` -> `clear_guild`). If that
-/// removes the guild in between, the write brings the message back, and with
-/// STATE_MESSAGE_TTL=0 it never expires. Deletes have no such race.
+/// MESSAGE_UPDATE reads the message and writes it back later, while READY's
+/// reconcile runs in the shard runner, not in this worker
+/// (`Runner::ready_cache` -> `cache::ready` -> `clear_guild`). If that
+/// removed the guild in between, a plain write would bring the message back,
+/// and with STATE_MESSAGE_TTL=0 it would never expire. So a stale edit is
+/// only written while the message is still cached, in one script. Skipping
+/// it instead would keep the old content (and give the next event a wrong
+/// `old`) until the message expires: with a TTL of 0, for good.
 pub fn only_removes(event: &Event) -> bool {
     match event {
         Event::MessageDelete(_)
         | Event::MessageDeleteBulk(_)
         | Event::ChannelDelete(_)
         | Event::ThreadDelete(_)
-        | Event::RoleDelete(_) => true,
+        | Event::RoleDelete(_)
+        | Event::MessageUpdate(_) => true,
         // An outage marks the guild unavailable, which writes a stub.
         Event::GuildDelete(data) => data.unavailable != Some(true),
         _ => false,
@@ -327,10 +331,13 @@ impl<C: ConnectionLike> ConnectionLike for Tracked<'_, C> {
     }
 }
 
+/// Apply an event to the cache. `current` is false for a job of a previous
+/// session (see [`only_removes`]).
 async fn update_cache<C, P>(
     ctx: &WorkerContext<C, P>,
     conn: &mut C,
     event: &mut Event,
+    current: bool,
 ) -> Option<Outcome>
 where
     C: ConnectionLike + Send,
@@ -347,7 +354,13 @@ where
         now_ms: FormattedDateTime::now().unix_millis(),
     };
     let mut conn = Tracked { conn, sent: false };
-    let update = cache::update(&mut conn, event, &update_ctx);
+    let update = async {
+        if current {
+            cache::update(&mut conn, event, &update_ctx).await
+        } else {
+            cache::update_stale(&mut conn, event, &update_ctx).await
+        }
+    };
     match tokio::time::timeout(ctx.cache_timeout, update).await {
         Ok(Ok(outcome)) => {
             // Without a command Redis was not asked: dropping the permit ends
@@ -620,7 +633,7 @@ mod tests {
             (Fake::Rejected, false),
         ] {
             let ctx = half_open(conn, short);
-            let outcome = update_cache(&ctx, &mut conn, &mut message_delete()).await;
+            let outcome = update_cache(&ctx, &mut conn, &mut message_delete(), true).await;
             assert!(outcome.is_none(), "{conn:?}");
             let state = ctx.breaker.state();
             assert!(!state.probing, "{conn:?} ends the probe");
@@ -634,7 +647,7 @@ mod tests {
         // Dropped while it waits for Redis (the worker task was aborted).
         let ctx = half_open(Fake::Hang, Duration::from_secs(60));
         let (mut conn, mut event) = (Fake::Hang, message_delete());
-        let mut update = Box::pin(update_cache(&ctx, &mut conn, &mut event));
+        let mut update = Box::pin(update_cache(&ctx, &mut conn, &mut event, true));
         let pending =
             std::future::poll_fn(|cx| Poll::Ready(update.as_mut().poll(cx).is_pending())).await;
         assert!(pending);
@@ -659,7 +672,7 @@ mod tests {
         let mut ctx = half_open(Fake::Hang, Duration::from_millis(10));
         ctx.state.member = false;
         let mut conn = Fake::Hang;
-        let outcome = update_cache(&ctx, &mut conn, &mut member_update()).await;
+        let outcome = update_cache(&ctx, &mut conn, &mut member_update(), true).await;
         assert!(outcome.is_some(), "nothing to write, so it succeeds");
 
         let until = ctx.breaker.state().open_until.expect("still open");
@@ -680,7 +693,9 @@ mod tests {
         for mut event in [stickers, message_delete()] {
             let ctx = half_open(Fake::Empty, Duration::from_secs(60));
             let mut conn = Fake::Empty;
-            assert!(update_cache(&ctx, &mut conn, &mut event).await.is_some());
+            assert!(update_cache(&ctx, &mut conn, &mut event, true)
+                .await
+                .is_some());
             let state = ctx.breaker.state();
             assert!(state.open_until.is_none(), "{:?} closes it", event.kind());
         }
