@@ -5,7 +5,7 @@
 //! keys that no index referenced, so they could never be cleaned up. A batch
 //! is planned in memory first, so it is also cheap to unit test.
 
-use super::keys::plan;
+use super::keys::{plan, stored_key};
 use crate::{constants::EXPIRY_ZSET, models::ApiResult};
 
 use redis::aio::ConnectionLike;
@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 /// connection when a command has more than 1M arguments.
 pub const CHUNK: usize = 1000;
 
+/// Cache writes planned in memory and sent by [`Batch::commit`] as one
+/// transaction. Keys are logical keys (see [`super::keys`]), except for
+/// [`Batch::del_raw`]; the batch plans their stored keys, index entries and
+/// expiry entries.
 #[derive(Debug, Default)]
 pub struct Batch {
     deletes: Vec<String>,
@@ -27,10 +31,13 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// An empty batch.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Whether the batch holds no command, in which case [`Batch::commit`]
+    /// sends nothing.
     pub fn is_empty(&self) -> bool {
         self.deletes.is_empty()
             && self.unindex.is_empty()
@@ -41,6 +48,11 @@ impl Batch {
     }
 
     /// Store `value` as JSON under a logical key and index it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `value` cannot be serialized to JSON; the batch is then
+    /// left unchanged.
     pub fn set(&mut self, key: &str, value: &impl Serialize) -> ApiResult<()> {
         let json = serde_json::to_string(value)?;
         self.set_json(key, json);
@@ -71,66 +83,45 @@ impl Batch {
         self.deletes.push(key.into());
     }
 
-    /// Expire a logical key `ttl_ms` after `now_ms`. A TTL of 0 means "never".
+    /// Expire a logical key `ttl_ms` after `now_ms` (unix milliseconds). A TTL
+    /// of 0 means "never": it adds no deadline but keeps one set earlier (call
+    /// [`Batch::persist`] to drop it).
     pub fn expire(&mut self, key: &str, ttl_ms: u64, now_ms: i64) {
         if let Some(deadline) = deadline(ttl_ms, now_ms) {
-            self.expiries.push((plan(key).stored, deadline));
+            self.expiries.push((stored_key(key), deadline));
         }
     }
 
     /// Remove any pending expiry of a logical key.
     pub fn persist(&mut self, key: &str) {
-        self.unexpire.push(plan(key).stored);
+        self.unexpire.push(stored_key(key));
     }
 
     /// The commands this batch sends, in order. Deletes run before writes so a
     /// key that is cleared and re-written in one batch ends up written.
+    ///
+    /// Within one batch every delete and `persist` runs before every write and
+    /// expiry, whatever the call order: a `set` followed by a `del` of the same
+    /// key leaves it written, and an `expire` wins over a `persist`.
     pub fn commands(&self) -> Vec<Vec<String>> {
         let mut out = Vec::new();
-
-        for chunk in self.deletes.chunks(CHUNK) {
-            out.push(command("DEL", chunk.iter().cloned()));
-        }
-        for (set, members) in &self.unindex {
-            for chunk in members.chunks(CHUNK) {
-                out.push(command(
-                    "SREM",
-                    std::iter::once(set.clone()).chain(chunk.iter().cloned()),
-                ));
-            }
-        }
-        for chunk in self.unexpire.chunks(CHUNK) {
-            out.push(command(
-                "ZREM",
-                std::iter::once(EXPIRY_ZSET.to_owned()).chain(chunk.iter().cloned()),
-            ));
-        }
-        for chunk in self.writes.chunks(CHUNK) {
-            out.push(command(
-                "MSET",
-                chunk.iter().flat_map(|(k, v)| [k.clone(), v.clone()]),
-            ));
-        }
-        for (set, members) in &self.index {
-            for chunk in members.chunks(CHUNK) {
-                out.push(command(
-                    "SADD",
-                    std::iter::once(set.clone()).chain(chunk.iter().cloned()),
-                ));
-            }
-        }
-        for chunk in self.expiries.chunks(CHUNK) {
-            out.push(command(
-                "ZADD",
-                std::iter::once(EXPIRY_ZSET.to_owned())
-                    .chain(chunk.iter().flat_map(|(k, d)| [d.to_string(), k.clone()])),
-            ));
-        }
-
+        self.for_each_command(|name, args| {
+            let mut command = Vec::with_capacity(args.len() + 1);
+            command.push(name.to_owned());
+            command.extend(args.iter().map(|arg| (*arg).to_owned()));
+            out.push(command);
+        });
         out
     }
 
-    /// Send the batch as one MULTI/EXEC transaction.
+    /// Send the batch as one MULTI/EXEC transaction. An empty batch sends
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection fails or Redis returns an error. Part or all
+    /// of the batch may have been applied anyway (the connection was lost
+    /// after EXEC, or one command failed inside the transaction).
     pub async fn commit<C: ConnectionLike + Send>(self, conn: &mut C) -> ApiResult<()> {
         if self.is_empty() {
             return Ok(());
@@ -138,30 +129,77 @@ impl Batch {
 
         let mut pipe = redis::pipe();
         pipe.atomic();
-        for args in self.commands() {
-            let mut iter = args.into_iter();
-            let name = iter.next().expect("command name");
-            let cmd = pipe.cmd(&name);
-            for arg in iter {
-                cmd.arg(arg);
+        self.for_each_command(|name, args| {
+            let cmd = pipe.cmd(name);
+            for arg in args {
+                cmd.arg(*arg);
             }
             cmd.ignore();
-        }
+        });
         pipe.query_async::<()>(conn).await?;
 
         Ok(())
     }
+
+    /// Call `emit` with the name and arguments of each command, in send order.
+    /// [`Batch::commands`] and [`Batch::commit`] both use it, so what the tests
+    /// inspect is exactly what is sent.
+    fn for_each_command(&self, mut emit: impl FnMut(&str, &[&str])) {
+        for chunk in self.deletes.chunks(CHUNK) {
+            let args: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            emit("DEL", &args);
+        }
+        for (set, members) in &self.unindex {
+            for chunk in members.chunks(CHUNK) {
+                let args: Vec<&str> = std::iter::once(set.as_str())
+                    .chain(chunk.iter().map(String::as_str))
+                    .collect();
+                emit("SREM", &args);
+            }
+        }
+        for chunk in self.unexpire.chunks(CHUNK) {
+            let args: Vec<&str> = std::iter::once(EXPIRY_ZSET)
+                .chain(chunk.iter().map(String::as_str))
+                .collect();
+            emit("ZREM", &args);
+        }
+        for chunk in self.writes.chunks(CHUNK) {
+            let args: Vec<&str> = chunk
+                .iter()
+                .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+                .collect();
+            emit("MSET", &args);
+        }
+        for (set, members) in &self.index {
+            for chunk in members.chunks(CHUNK) {
+                let args: Vec<&str> = std::iter::once(set.as_str())
+                    .chain(chunk.iter().map(String::as_str))
+                    .collect();
+                emit("SADD", &args);
+            }
+        }
+        for chunk in self.expiries.chunks(CHUNK) {
+            let deadlines: Vec<String> = chunk
+                .iter()
+                .map(|(_, deadline)| deadline.to_string())
+                .collect();
+            let mut args: Vec<&str> = Vec::with_capacity(1 + 2 * chunk.len());
+            args.push(EXPIRY_ZSET);
+            for ((key, _), deadline) in chunk.iter().zip(&deadlines) {
+                args.push(deadline);
+                args.push(key);
+            }
+            emit("ZADD", &args);
+        }
+    }
 }
 
-/// The expiry deadline of a key written at `now_ms` with a TTL of `ttl_ms`,
-/// `None` for a TTL of 0 ("never"). The write that does not go through a
-/// batch (`cache::update_stale`) uses it too, so both set the same deadline.
-pub fn deadline(ttl_ms: u64, now_ms: i64) -> Option<i64> {
+/// The expiry deadline (unix milliseconds) of a key written at `now_ms` with
+/// a TTL of `ttl_ms`, `None` for a TTL of 0 ("never"). The write that does not
+/// go through a batch (`cache::update_stale`) uses it too, so both set the
+/// same deadline.
+pub(crate) fn deadline(ttl_ms: u64, now_ms: i64) -> Option<i64> {
     (ttl_ms != 0).then(|| now_ms.saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX)))
-}
-
-fn command(name: &str, args: impl Iterator<Item = String>) -> Vec<String> {
-    std::iter::once(name.to_owned()).chain(args).collect()
 }
 
 #[cfg(test)]

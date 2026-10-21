@@ -2,10 +2,12 @@
 //!
 //! The key layout and the JSON stored under each key are a contract with the
 //! consumers of the cache and are kept compatible with earlier versions (see
-//! [`crate::constants`] and [`keys`]). Each gateway event is applied with at
-//! most a few reads followed by one atomic write ([`batch::Batch`], or one
-//! script for an edit of a previous session, see [`update_stale`]). Events of
-//! one guild are applied in order by the same worker (see
+//! [`crate::constants`] and [`keys`]). Each gateway event is applied with a
+//! few reads (removing a guild or a channel also reads the message index of
+//! every removed channel and thread, and `GUILD_EMOJIS_UPDATE` reads the
+//! guild's whole key index), followed by one atomic write ([`batch::Batch`],
+//! or one script for an edit of a previous session, see [`update_stale`]).
+//! Events of one guild are applied in order by the same worker (see
 //! [`crate::gateway::worker`]), which makes the read-modify-write updates here
 //! safe.
 //!
@@ -20,7 +22,7 @@ pub mod jobs;
 pub mod keys;
 pub mod merge;
 
-use self::{batch::Batch, keys::plan};
+use self::{batch::Batch, keys::stored_key};
 use crate::{
     config::StateConfig,
     constants::{
@@ -32,14 +34,14 @@ use crate::{
 
 use redis::{aio::ConnectionLike, Script};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::{collections::HashSet, sync::LazyLock};
 use twilight_model::{
     channel::Channel,
     gateway::{
         event::Event,
         payload::incoming::{GuildCreate, MessageUpdate, Ready},
-        presence::{Presence, Status, UserOrId},
+        presence::{Status, UserOrId},
     },
     guild::{Guild, Member},
     id::{
@@ -52,20 +54,28 @@ use twilight_model::{
 /// Inputs of one cache update besides the event itself.
 #[derive(Clone, Copy, Debug)]
 pub struct UpdateContext<'a> {
+    /// What to cache (the `STATE_*` settings).
     pub state: &'a StateConfig,
+    /// The bot's own user id, `None` when it is not known. The bot's member is
+    /// cached even with `STATE_MEMBER=false` and never expires.
     pub bot_id: Option<Id<UserMarker>>,
+    /// The current time in unix milliseconds: the base of expiry deadlines
+    /// and of the recent-join check ([`joined_recently`]).
     pub now_ms: i64,
 }
 
 /// What a cache update observed.
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
-    /// The previous cached value, when `STATE_OLD` is enabled.
+    /// The previous cached value, when `STATE_OLD` is enabled. For
+    /// `GUILD_EMOJIS_UPDATE` and `MESSAGE_DELETE_BULK` it is an array of the
+    /// cached values that were found; for `GUILD_STICKERS_UPDATE` it is the
+    /// guild's previous `stickers`.
     pub old: Option<Value>,
-    /// For GUILD_CREATE / GUILD_DELETE: the guild as it was cached before.
+    /// For `GUILD_CREATE` / `GUILD_DELETE`: the guild as it was cached before.
     pub previous_guild: Option<Value>,
-    /// For GUILD_CREATE: whether the guild was already known (cached in full,
-    /// or as an unavailable stub from READY or an outage).
+    /// For `GUILD_CREATE`: whether the guild was already known (cached in
+    /// full, or as an unavailable stub from READY or an outage).
     pub guild_known: bool,
 }
 
@@ -73,7 +83,9 @@ pub struct Outcome {
 /// cached members have always carried it.
 #[derive(Serialize)]
 pub struct CachedMember<'a> {
+    /// The guild the member belongs to.
     pub guild_id: Id<GuildMarker>,
+    /// The member, serialized next to `guild_id` (flattened).
     #[serde(flatten)]
     pub member: &'a Member,
 }
@@ -81,17 +93,27 @@ pub struct CachedMember<'a> {
 // ---------------------------------------------------------------------------
 // Reads
 
-/// GET a logical key and parse it as JSON.
+/// GET a logical key and parse it as JSON. `None` when the key is not cached.
+///
+/// # Errors
+///
+/// Fails when the Redis command fails or the cached value is not JSON.
 pub async fn get<C: ConnectionLike + Send>(conn: &mut C, key: &str) -> ApiResult<Option<Value>> {
     let raw: Option<String> = redis::cmd("GET")
-        .arg(plan(key).stored)
+        .arg(stored_key(key))
         .query_async(conn)
         .await?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()
 }
 
-/// MGET logical keys (always MGET, even for one key) and parse them as JSON.
+/// MGET logical keys (always MGET, even for one key) and parse them as JSON,
+/// in the order of `keys` (`None` for a key that is not cached). No keys send
+/// no command.
+///
+/// # Errors
+///
+/// Fails when the Redis command fails or a cached value is not JSON.
 pub async fn get_all<C: ConnectionLike + Send>(
     conn: &mut C,
     keys: &[String],
@@ -99,7 +121,7 @@ pub async fn get_all<C: ConnectionLike + Send>(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let stored: Vec<String> = keys.iter().map(|key| plan(key).stored).collect();
+    let stored: Vec<String> = keys.iter().map(|key| stored_key(key)).collect();
     let raw: Vec<Option<String>> = redis::cmd("MGET").arg(stored).query_async(conn).await?;
     raw.into_iter()
         .map(|raw| {
@@ -109,13 +131,24 @@ pub async fn get_all<C: ConnectionLike + Send>(
         .collect()
 }
 
+/// The members of a set (SMEMBERS), in no particular order. `set` is used
+/// verbatim: index sets are not planned.
+///
+/// # Errors
+///
+/// Fails when the Redis command fails.
 pub async fn members<C: ConnectionLike + Send>(conn: &mut C, set: &str) -> ApiResult<Vec<String>> {
     Ok(redis::cmd("SMEMBERS").arg(set).query_async(conn).await?)
 }
 
+/// Whether a logical key is cached.
+///
+/// # Errors
+///
+/// Fails when the Redis command fails.
 pub async fn exists<C: ConnectionLike + Send>(conn: &mut C, key: &str) -> ApiResult<bool> {
     let count: u64 = redis::cmd("EXISTS")
-        .arg(plan(key).stored)
+        .arg(stored_key(key))
         .query_async(conn)
         .await?;
     Ok(count > 0)
@@ -143,8 +176,8 @@ async fn clear_channel<C: ConnectionLike + Send>(
 /// Plan the removal of a guild and everything cached under it. Returns the
 /// cached guild.
 ///
-/// Channels in `keep` are about to be written again (GUILD_CREATE), so their
-/// cached messages survive.
+/// Channels in `keep` are about to be written again (`GUILD_CREATE`), so
+/// their cached messages survive.
 async fn clear_guild<C: ConnectionLike + Send>(
     conn: &mut C,
     batch: &mut Batch,
@@ -166,12 +199,9 @@ async fn clear_guild<C: ConnectionLike + Send>(
         // without looking up its messages.
         match keys::channel_id_of(&child).and_then(Id::new_checked) {
             Some(channel_id) if keep.contains(&channel_id.get()) => {}
-            Some(channel_id) => {
-                // Stored channel keys lose their guild; re-add it so the
-                // channel is also removed from guild_keys:<guild>.
-                let logical = channel_key(Some(guild_id), channel_id);
-                clear_channel(conn, batch, &logical, channel_id.get()).await?;
-            }
+            // `guild_keys:<guild>` itself is deleted below, so the stored key
+            // is enough.
+            Some(channel_id) => clear_channel(conn, batch, &child, channel_id.get()).await?,
             None => batch.del(&child),
         }
     }
@@ -217,12 +247,13 @@ async fn clear_threads<C: ConnectionLike + Send>(
     Ok(())
 }
 
-/// How recent `joined_at` must be for a GUILD_MEMBER_ADD to count as a join.
+/// How recent `joined_at` must be for a `GUILD_MEMBER_ADD` to count as a join,
+/// in milliseconds.
 pub const RECENT_JOIN_MS: i64 = 15 * 60 * 1000;
 
-/// Whether a GUILD_MEMBER_ADD is a new join rather than a re-sent event for
+/// Whether a `GUILD_MEMBER_ADD` is a new join rather than a re-sent event for
 /// an existing member (Discord does that; the re-sent event carries the
-/// original `joined_at`).
+/// original `joined_at`). `now_ms` is in unix milliseconds.
 pub fn joined_recently(joined_at: Option<twilight_model::util::Timestamp>, now_ms: i64) -> bool {
     joined_at.is_some_and(|at| now_ms - at.as_micros() / 1000 < RECENT_JOIN_MS)
 }
@@ -245,13 +276,6 @@ fn set_member(
 
 fn wants_member(ctx: &UpdateContext<'_>, user_id: Id<UserMarker>) -> bool {
     ctx.state.member || Some(user_id) == ctx.bot_id
-}
-
-fn presence_user_id(presence: &Presence) -> Id<UserMarker> {
-    match &presence.user {
-        UserOrId::User(user) => user.id,
-        UserOrId::UserId { id } => *id,
-    }
 }
 
 fn set_channel(
@@ -279,19 +303,25 @@ fn channel_or_thread_key(guild_id: Option<Id<GuildMarker>>, channel: &Channel) -
     }
 }
 
-fn old_if(ctx: &UpdateContext<'_>, value: Option<Value>) -> Option<Value> {
+/// A copy of the previous cached value for [`Outcome::old`], only when
+/// `STATE_OLD` is enabled (so nothing is cloned otherwise).
+fn old_if(ctx: &UpdateContext<'_>, value: Option<&Value>) -> Option<Value> {
     if ctx.state.old {
-        value
+        value.cloned()
     } else {
         None
     }
 }
 
 /// Overlay `update` onto `cached`. Keys in `keep_if_null` are only copied when
-/// the update has a non-null value for them.
+/// the update has a non-null value for them. Unless both are objects the
+/// result is `update`.
 fn overlay(cached: Option<Value>, update: Value, keep_if_null: &[&str]) -> Value {
-    let (Some(Value::Object(mut cached)), Value::Object(update)) = (cached, update.clone()) else {
+    let Value::Object(update) = update else {
         return update;
+    };
+    let Some(Value::Object(mut cached)) = cached else {
+        return Value::Object(update);
     };
     for (key, value) in update {
         if value.is_null() && keep_if_null.contains(&key.as_str()) && cached.contains_key(&key) {
@@ -302,30 +332,47 @@ fn overlay(cached: Option<Value>, update: Value, keep_if_null: &[&str]) -> Value
     Value::Object(cached)
 }
 
-/// A cached message with a MESSAGE_UPDATE applied. MESSAGE_UPDATE is a full
-/// message now, but its `tts` is always false.
-fn edited_message(previous: Value, data: &MessageUpdate) -> ApiResult<Value> {
+/// Message lists that twilight leaves out when they are empty
+/// (`skip_serializing_if = "Vec::is_empty"`) and that an edit can empty.
+/// `MESSAGE_UPDATE` carries the full message, so a list it leaves out is empty
+/// now and must not keep its cached value. `reactions`, `mention_channels`
+/// and `message_snapshots` are left out the same way but keep their cached
+/// value: an edit does not reliably carry them.
+const EMPTIED_BY_EDITS: [&str; 1] = ["components"];
+
+/// A cached message with a `MESSAGE_UPDATE` applied. `MESSAGE_UPDATE` is a
+/// full message now, so every field it carries replaces the cached one, except
+/// `tts`: it is always false in an update, so the cached one is kept. The lists
+/// in `EMPTIED_BY_EDITS` that the update leaves out are dropped.
+fn edited_message(mut previous: Value, data: &MessageUpdate) -> ApiResult<Value> {
     let mut update = serde_json::to_value(&data.0)?;
     if let (Some(tts), Value::Object(object)) = (previous.get("tts"), &mut update) {
         object.insert("tts".into(), tts.clone());
+    }
+    if let (Value::Object(cached), Value::Object(object)) = (&mut previous, &update) {
+        for list in EMPTIED_BY_EDITS {
+            if !object.contains_key(list) {
+                cached.remove(list);
+            }
+        }
     }
     Ok(overlay(Some(previous), update, &[]))
 }
 
 /// A presence user that is only `{"id": ...}` must not replace a cached full user.
-fn merge_presence(cached: Option<Value>, update: Value) -> Value {
+fn merge_presence(cached: Option<Value>, mut update: Value) -> Value {
     let partial_user = update
         .get("user")
         .and_then(Value::as_object)
         .is_some_and(|user| user.len() <= 1);
-    let cached_user = cached.as_ref().and_then(|c| c.get("user")).cloned();
-    let mut merged = update;
     if partial_user {
-        if let (Some(user), Some(object)) = (cached_user, merged.as_object_mut()) {
-            object.insert("user".into(), user);
+        if let (Some(Value::Object(mut cached)), Some(object)) = (cached, update.as_object_mut()) {
+            if let Some(user) = cached.remove("user") {
+                object.insert("user".into(), user);
+            }
         }
     }
-    merged
+    update
 }
 
 // ---------------------------------------------------------------------------
@@ -333,12 +380,25 @@ fn merge_presence(cached: Option<Value>, update: Value) -> Value {
 
 /// Apply one gateway event to the cache.
 ///
-/// GUILD_CREATE's lists are moved out of `event` into their own keys, so only
-/// the guild's scalar fields are left in it afterwards.
+/// `GUILD_CREATE`'s lists that are stored under their own keys
+/// ([`merge::SPLIT_GUILD_FIELDS`]) are taken out of `event`, also when their
+/// `STATE_*` switch is off; `threads` and the guild's other fields stay in it.
 ///
-/// With the cache disabled (`STATE_ENABLED=false`) nothing is read or written.
-/// The callers skip it then too, but a new call site must not be able to
-/// write to a Redis that other services expect to be left alone.
+/// With the cache disabled (`STATE_ENABLED=false`) nothing is read or written
+/// by this function (the background jobs in [`jobs`] still run). The callers
+/// skip it then too, but a new call site must not be able to write to a Redis
+/// that other services expect to be left alone.
+///
+/// # Errors
+///
+/// Fails when a Redis command fails or a value cannot be converted to or from
+/// JSON. The reads come first, so a failure before the write leaves the cache
+/// as it was; READY, which writes several transactions, keeps those it
+/// committed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat match with one arm per event kind"
+)]
 pub async fn update<C: ConnectionLike + Send>(
     conn: &mut C,
     event: &mut Event,
@@ -438,7 +498,7 @@ pub async fn update<C: ConnectionLike + Send>(
                     .collect();
                 let previous = clear_guild(conn, &mut batch, guild.id, &keep).await?;
                 outcome.guild_known = previous.is_some();
-                outcome.old = old_if(ctx, previous.clone());
+                outcome.old = old_if(ctx, previous.as_ref());
                 outcome.previous_guild = previous;
                 write_guild(&mut batch, ctx, guild)?;
             }
@@ -446,7 +506,7 @@ pub async fn update<C: ConnectionLike + Send>(
                 let key = guild_key(guild.id);
                 let previous = get(conn, &key).await?;
                 outcome.guild_known = previous.is_some();
-                outcome.old = old_if(ctx, previous.clone());
+                outcome.old = old_if(ctx, previous.as_ref());
                 batch.set(
                     &key,
                     &merge::mark_unavailable(previous.clone(), guild.id.get()),
@@ -458,7 +518,7 @@ pub async fn update<C: ConnectionLike + Send>(
             if data.unavailable == Some(true) {
                 let key = guild_key(data.id);
                 let previous = get(conn, &key).await?;
-                outcome.old = old_if(ctx, previous.clone());
+                outcome.old = old_if(ctx, previous.as_ref());
                 batch.set(
                     &key,
                     &merge::mark_unavailable(previous.clone(), data.id.get()),
@@ -466,20 +526,20 @@ pub async fn update<C: ConnectionLike + Send>(
                 outcome.previous_guild = previous;
             } else {
                 let previous = clear_guild(conn, &mut batch, data.id, &HashSet::new()).await?;
-                outcome.old = old_if(ctx, previous.clone());
+                outcome.old = old_if(ctx, previous.as_ref());
                 outcome.previous_guild = previous;
             }
         }
         Event::UnavailableGuild(data) => {
             let key = guild_key(data.id);
             let previous = get(conn, &key).await?;
-            outcome.old = old_if(ctx, previous.clone());
+            outcome.old = old_if(ctx, previous.as_ref());
             batch.set(&key, &merge::mark_unavailable(previous, data.id.get()))?;
         }
         Event::GuildUpdate(data) => {
             let key = guild_key(data.id);
             let previous = get(conn, &key).await?;
-            outcome.old = old_if(ctx, previous.clone());
+            outcome.old = old_if(ctx, previous.as_ref());
             let merged = merge::merge_guild_update(previous, serde_json::to_value(&data.0)?);
             batch.set(&key, &merged)?;
             for role in &data.roles {
@@ -556,7 +616,7 @@ pub async fn update<C: ConnectionLike + Send>(
             if wants_member(ctx, data.user.id) {
                 let key = member_key(data.guild_id, data.user.id);
                 let previous = get(conn, &key).await?;
-                outcome.old = old_if(ctx, previous.clone());
+                outcome.old = old_if(ctx, previous.as_ref());
                 let mut update = serde_json::to_value(data.as_ref())?;
                 if previous.is_none() {
                     // Not cached: insert it, filling fields MemberUpdate lacks.
@@ -589,14 +649,16 @@ pub async fn update<C: ConnectionLike + Send>(
                 set_member(&mut batch, ctx, data.guild_id, bot)?;
             }
             if state.presence {
-                for presence in &data.presences {
-                    let key = presence_key(data.guild_id, presence_user_id(presence));
+                let guild_id = data.guild_id;
+                for presence in &mut data.presences {
+                    let key = presence_key(guild_id, presence.user.id());
                     if presence.status == Status::Offline {
                         batch.del(&key);
                     } else {
-                        let mut presence = presence.clone();
-                        presence.guild_id = data.guild_id;
-                        batch.set(&key, &presence)?;
+                        // twilight's deserializer sets it already; a chunk
+                        // built in code may not.
+                        presence.guild_id = guild_id;
+                        batch.set(&key, &*presence)?;
                     }
                 }
             }
@@ -612,7 +674,7 @@ pub async fn update<C: ConnectionLike + Send>(
             if state.message {
                 let key = message_key(data.channel_id, data.id);
                 if let Some(previous) = get(conn, &key).await? {
-                    outcome.old = old_if(ctx, Some(previous.clone()));
+                    outcome.old = old_if(ctx, Some(&previous));
                     batch.set(&key, &edited_message(previous, data)?)?;
                     batch.expire(&key, state.message_ttl, ctx.now_ms);
                 }
@@ -645,23 +707,26 @@ pub async fn update<C: ConnectionLike + Send>(
         }
         Event::PresenceUpdate(data) => {
             if state.presence {
-                let key = presence_key(data.guild_id, presence_user_id(&data.0));
-                let previous = if state.old || matches!(data.user, UserOrId::UserId { .. }) {
+                let key = presence_key(data.guild_id, data.user.id());
+                let offline = data.status == Status::Offline;
+                // The cached user only completes a partial one that is stored.
+                let partial = matches!(data.user, UserOrId::UserId { .. });
+                let previous = if state.old || (partial && !offline) {
                     get(conn, &key).await?
                 } else {
                     None
                 };
-                if data.status == Status::Offline {
+                outcome.old = old_if(ctx, previous.as_ref());
+                if offline {
                     batch.del(&key);
                 } else {
                     let update = serde_json::to_value(&data.0)?;
-                    batch.set(&key, &merge_presence(previous.clone(), update))?;
+                    batch.set(&key, &merge_presence(previous, update))?;
                 }
-                outcome.old = old_if(ctx, previous);
             }
         }
         Event::Ready(data) => {
-            ready(conn, data, ctx).await?;
+            ready(conn, data).await?;
         }
         Event::RoleCreate(data) => {
             batch.set(&role_key(data.guild_id, data.role.id), &data.role)?;
@@ -733,11 +798,16 @@ static SET_IF_CACHED: LazyLock<Script> = LazyLock::new(|| Script::new(SET_IF_CAC
 /// READY's reconcile runs in the shard runner, at the same time as the
 /// workers, and can remove a guild between the read and the write of an
 /// update. Removals bring nothing back, so they are applied by [`update`].
-/// A MESSAGE_UPDATE has to read the message to merge the edit into it, so
+/// A `MESSAGE_UPDATE` has to read the message to merge the edit into it, so
 /// its write only goes ahead if the message is still cached when it runs
 /// (`SET_IF_CACHED_SCRIPT`). It then stores what [`update`] stores (value
 /// and expiry), but never undoes a removal; `old` is only set when the edit
 /// was written, as [`update`] only sets it for a cached message.
+///
+/// # Errors
+///
+/// As [`update`]: fails when a Redis command or the script fails, or a value
+/// cannot be converted to or from JSON.
 pub async fn update_stale<C: ConnectionLike + Send>(
     conn: &mut C,
     event: &mut Event,
@@ -756,20 +826,21 @@ pub async fn update_stale<C: ConnectionLike + Send>(
     let Some(previous) = get(conn, &key).await? else {
         return Ok(outcome);
     };
-    let edited = serde_json::to_string(&edited_message(previous.clone(), data)?)?;
-    let mut invocation = SET_IF_CACHED.key(plan(&key).stored);
+    let old = old_if(ctx, Some(&previous));
+    let edited = serde_json::to_string(&edited_message(previous, data)?)?;
+    let mut invocation = SET_IF_CACHED.key(stored_key(&key));
     invocation.key(EXPIRY_ZSET).arg(edited);
     if let Some(deadline) = batch::deadline(state.message_ttl, ctx.now_ms) {
         invocation.arg(deadline);
     }
     let written: bool = invocation.invoke_async(conn).await?;
     if written {
-        outcome.old = old_if(ctx, Some(previous));
+        outcome.old = old;
     }
     Ok(outcome)
 }
 
-/// Plan all keys of an available GUILD_CREATE. The lists that are stored
+/// Plan all keys of an available `GUILD_CREATE`. The lists that are stored
 /// under their own keys are taken out of `guild`, which leaves exactly the
 /// guild blob behind (with empty lists, as consumers expect).
 fn write_guild(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &mut Guild) -> ApiResult<()> {
@@ -814,10 +885,7 @@ fn write_guild(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &mut Guild) ->
             .filter(|p| p.status != Status::Offline)
         {
             presence.guild_id = guild_id;
-            batch.set(
-                &presence_key(guild_id, presence_user_id(&presence)),
-                &presence,
-            )?;
+            batch.set(&presence_key(guild_id, presence.user.id()), &presence)?;
         }
     }
 
@@ -863,11 +931,7 @@ async fn adjust_member_count<C: ConnectionLike + Send>(
 
 /// READY: store the bot user, add stubs for guilds that are not cached yet,
 /// and drop cached guilds of this shard that READY no longer lists.
-async fn ready<C: ConnectionLike + Send>(
-    conn: &mut C,
-    data: &Ready,
-    _ctx: &UpdateContext<'_>,
-) -> ApiResult<()> {
+async fn ready<C: ConnectionLike + Send>(conn: &mut C, data: &Ready) -> ApiResult<()> {
     let mut pipe = redis::pipe();
     pipe.atomic();
     pipe.cmd("SET")
@@ -877,9 +941,7 @@ async fn ready<C: ConnectionLike + Send>(
     let guild_index = keys::type_index(GUILD_KEY);
     for guild in &data.guilds {
         let key = guild_key(guild.id);
-        let mut stub = Map::new();
-        stub.insert("id".into(), Value::String(guild.id.to_string()));
-        stub.insert("unavailable".into(), Value::Bool(true));
+        let stub = merge::mark_unavailable(None, guild.id.get());
         // NX: keep a fully cached guild until its GUILD_CREATE replaces it.
         pipe.cmd("SET")
             .arg(&key)
@@ -955,5 +1017,74 @@ mod tests {
 
         let full = json!({"user": {"id": "1", "username": "new"}, "status": "dnd"});
         assert_eq!(merge_presence(None, full.clone()), full);
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A `MESSAGE_UPDATE`, which carries the full message 1 of channel 3.
+    fn edit_of(content: &str, components: Value) -> MessageUpdate {
+        let message = json!({
+            "id": "1", "channel_id": "3", "type": 0, "content": content,
+            "author": {
+                "id": "2", "username": "author", "global_name": "AUTHOR",
+                "discriminator": "0", "avatar": null, "bot": false, "public_flags": 0,
+            },
+            "timestamp": "2024-01-01T00:00:00.000000+00:00", "edited_timestamp": null,
+            "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+            "attachments": [], "embeds": [], "pinned": false, "components": components,
+        });
+        serde_json::from_str(&message.to_string()).unwrap()
+    }
+
+    /// One action row with one button.
+    fn buttons(custom_id: &str) -> Value {
+        json!([{"type": 1, "components": [{"type": 2, "style": 1, "custom_id": custom_id}]}])
+    }
+
+    /// The `custom_id` of a message's first button, `None` without one.
+    fn button(message: &Value) -> Option<&str> {
+        message["components"][0]["components"][0]["custom_id"].as_str()
+    }
+
+    #[test]
+    fn an_edit_without_components_drops_the_cached_ones() {
+        let mut cached = serde_json::to_value(edit_of("pick", buttons("a")).0).unwrap();
+        cached["tts"] = json!(true);
+        assert_eq!(button(&cached), Some("a"));
+
+        // The update's buttons replace the cached ones.
+        let kept = edited_message(cached.clone(), &edit_of("again", buttons("b"))).unwrap();
+        assert_eq!(button(&kept), Some("b"));
+
+        // No buttons left: twilight leaves the empty list out of the update.
+        let edited = edited_message(cached, &edit_of("done", json!([]))).unwrap();
+        assert!(edited.get("components").is_none(), "{edited}");
+        assert_eq!(edited["content"], "done");
+        assert_eq!(edited["tts"], true, "an update's tts is always false");
+
+        // A message without buttons is edited without the key.
+        let plain = serde_json::to_value(edit_of("plain", json!([])).0).unwrap();
+        assert!(plain.get("components").is_none(), "{plain}");
+        let edited = edited_message(plain, &edit_of("plain!", json!([]))).unwrap();
+        assert!(edited.get("components").is_none(), "{edited}");
+    }
+
+    #[test]
+    fn overlay_onto_or_of_a_non_object_is_the_update() {
+        let object = json!({"a": 1});
+        assert_eq!(overlay(Some(json!([1])), object.clone(), &["a"]), object);
+        assert_eq!(overlay(Some(object), json!("b"), &["a"]), json!("b"));
+    }
+
+    #[test]
+    fn a_partial_presence_user_without_a_cached_one_stays_partial() {
+        let update = json!({"user": {"id": "1"}, "status": "idle"});
+        for cached in [json!({"status": "online"}), json!("online")] {
+            assert_eq!(merge_presence(Some(cached), update.clone()), update);
+        }
     }
 }
