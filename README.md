@@ -37,6 +37,19 @@ Configuration is read from environment variables (or `.env`); see
   `message_id` property (`shard:session:seq`). Each worker waits for its
   confirm before the next event, and LavinMQ confirms only after syncing its
   data directory, so the broker's disk bounds the rate per worker.
+- `WORKERS` is the setting for the publish rate: with one event in flight per
+  worker, the confirmed rate of a process grows with the number of workers.
+  Measured on a dev machine (LavinMQ 2.10 with its default disk sync, 1 KiB
+  events): about 200 events/s from one worker, 2.5k/s from 32 and 10k/s from
+  128 (about 60k/s from 32 before confirms). Raise it (up to 1024) when shards
+  log `Event queue is full; pausing the shard until it drains`. It does not
+  help one busy guild: a guild's events always use the same worker, to stay in
+  order, so a guild is capped at one worker's rate (presence updates of a
+  large guild, which the `INTENTS` of `.env.example` include, can exceed it),
+  and while its worker's queue is full the whole shard pauses. Only faster
+  confirms (the broker's disk) lift that cap. The numbers depend on the disk:
+  compare the production peak of `gateway_events` with a measurement on the
+  production broker.
 - Events of one guild are cached and published in order; a consumer that reads
   the cache after receiving an event sees that event applied.
 - Active threads are cached under `thread:<guild>:<thread>` (indexed in
