@@ -19,6 +19,8 @@ pub struct PollMedia {
 pub struct PartialPollMediaEmoji {
     #[serde(default)]
     pub animated: bool,
+    // Unicode emojis may come with an id of 0. (twilight-dispatch patch)
+    #[serde(default, with = "crate::visitor::zeroable_id")]
     pub id: Option<Id<EmojiMarker>>,
     pub name: Option<String>,
 }

@@ -20,6 +20,16 @@ twilight-dispatch:
    `application/monetization/sku_flags.rs`.
 4. `user/mod.rs`: discriminator `0` (users on the new username system) is
    serialized as `"0"`, not `"0000"`.
+5. Unicode emojis (only a name) whose id Discord sends as `0`, `"0"` or `""`,
+   or leaves out, parse with no id instead of failing the whole GUILD_CREATE /
+   CHANNEL_* / MESSAGE_CREATE (`invalid value: integer 0, expected non zero
+   u64`): `visitor.rs` `zeroable_id` also treats `"0"` and `""` as none
+   (upstream only handled the integer), and it is used for every optional
+   emoji id: `channel/forum.rs` (`ForumTag`, `DefaultReaction`),
+   `guild/invite/welcome_screen.rs`, `guild/onboarding/option.rs`,
+   `poll/media.rs`. `gateway/presence/activity_emoji.rs`: a custom status
+   emoji id may be an integer (kept as a string, as before). They are stored
+   as Discord documents a unicode emoji: `"emoji_id": null` with the name.
 
 To upgrade: copy the new release over this directory, re-apply the patches,
 and run `cargo test` in the repository root.

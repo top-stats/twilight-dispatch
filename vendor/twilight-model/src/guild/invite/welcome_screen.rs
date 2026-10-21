@@ -19,6 +19,8 @@ pub struct WelcomeScreenChannel {
     /// Description of the channel.
     pub description: String,
     /// ID of the emoji if the emoji is custom.
+    // Unicode emojis may come with an id of 0. (twilight-dispatch patch)
+    #[serde(default, with = "crate::visitor::zeroable_id")]
     pub emoji_id: Option<Id<EmojiMarker>>,
     /// Emoji's name if it is custom, or the unicode character.
     pub emoji_name: Option<String>,

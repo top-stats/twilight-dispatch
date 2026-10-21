@@ -12,6 +12,8 @@ pub struct DefaultReaction {
     /// ID of custom guild emoji.
     ///
     /// Conflicts with `emoji_name`.
+    // Unicode emojis may come with an id of 0. (twilight-dispatch patch)
+    #[serde(default, with = "crate::visitor::zeroable_id")]
     pub emoji_id: Option<Id<EmojiMarker>>,
     /// Unicode emoji character.
     ///
@@ -130,7 +132,8 @@ pub struct ForumTag {
     /// case, then the emoji ID is `None`.
     ///
     /// Conflicts with `emoji_name`.
-    #[serde(with = "crate::visitor::zeroable_id")]
+    // Also accepts a missing id. (twilight-dispatch patch)
+    #[serde(default, with = "crate::visitor::zeroable_id")]
     pub emoji_id: Option<Id<EmojiMarker>>,
     /// Unicode emoji character.
     ///

@@ -56,7 +56,7 @@ pub mod zeroable_id {
     use crate::id::Id;
     use serde::{
         Deserialize,
-        de::{Deserializer, Error as DeError, Visitor},
+        de::{Deserializer, Error as DeError, Unexpected, Visitor},
         ser::Serializer,
     };
     use std::{
@@ -97,11 +97,25 @@ pub mod zeroable_id {
         }
 
         fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+            // Discord sends snowflakes as strings, so "0" is the usual zero.
+            // (twilight-dispatch patch)
+            if v.is_empty() || v == "0" {
+                return Ok(None);
+            }
+
             Id::from_str(v).map(Some).map_err(DeError::custom)
         }
 
         fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
             Ok(Id::new_checked(v))
+        }
+
+        // (twilight-dispatch patch)
+        fn visit_i64<E: DeError>(self, v: i64) -> Result<Self::Value, E> {
+            let v = u64::try_from(v)
+                .map_err(|_| DeError::invalid_value(Unexpected::Signed(v), &self))?;
+
+            self.visit_u64(v)
         }
 
         fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {

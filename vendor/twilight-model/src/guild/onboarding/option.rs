@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct OnboardingPromptEmoji {
     pub name: Option<String>,
+    // Unicode emojis may come with an id of 0. (twilight-dispatch patch)
+    #[serde(default, with = "crate::visitor::zeroable_id")]
     pub id: Option<Id<EmojiMarker>>,
     #[serde(default)]
     pub animated: bool,
