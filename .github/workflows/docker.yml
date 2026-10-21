@@ -18,8 +18,55 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Runs on GitHub-hosted runners so pull requests (including ones from forks
-  # of this public repository) never execute on the self-hosted runner.
+  # fmt, clippy, test and coverage run on GitHub-hosted runners so pull
+  # requests (including ones from forks of this public repository) never
+  # execute on the self-hosted runner. They are separate jobs so that one
+  # failing check does not hide the result of the others.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Same toolchain as rust-toolchain.toml and the Docker image.
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Broken intra-doc links and other rustdoc warnings.
+      - name: Docs
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -55,12 +102,6 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Wait for Redis and LavinMQ
         run: |
@@ -162,7 +203,7 @@ jobs:
           path: lcov.info
 
   build-and-push:
-    needs: test
+    needs: [fmt, clippy, test]
     # Only pushes publish an image; pull requests stop after the tests.
     if: github.event_name == 'push'
     runs-on: self-hosted

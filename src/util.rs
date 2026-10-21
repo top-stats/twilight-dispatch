@@ -1,4 +1,7 @@
+//! Small helpers shared by the modules.
+
 use std::{
+    fmt,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -48,6 +51,61 @@ impl Throttle {
 impl Default for Throttle {
     fn default() -> Self {
         Self::new(Duration::from_secs(5))
+    }
+}
+
+/// Displays an error followed by its chain of sources, `outer: inner:
+/// innermost`, for logging errors (such as twilight's) whose `Display` leaves
+/// the cause out.
+#[derive(Clone, Copy, Debug)]
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(err) = source {
+            write!(f, ": {err}")?;
+            source = err.source();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::ErrorChain;
+    use std::{error::Error, fmt};
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl fmt::Display for Layer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl Error for Layer {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.1.as_deref().map(|inner| inner as &(dyn Error + 'static))
+        }
+    }
+
+    #[test]
+    fn every_source_is_shown_outermost_first() {
+        let innermost = Layer("connection refused", None);
+        let inner = Layer("failed to connect", Some(Box::new(innermost)));
+        let outer = Layer("failed to reconnect to the gateway", Some(Box::new(inner)));
+        assert_eq!(
+            ErrorChain(&outer).to_string(),
+            "failed to reconnect to the gateway: failed to connect: connection refused"
+        );
+        assert_eq!(
+            ErrorChain(&Layer("alone", None)).to_string(),
+            "alone",
+            "an error without a source is shown as is"
+        );
     }
 }
 

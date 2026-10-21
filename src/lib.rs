@@ -18,6 +18,10 @@
         clippy::unwrap_used
     )
 )]
+#![allow(
+    clippy::must_use_candidate,
+    reason = "callers use the results; #[must_use] on every pure function is noise"
+)]
 
 pub mod amqp;
 pub mod app;
