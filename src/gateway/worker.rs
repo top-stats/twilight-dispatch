@@ -139,9 +139,9 @@ impl Breaker {
 }
 
 /// An update the breaker let through. Dropping it ends a probe however the
-/// update ended (an error that says nothing about the connection, or the
-/// update being cancelled), so the next update probes again instead of the
-/// breaker skipping every update from then on.
+/// update ended (an error that says nothing about the connection, an update
+/// that sent nothing, or the update being cancelled), so the next update
+/// probes again instead of the breaker skipping every update from then on.
 #[must_use]
 pub struct Permit<'a> {
     breaker: &'a Breaker,
@@ -292,6 +292,41 @@ fn is_connection_error(err: &ApiError) -> bool {
     }
 }
 
+/// The worker's connection, recording whether an update sent anything.
+///
+/// An update with nothing to write (a member update with STATE_MEMBER off)
+/// succeeds without asking Redis, so it says nothing about whether Redis
+/// answers. Were it a probe that closed the breaker, every worker would wait
+/// for the timeout of a Redis that is still stalled.
+struct Tracked<'c, C> {
+    conn: &'c mut C,
+    sent: bool,
+}
+
+impl<C: ConnectionLike> ConnectionLike for Tracked<'_, C> {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        self.sent = true;
+        self.conn.req_packed_command(cmd)
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        self.sent = true;
+        self.conn.req_packed_commands(pipeline, offset, count)
+    }
+
+    fn get_db(&self) -> i64 {
+        self.conn.get_db()
+    }
+}
+
 async fn update_cache<C, P>(
     ctx: &WorkerContext<C, P>,
     conn: &mut C,
@@ -311,9 +346,15 @@ where
         bot_id: Some(ctx.bot_id),
         now_ms: FormattedDateTime::now().unix_millis(),
     };
-    match tokio::time::timeout(ctx.cache_timeout, cache::update(conn, event, &update_ctx)).await {
+    let mut conn = Tracked { conn, sent: false };
+    let update = cache::update(&mut conn, event, &update_ctx);
+    match tokio::time::timeout(ctx.cache_timeout, update).await {
         Ok(Ok(outcome)) => {
-            permit.success();
+            // Without a command Redis was not asked: dropping the permit ends
+            // a probe without a verdict, and the next update probes.
+            if conn.sent {
+                permit.success();
+            }
             Some(outcome)
         }
         Ok(Err(err)) => {
@@ -476,7 +517,7 @@ mod tests {
         assert!(!breaker.state().probing, "and ends");
     }
 
-    /// A Redis connection that fails every command in one way.
+    /// A Redis connection that answers every command in one way.
     #[derive(Clone, Copy, Debug)]
     enum Fake {
         /// Never answers, like a stalled or paused Redis.
@@ -484,16 +525,23 @@ mod tests {
         BrokenPipe,
         /// An error about the command, not the connection (like WRONGTYPE).
         Rejected,
+        /// Nil, as for a key that is not cached.
+        Empty,
     }
 
     impl Fake {
-        fn reply<'a, T: Send + 'a>(self) -> redis::RedisFuture<'a, T> {
+        fn reply<'a, T: Send + 'a>(self, empty: T) -> redis::RedisFuture<'a, T> {
             Box::pin(async move {
-                Err(match self {
+                match self {
                     Self::Hang => std::future::pending().await,
-                    Self::BrokenPipe => std::io::Error::from(std::io::ErrorKind::BrokenPipe).into(),
-                    Self::Rejected => (redis::ErrorKind::UnexpectedReturnType, "WRONGTYPE").into(),
-                })
+                    Self::BrokenPipe => {
+                        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+                    }
+                    Self::Rejected => {
+                        Err((redis::ErrorKind::UnexpectedReturnType, "WRONGTYPE").into())
+                    }
+                    Self::Empty => Ok(empty),
+                }
             })
         }
     }
@@ -503,16 +551,16 @@ mod tests {
             &'a mut self,
             _cmd: &'a redis::Cmd,
         ) -> redis::RedisFuture<'a, redis::Value> {
-            self.reply()
+            self.reply(redis::Value::Nil)
         }
 
         fn req_packed_commands<'a>(
             &'a mut self,
             _pipeline: &'a redis::Pipeline,
             _offset: usize,
-            _count: usize,
+            count: usize,
         ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
-            self.reply()
+            self.reply(vec![redis::Value::Nil; count])
         }
 
         fn get_db(&self) -> i64 {
@@ -589,6 +637,49 @@ mod tests {
         assert!(!ctx.breaker.allow(), "the update is the probe");
         drop(update);
         assert!(ctx.breaker.allow(), "dropping it ends the probe");
+    }
+
+    /// A member update of another user, which writes nothing with
+    /// STATE_MEMBER off.
+    fn member_update() -> Event {
+        let data = serde_json::json!({
+            "guild_id": "1",
+            "roles": [],
+            "user": {"id": "20", "username": "user", "discriminator": "0", "avatar": null},
+        });
+        Event::MemberUpdate(Box::new(serde_json::from_value(data).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_sends_nothing_leaves_the_breaker_open() {
+        let mut ctx = half_open(Fake::Hang, Duration::from_millis(10));
+        ctx.state.member = false;
+        let mut conn = Fake::Hang;
+        let outcome = update_cache(&ctx, &mut conn, &mut member_update()).await;
+        assert!(outcome.is_some(), "nothing to write, so it succeeds");
+
+        let until = ctx.breaker.state().open_until.expect("still open");
+        assert!(!ctx.breaker.state().probing, "the probe ended");
+        let _probe = ctx
+            .breaker
+            .permit_at(until)
+            .expect("the next update probes");
+        assert!(ctx.breaker.permit_at(until).is_none(), "the others skip");
+    }
+
+    /// Any answer closes the breaker: a sticker update of a guild that is not
+    /// cached only reads the guild, a message delete only writes.
+    #[tokio::test]
+    async fn a_probe_that_reaches_redis_closes_the_breaker() {
+        let stickers = serde_json::json!({"guild_id": "1", "stickers": []});
+        let stickers = Event::GuildStickersUpdate(serde_json::from_value(stickers).unwrap());
+        for mut event in [stickers, message_delete()] {
+            let ctx = half_open(Fake::Empty, Duration::from_secs(60));
+            let mut conn = Fake::Empty;
+            assert!(update_cache(&ctx, &mut conn, &mut event).await.is_some());
+            let state = ctx.breaker.state();
+            assert!(state.open_until.is_none(), "{:?} closes it", event.kind());
+        }
     }
 
     #[test]
