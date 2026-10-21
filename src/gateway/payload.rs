@@ -11,42 +11,67 @@ use std::borrow::Cow;
 /// The outer fields of a gateway payload.
 #[derive(Debug, Deserialize)]
 pub struct Envelope<'a> {
+    /// Gateway opcode (`0` for a dispatch).
     pub op: u8,
+    /// Sequence number; only dispatches carry one. `None` when absent or `null`.
     #[serde(default)]
     pub s: Option<u64>,
+    /// Dispatch event name, such as `MESSAGE_CREATE`; `None` for other opcodes.
+    /// Borrowed from the payload unless it contains escapes.
     #[serde(borrow, default)]
     pub t: Option<Cow<'a, str>>,
+    /// The event data, unparsed and borrowed from the payload. `None` when `d`
+    /// is absent or `null`.
     #[serde(borrow, default)]
     pub d: Option<&'a RawValue>,
 }
 
 impl<'a> Envelope<'a> {
+    /// Parse the envelope of a raw gateway payload, borrowing from `json`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `json` is not valid JSON, is not an object with an `op` that
+    /// fits a `u8`, or has an `s` or `t` of the wrong type.
     pub fn parse(json: &'a str) -> serde_json::Result<Self> {
         serde_json::from_str(json)
     }
 
+    /// The dispatch event name (`t`), if any.
     pub fn kind(&self) -> Option<&str> {
         self.t.as_deref()
     }
 }
 
-/// What orders a payload relative to others.
+/// What orders a payload relative to others: payloads with the same route are
+/// processed by the same worker, in gateway order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Route {
+    /// An event of the guild with this id.
     Guild(u64),
+    /// An event that names a channel but no guild (usually a DM channel), by
+    /// channel id.
     Channel(u64),
+    /// Neither a guild nor a channel (such as `USER_UPDATE`, or a `d` without
+    /// either id); always processed by worker 0.
     Unrouted,
 }
 
 impl Route {
     /// The worker that processes this payload. Every payload of one guild (or
     /// one DM channel) goes to the same worker, so they stay in order.
+    ///
+    /// `workers` is the number of workers (0 counts as 1); the result is below
+    /// `workers.max(1)`.
     pub fn worker(self, workers: usize) -> usize {
         let workers = workers.max(1) as u64;
         match self {
             // The low bits of a snowflake are a per-process increment that is
             // usually 0, so `id % workers` would load a few workers only.
-            Self::Guild(id) | Self::Channel(id) => (mix(id) % workers) as usize,
+            Self::Guild(id) | Self::Channel(id) => {
+                // Below `workers`, which came from a usize, so it always fits.
+                usize::try_from(mix(id) % workers).unwrap_or(0)
+            }
             Self::Unrouted => 0,
         }
     }
@@ -61,6 +86,7 @@ const fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// The top-level ids of a dispatch's `d` that decide its [`Route`].
 #[derive(Deserialize)]
 struct Hint<'a> {
     #[serde(borrow, default)]
@@ -102,24 +128,37 @@ pub fn route(kind: Option<&str>, d: Option<&RawValue>) -> Route {
     }
 }
 
+/// The published message. The field order is part of the format.
 #[derive(Serialize)]
 struct Outgoing<'a> {
     op: u8,
     t: Option<&'a str>,
-    d: &'a RawValue,
+    /// Written byte for byte when present, as `null` when not.
+    d: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     old: Option<&'a Value>,
 }
 
-/// Build the message published to the broker.
+/// Build the message published to the broker: `{"op", "t", "d", "old"?}`, with
+/// `d` copied verbatim from the envelope (`null` when it has none) and `old`
+/// (the cached object an update replaced) only when given.
+///
+/// # Errors
+///
+/// Returns the serializer's error. Serializing these types into memory does
+/// not fail in practice.
 pub fn outgoing(envelope: &Envelope<'_>, old: Option<&Value>) -> serde_json::Result<Vec<u8>> {
-    let null = RawValue::from_string("null".to_owned())?;
-    serde_json::to_vec(&Outgoing {
+    let message = Outgoing {
         op: envelope.op,
         t: envelope.kind(),
-        d: envelope.d.unwrap_or(&null),
+        d: envelope.d,
         old,
-    })
+    };
+    // Room for `d` and the envelope, so a large payload is not copied each
+    // time the buffer would double.
+    let mut bytes = Vec::with_capacity(envelope.d.map_or(0, |d| d.get().len()) + 64);
+    serde_json::to_writer(&mut bytes, &message)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -352,5 +391,48 @@ mod tests {
         let env = Envelope::parse(r#"{"op":0,"t":"X","s":1}"#).unwrap();
         let value: Value = serde_json::from_slice(&outgoing(&env, None).unwrap()).unwrap();
         assert_eq!(value, json!({"op": 0, "t": "X", "d": null}));
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// What `outgoing` publishes for the raw payload `raw`.
+    fn published(raw: &str, old: Option<&Value>) -> String {
+        let envelope = Envelope::parse(raw).unwrap();
+        String::from_utf8(outgoing(&envelope, old).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_missing_or_null_d_is_published_as_null() {
+        let null = r#"{"op":0,"t":"X","s":1,"d":null}"#;
+        let missing = r#"{"op":0,"t":"X","s":1}"#;
+        let expected = r#"{"op":0,"t":"X","d":null}"#;
+        assert_eq!(published(null, None), expected);
+        assert_eq!(published(missing, None), expected);
+
+        let old = json!({"id": "5"});
+        let with_old = r#"{"op":0,"t":"X","d":null,"old":{"id":"5"}}"#;
+        assert_eq!(published(null, Some(&old)), with_old);
+
+        let ack = r#"{"op":11,"t":null,"d":null}"#;
+        assert_eq!(published(r#"{"op":11}"#, None), ack);
+    }
+
+    #[test]
+    fn a_large_d_is_copied_verbatim_into_a_presized_buffer() {
+        let d = format!(r#"{{"id":"1", "content":"{}"}}"#, "x".repeat(100_000));
+        let raw = format!(r#"{{"t":"MESSAGE_CREATE","s":2,"op":0,"d":{d}}}"#);
+        let envelope = Envelope::parse(&raw).unwrap();
+        let bytes = outgoing(&envelope, None).unwrap();
+
+        let expected = format!(r#"{{"op":0,"t":"MESSAGE_CREATE","d":{d}}}"#);
+        assert!(bytes == expected.as_bytes(), "d was not copied verbatim");
+        // Room for `d` is reserved up front. A buffer that grew by doubling
+        // would end up with about twice the length.
+        let (len, capacity) = (bytes.len(), bytes.capacity());
+        assert!(capacity < len + 128, "{capacity} for {len} bytes");
     }
 }

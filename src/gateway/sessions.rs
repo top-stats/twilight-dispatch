@@ -3,12 +3,14 @@
 //! Sessions are stored per shard (`gateway_session:<shard>`), so processes that
 //! run different shard ranges no longer overwrite each other. The legacy
 //! `gateway_sessions` blob written by older versions is still read as a
-//! fallback, so an upgrade resumes the running sessions.
+//! fallback, so an upgrade resumes the running sessions. `gateway_statuses` is
+//! one list that every process merges its own shards into.
 
 use super::registry::Registry;
 use crate::{
     constants::{session_key, CACHE_JOB_INTERVAL_MS, SESSIONS_KEY, STATUSES_KEY},
     models::{ApiResult, FormattedDateTime, SessionInfo, StatusInfo},
+    util::Throttle,
 };
 
 use redis::aio::ConnectionLike;
@@ -26,6 +28,16 @@ pub fn parse_legacy(json: &str) -> HashMap<u32, SessionInfo> {
 }
 
 /// Load saved sessions for `shards`; per-shard keys win over the legacy blob.
+///
+/// A per-shard key wins only when it holds a resumable session: one that is
+/// missing, unparseable or not resumable leaves the legacy entry in place.
+/// Sessions of other shards in the legacy blob are not returned.
+///
+/// # Errors
+///
+/// Fails when Redis does not answer the `MGET` of the per-shard keys. A legacy
+/// blob that cannot be read is ignored, and with no `shards` Redis is not
+/// queried at all.
 pub async fn load<C: ConnectionLike + Send>(
     conn: &mut C,
     shards: impl IntoIterator<Item = u32>,
@@ -91,37 +103,42 @@ static MERGE: std::sync::LazyLock<redis::Script> =
 
 /// Write the sessions of every shard: resumable ones are stored, the keys of
 /// shards without one are removed. Returns how many sessions were stored.
+///
+/// # Errors
+///
+/// Fails when Redis rejects or does not answer the per-shard writes or the
+/// merge into the legacy blob; the per-shard keys may be written already when
+/// only the merge failed. With no shards Redis is not queried at all.
 pub async fn save<C: ConnectionLike + Send>(conn: &mut C, registry: &Registry) -> ApiResult<usize> {
+    if registry.is_empty() {
+        return Ok(0);
+    }
     let mut pipe = redis::pipe();
     let mut merge = MERGE.key(SESSIONS_KEY);
     let mut count = 0;
     for handle in registry.handles() {
-        match handle.session_info() {
-            Some(session) => {
-                let json = serde_json::to_string(&session)?;
-                pipe.cmd("SET")
-                    .arg(session_key(handle.id))
-                    .arg(&json)
-                    .arg("EX")
-                    .arg(SESSION_TTL_SECS)
-                    .ignore();
-                merge.arg(handle.id.to_string()).arg(json);
-                count += 1;
-            }
-            None => {
-                pipe.cmd("DEL").arg(session_key(handle.id)).ignore();
-                merge.arg(handle.id.to_string()).arg("");
-            }
+        if let Some(session) = handle.session_info() {
+            let json = serde_json::to_string(&session)?;
+            pipe.cmd("SET")
+                .arg(session_key(handle.id))
+                .arg(&json)
+                .arg("EX")
+                .arg(SESSION_TTL_SECS)
+                .ignore();
+            merge.arg(handle.id.to_string()).arg(json);
+            count += 1;
+        } else {
+            pipe.cmd("DEL").arg(session_key(handle.id)).ignore();
+            merge.arg(handle.id.to_string()).arg("");
         }
-    }
-    if registry.is_empty() {
-        return Ok(0);
     }
     pipe.query_async::<()>(conn).await?;
     merge.invoke_async::<()>(conn).await?;
     Ok(count)
 }
 
+/// The `gateway_statuses` entries of this process' shards, sorted by shard,
+/// with `last_ack` as of now.
 pub fn statuses(registry: &Registry) -> Vec<StatusInfo> {
     let now = FormattedDateTime::now();
     let mut statuses: Vec<StatusInfo> = registry.handles().map(|h| h.status_info(now)).collect();
@@ -129,24 +146,55 @@ pub fn statuses(registry: &Registry) -> Vec<StatusInfo> {
     statuses
 }
 
-/// Every second: write `gateway_statuses` and the shards' sessions.
+/// Merge this process' shards into `gateway_statuses`, keeping the entries of
+/// the shards it does not run (those of other processes), sorted by shard. A
+/// stored value that is missing, unreadable or not a status list is replaced
+/// by this process' shards alone.
+async fn write_statuses<C: ConnectionLike + Send>(
+    conn: &mut C,
+    registry: &Registry,
+) -> ApiResult<()> {
+    let stored: Option<String> = redis::cmd("GET")
+        .arg(STATUSES_KEY)
+        .query_async(conn)
+        .await
+        .unwrap_or_default();
+    let mut merged = stored
+        .and_then(|json| serde_json::from_str::<Vec<StatusInfo>>(&json).ok())
+        .unwrap_or_default();
+    merged.retain(|status| registry.get(status.shard).is_none());
+    merged.extend(statuses(registry));
+    merged.sort_by_key(|status| status.shard);
+    redis::cmd("SET")
+        .arg(STATUSES_KEY)
+        .arg(serde_json::to_string(&merged)?)
+        .query_async::<()>(conn)
+        .await?;
+    Ok(())
+}
+
+/// Every second (`CACHE_JOB_INTERVAL_MS`): merge this process' shards into
+/// `gateway_statuses` and save the shards' sessions (see [`save`]). Failures
+/// are logged, each kind at most once per 5 s, and the job carries on.
 pub async fn run_job<C: ConnectionLike + Send>(mut conn: C, registry: Arc<Registry>) {
+    let statuses_errors = Throttle::default();
+    let sessions_errors = Throttle::default();
     loop {
-        match serde_json::to_string(&statuses(&registry)) {
-            Ok(json) => {
-                if let Err(err) = redis::cmd("SET")
-                    .arg(STATUSES_KEY)
-                    .arg(json)
-                    .query_async::<()>(&mut conn)
-                    .await
-                {
-                    warn!("Failed to dump gateway statuses: {}", err);
-                }
+        if let Err(err) = write_statuses(&mut conn, &registry).await {
+            if let Some(suppressed) = statuses_errors.check() {
+                warn!(
+                    "Failed to dump gateway statuses: {} ({} similar suppressed)",
+                    err, suppressed
+                );
             }
-            Err(err) => warn!("Failed to serialize gateway statuses: {}", err),
         }
         if let Err(err) = save(&mut conn, &registry).await {
-            warn!("Failed to dump gateway sessions: {}", err);
+            if let Some(suppressed) = sessions_errors.check() {
+                warn!(
+                    "Failed to dump gateway sessions: {} ({} similar suppressed)",
+                    err, suppressed
+                );
+            }
         }
         tokio::time::sleep(Duration::from_millis(CACHE_JOB_INTERVAL_MS)).await;
     }
