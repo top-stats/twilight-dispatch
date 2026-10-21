@@ -1,3 +1,20 @@
+//! The twilight-dispatch service (see the README), and `twilight-dispatch
+//! healthcheck`, the Docker HEALTHCHECK command.
+
+#![forbid(unsafe_code)]
+#![warn(
+    missing_docs,
+    rust_2018_idioms,
+    clippy::pedantic,
+    clippy::allow_attributes_without_reason,
+    clippy::dbg_macro,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unwrap_used
+)]
+
 use std::process::ExitCode;
 use tracing::{error, warn};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};

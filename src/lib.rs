@@ -1,5 +1,24 @@
 //! Discord gateway to AMQP bridge with a Redis state cache.
 
+#![forbid(unsafe_code)]
+// Lints for the service code. Test code (the unit test modules and tests/)
+// keeps the default set.
+#![cfg_attr(
+    not(test),
+    warn(
+        missing_docs,
+        rust_2018_idioms,
+        clippy::pedantic,
+        clippy::allow_attributes_without_reason,
+        clippy::dbg_macro,
+        clippy::print_stderr,
+        clippy::print_stdout,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod amqp;
 pub mod app;
 pub mod cache;

@@ -77,6 +77,90 @@ jobs:
       - name: Test
         run: cargo test --locked --no-fail-fast
 
+  # Line coverage of the service code (src/; not tests/ or vendor/), with the
+  # lines no test runs listed in the log.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+      lavinmq:
+        image: cloudamqp/lavinmq:2.10.1
+        ports:
+          - 5672:5672
+          - 15672:15672
+
+    env:
+      CARGO_TERM_COLOR: always
+      REQUIRE_SERVICES: '1'
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
+      TEST_AMQP_HTTP: 127.0.0.1:15672
+      IGNORE_FILES: '/(vendor|tests)/'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for Redis and LavinMQ
+        run: |
+          for port in 6379 5672 15672; do
+            for _ in $(seq 1 60); do
+              if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null || { echo "port $port is not reachable"; exit 1; }
+          done
+
+      - name: Test with coverage
+        run: cargo llvm-cov --no-report --locked --no-fail-fast
+
+      - name: Coverage report
+        if: ${{ !cancelled() }}
+        run: |
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_FILES" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_FILES" --summary-only | tee summary.txt
+          { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Lines no test runs:"
+          awk -F'[:,]' '
+            function flush() {
+              if (start >= 0) out = out " " (start == prev ? start : start "-" prev)
+              start = prev = -1
+            }
+            /^SF:/ { file = substr($0, 4); sub(/.*\/src\//, "src/", file); out = ""; start = prev = -1 }
+            /^DA:/ && $3 == 0 {
+              line = $2 + 0
+              if (line == prev + 1) { prev = line } else { flush(); start = prev = line }
+            }
+            /^end_of_record/ { flush(); if (out != "") print file ":" out }
+          ' lcov.info | sort
+
+      - name: Upload lcov.info
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
   build-and-push:
     needs: test
     # Only pushes publish an image; pull requests stop after the tests.
