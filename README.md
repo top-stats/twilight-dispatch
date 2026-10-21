@@ -27,6 +27,16 @@ Configuration is read from environment variables (or `.env`); see
   `stop_grace_period: 30s` in Swarm / Compose (Docker's default is 10s).
 - Redis and the broker are reconnected automatically; while Redis is down
   events are still published (without cache updates or `old`).
+- An event counts as published once the broker confirmed it (publisher
+  confirms); only then may the saved resume point pass it. An event the
+  broker nacked, did not confirm within 5 s, or whose connection dropped
+  first is retried and, failing that, replayed by Discord on the next
+  resume. Delivery is at-least-once: when the connection drops after the
+  broker stored an event but before its confirm arrived, the event is
+  published again (as after a restart), so consumers should dedupe by the
+  `message_id` property (`shard:session:seq`). Each worker waits for its
+  confirm before the next event, and LavinMQ confirms only after syncing its
+  data directory, so the broker's disk bounds the rate per worker.
 - Events of one guild are cached and published in order; a consumer that reads
   the cache after receiving an event sees that event applied.
 - Active threads are cached under `thread:<guild>:<thread>` (indexed in

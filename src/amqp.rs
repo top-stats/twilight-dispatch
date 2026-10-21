@@ -12,6 +12,13 @@
 //! [`OUTAGE_BUDGET`] per outage (not per message); after that publishes fail
 //! immediately until the broker is back, so an outage cannot stall the
 //! workers (and with them the shards).
+//!
+//! A publish succeeds only once the broker confirmed it (publisher
+//! confirms): the worker then lets the resume point pass the event, so a
+//! message that was only written to the socket would be lost with the
+//! connection or a broker crash. A confirm that is lost with the connection
+//! makes the publish retry a message the broker already has, so consumers
+//! can get an event twice (at-least-once; they dedupe by `message_id`).
 
 use crate::{
     constants::{EXCHANGE, QUEUE_RECV, QUEUE_SEND, SHARD_EXCHANGE},
@@ -21,17 +28,19 @@ use crate::{
 
 use lapin::{
     options::{
-        BasicPublishOptions, BasicQosOptions, ExchangeDeclareOptions, QueueBindOptions,
-        QueueDeclareOptions,
+        BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions, ExchangeDeclareOptions,
+        QueueBindOptions, QueueDeclareOptions,
     },
     types::FieldTable,
-    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
 };
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, PoisonError,
     },
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::sync::{watch, Notify};
@@ -41,7 +50,8 @@ use tracing::{info, warn};
 pub const OUTAGE_BUDGET: Duration = Duration::from_secs(20);
 /// Time limit for connecting (TCP + AMQP handshake + topology).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Time limit for handing one message to the connection.
+/// Time limit for one publish attempt: writing the message and waiting for
+/// the broker's confirm.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Attempts per message; a message the broker keeps rejecting is dropped.
 pub const PUBLISH_ATTEMPTS: u32 = 3;
@@ -56,7 +66,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct Link {
     pub generation: u64,
     connection: Arc<Connection>,
+    /// In confirm mode.
     publish: Channel,
+    /// Held while a publish is queued on `publish`, see [`Amqp::publish`].
+    publishing: Arc<StdMutex<()>>,
     consume: Channel,
 }
 
@@ -162,6 +175,9 @@ impl Amqp {
             )
             .await?;
             let publish = connection.create_channel().await?;
+            publish
+                .confirm_select(ConfirmSelectOptions::default())
+                .await?;
             let consume = connection.create_channel().await?;
             // gateway.send is declared by the consumer, so publishing does not
             // depend on it.
@@ -170,6 +186,7 @@ impl Amqp {
                 generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
                 connection: Arc::new(connection),
                 publish,
+                publishing: Arc::default(),
                 consume,
             })
         };
@@ -210,8 +227,9 @@ impl Amqp {
         link
     }
 
-    /// Publish to the gateway exchange. Waits for a reconnect within the
-    /// outage budget and tries a message at most [`PUBLISH_ATTEMPTS`] times.
+    /// Publish to the gateway exchange and wait for the broker's confirm.
+    /// Waits for a reconnect within the outage budget and tries a message at
+    /// most [`PUBLISH_ATTEMPTS`] times.
     pub async fn publish(
         &self,
         routing_key: &str,
@@ -227,19 +245,55 @@ impl Amqp {
             let Some(link) = self.healthy_link().await else {
                 break;
             };
-            let sent = tokio::time::timeout(
-                PUBLISH_TIMEOUT,
-                link.publish.basic_publish(
+            let attempt = async {
+                let write = link.publish.basic_publish(
                     EXCHANGE.into(),
                     routing_key.into(),
                     BasicPublishOptions::default(),
                     payload,
                     properties.clone(),
-                ),
-            )
-            .await;
-            match sent {
-                Ok(Ok(_confirm)) => return Ok(()),
+                );
+                let mut write = std::pin::pin!(write);
+                // The broker confirms messages by their position on the
+                // channel. In its first poll lapin gives a publish its
+                // position and then queues its frames: two workers on
+                // different threads could be queued the other way round, and
+                // each would get the other's confirm (a nack failing the
+                // wrong event, the nacked one counting as stored). So that
+                // poll is taken one publish at a time (tests/confirms.rs
+                // catches a lapin that queues later). The write and the
+                // confirm are awaited without the lock, so the publishes of
+                // the workers still overlap (holding it until the frames are
+                // written serializes the writes, at a fifth of the rate).
+                let queued = std::future::poll_fn(|cx| {
+                    let _queueing = link
+                        .publishing
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    Poll::Ready(write.as_mut().poll(cx))
+                })
+                .await;
+                let confirm = match queued {
+                    Poll::Ready(written) => written?,
+                    Poll::Pending => write.await?,
+                };
+                confirm.await
+            };
+            match tokio::time::timeout(PUBLISH_TIMEOUT, attempt).await {
+                Ok(Ok(Confirmation::Ack(_))) => return Ok(()),
+                // The broker could not take this message (e.g. a full queue
+                // that rejects publishes). That says nothing about the link,
+                // and dropping it would fail the other workers' events too.
+                Ok(Ok(Confirmation::Nack(_))) => {
+                    last_error = "the AMQP broker rejected the message".into();
+                    continue;
+                }
+                // Only a channel that is not in confirm mode answers this.
+                Ok(Ok(Confirmation::NotRequested)) => {
+                    last_error = "the AMQP channel does not confirm publishes".into();
+                }
+                // Also a connection that dropped before the confirm arrived:
+                // the broker may have the message, which is then sent twice.
                 Ok(Err(err)) => last_error = err.into(),
                 Err(_) => last_error = "timed out publishing to the AMQP broker".into(),
             }

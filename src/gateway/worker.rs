@@ -442,7 +442,7 @@ fn log_guild_changes<C, P>(ctx: &WorkerContext<C, P>, event: &Event, outcome: Op
     }
 }
 
-/// Publish a payload. Returns false only when the broker did not take it
+/// Publish a payload. Returns false only when the broker did not confirm it
 /// (payloads that cannot be published at all are logged and skipped).
 async fn publish<C, P>(
     ctx: &WorkerContext<C, P>,
