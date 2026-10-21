@@ -1,9 +1,9 @@
 //! Representations of activity linked or textual buttons.
 
 use serde::{
+    Deserialize, Serialize,
     de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
-    Deserialize, Serialize,
 };
 use std::fmt::{Formatter, Result as FmtResult};
 
@@ -71,6 +71,7 @@ impl ActivityButton {
     }
 
     /// Retrieve an immutable reference to the label.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn label(&self) -> Option<&str> {
         match self {
             Self::Link(link) => Some(&link.label),
@@ -81,6 +82,7 @@ impl ActivityButton {
 
     /// Retrieve an immutable reference to the URL if this is a link activity
     /// button.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn url(&self) -> Option<&str> {
         if let Self::Link(link) = self {
             Some(&link.url)
@@ -120,25 +122,12 @@ impl<'de> Visitor<'de> for ActivityButtonVisitor {
         let mut label = None;
         let mut url = None;
 
-        let span = tracing::trace_span!("deserializing activity button");
-        let _span_enter = span.enter();
-
         loop {
-            let span_child = tracing::trace_span!("iterating over element");
-            let _span_child_enter = span_child.enter();
-
             let key = match map.next_key() {
-                Ok(Some(key)) => {
-                    tracing::trace!(?key, "found key");
-
-                    key
-                }
+                Ok(Some(key)) => key,
                 Ok(None) => break,
-                Err(why) => {
-                    // Encountered when we run into an unknown key.
+                Err(_) => {
                     map.next_value::<IgnoredAny>()?;
-
-                    tracing::trace!("ran into an unknown key: {why:?}");
 
                     continue;
                 }
@@ -164,11 +153,6 @@ impl<'de> Visitor<'de> for ActivityButtonVisitor {
 
         let label = label.ok_or_else(|| DeError::missing_field("label"))?;
         let url = url.ok_or_else(|| DeError::missing_field("url"))?;
-
-        tracing::trace!(
-            %label,
-            ?url,
-        );
 
         Ok(ActivityButton::Link(ActivityButtonLink { label, url }))
     }
@@ -226,47 +210,11 @@ pub struct ActivityButtonLink {
 /// );
 /// # Ok(()) }
 /// ```
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ActivityButtonText {
     /// Text shown on the button.
     pub label: String,
-}
-#[derive(Debug, Deserialize)]
-#[serde(field_identifier, rename_all = "snake_case")]
-enum ActivityButtonTextField {
-    Label,
-}
-
-struct ActivityButtonTextVisitor;
-
-impl<'de> Visitor<'de> for ActivityButtonTextVisitor {
-    type Value = ActivityButtonText;
-
-    fn expecting(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.write_str("activity button string")
-    }
-
-    fn visit_string<E: DeError>(self, v: String) -> Result<Self::Value, E> {
-        Ok(ActivityButtonText { label: v })
-    }
-
-    fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(ActivityButtonText {
-            label: v.to_owned(),
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for ActivityButtonText {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ActivityButtonTextVisitor)
-    }
-}
-
-impl Serialize for ActivityButtonText {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.label)
-    }
 }
 
 #[cfg(test)]

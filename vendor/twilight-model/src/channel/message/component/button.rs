@@ -1,4 +1,7 @@
-use crate::channel::message::ReactionType;
+use crate::{
+    channel::message::EmojiReactionType,
+    id::{Id, marker::SkuMarker},
+};
 use serde::{Deserialize, Serialize};
 
 /// Clickable [`Component`] below messages.
@@ -6,6 +9,8 @@ use serde::{Deserialize, Serialize};
 /// [`Component`]: super::Component
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Button {
+    /// Optional identifier for the button.
+    pub id: Option<i32>,
     /// User defined identifier for the button.
     ///
     /// This field is required when using the following [`ButtonStyle`]s:
@@ -20,13 +25,17 @@ pub struct Button {
     /// Defaults to `false`.
     pub disabled: bool,
     /// Visual emoji for clients to display with the button.
-    pub emoji: Option<ReactionType>,
+    pub emoji: Option<EmojiReactionType>,
     /// Text appearing on the button.
     pub label: Option<String>,
     /// Style variant of the button.
     pub style: ButtonStyle,
     /// URL for buttons of a [`ButtonStyle::Link`] style.
     pub url: Option<String>,
+    /// The ID of the SKU that is attached to the button.
+    ///
+    /// This field is required when using the [`ButtonStyle::Premium`] style.
+    pub sku_id: Option<Id<SkuMarker>>,
 }
 
 /// Style of a [`Button`].
@@ -60,6 +69,13 @@ pub enum ButtonStyle {
     /// Selecting this button style requires specifying the [`Button::url`]
     /// field.
     Link,
+    /// Button indicates a premium upgrade action.
+    ///
+    /// Selecting this button style requires specifying the [`Button::sku_id`]
+    /// field.
+    /// The following fields are not available for this button style: [`Button::custom_id`], [`Button::label`], [`Button::url`] & [`Button::emoji`].
+    /// Premium button styles do not fire an interaction event.
+    Premium,
     /// Variant value is unknown to the library.
     Unknown(u8),
 }
@@ -72,6 +88,7 @@ impl From<u8> for ButtonStyle {
             3 => ButtonStyle::Success,
             4 => ButtonStyle::Danger,
             5 => ButtonStyle::Link,
+            6 => ButtonStyle::Premium,
             unknown => ButtonStyle::Unknown(unknown),
         }
     }
@@ -85,6 +102,7 @@ impl From<ButtonStyle> for u8 {
             ButtonStyle::Success => 3,
             ButtonStyle::Danger => 4,
             ButtonStyle::Link => 5,
+            ButtonStyle::Premium => 6,
             ButtonStyle::Unknown(unknown) => unknown,
         }
     }
@@ -92,9 +110,7 @@ impl From<ButtonStyle> for u8 {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use serde::{Deserialize, Serialize};
     use serde_test::Token;
     use static_assertions::{assert_fields, assert_impl_all};
     use std::{fmt::Debug, hash::Hash};
@@ -122,6 +138,7 @@ mod tests {
         serde_test::assert_tokens(&ButtonStyle::Success, &[Token::U8(3)]);
         serde_test::assert_tokens(&ButtonStyle::Danger, &[Token::U8(4)]);
         serde_test::assert_tokens(&ButtonStyle::Link, &[Token::U8(5)]);
+        serde_test::assert_tokens(&ButtonStyle::Premium, &[Token::U8(6)]);
         serde_test::assert_tokens(&ButtonStyle::Unknown(99), &[Token::U8(99)]);
     }
 }

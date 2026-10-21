@@ -1,0 +1,20 @@
+---
+source: tests/contract.rs
+expression: embeds
+---
+[
+  {
+    "color": 65280,
+    "description": "g (1000)",
+    "type": "rich",
+    "timestamp": "2026-10-20T12:00:00.000000+00:00",
+    "title": "Guild Join"
+  },
+  {
+    "color": 16711680,
+    "description": "Unknown (1000)",
+    "type": "rich",
+    "timestamp": "2026-10-20T12:00:00.000000+00:00",
+    "title": "Guild Leave"
+  }
+]

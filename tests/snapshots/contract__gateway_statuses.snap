@@ -1,0 +1,24 @@
+---
+source: tests/contract.rs
+expression: statuses
+---
+[
+  {
+    "last_ack": "[YYYY-MM-DDTHH:MM:SS.f]",
+    "latency": 42,
+    "shard": 0,
+    "status": "Connected"
+  },
+  {
+    "last_ack": "[YYYY-MM-DDTHH:MM:SS.f]",
+    "latency": 0,
+    "shard": 1,
+    "status": "Disconnected"
+  },
+  {
+    "last_ack": "[YYYY-MM-DDTHH:MM:SS.f]",
+    "latency": 0,
+    "shard": 2,
+    "status": "Resuming"
+  }
+]

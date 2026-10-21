@@ -1,0 +1,16 @@
+---
+source: tests/contract.rs
+expression: "json!({\"migrated\": migrated, \"redis\": dump(&mut conn).await})"
+---
+{
+  "migrated": 2,
+  "redis": {
+    "expiry_zset": {
+      "type": "zset",
+      "value": {
+        "member:1000:10": "now+60000ms",
+        "message:1003:2001": "now+30500ms"
+      }
+    }
+  }
+}

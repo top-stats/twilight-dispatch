@@ -1,0 +1,31 @@
+---
+source: tests/contract.rs
+expression: "json!({\"without_old\": parse(&without_old), \"with_old\": parse(&with_old)})"
+---
+{
+  "with_old": {
+    "d": {
+      "channel_id": "3",
+      "content": "café \"q\"",
+      "guild_id": "7",
+      "id": "5"
+    },
+    "old": {
+      "channel_id": "3",
+      "content": "before",
+      "id": "5"
+    },
+    "op": 0,
+    "t": "MESSAGE_CREATE"
+  },
+  "without_old": {
+    "d": {
+      "channel_id": "3",
+      "content": "café \"q\"",
+      "guild_id": "7",
+      "id": "5"
+    },
+    "op": 0,
+    "t": "MESSAGE_CREATE"
+  }
+}

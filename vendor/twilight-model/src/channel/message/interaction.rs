@@ -1,7 +1,7 @@
 use crate::{
     application::interaction::InteractionType,
     guild::PartialMember,
-    id::{marker::InteractionMarker, Id},
+    id::{Id, marker::InteractionMarker},
     user::User,
 };
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,9 @@ pub struct MessageInteraction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user::PrimaryGuild;
     use crate::{
+        guild::MemberFlags,
         test::image_hash,
         user::{PremiumType, UserFlags},
         util::Timestamp,
@@ -39,15 +41,19 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn message_interaction() -> Result<(), Box<dyn Error>> {
-        let joined_at = Timestamp::from_str("2015-04-26T06:26:56.936000+00:00")?;
+        let joined_at = Some(Timestamp::from_str("2015-04-26T06:26:56.936000+00:00")?);
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let value = MessageInteraction {
             id: Id::new(1),
             kind: InteractionType::ApplicationCommand,
             member: Some(PartialMember {
                 avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
                 communication_disabled_until: None,
                 deaf: false,
+                flags,
                 joined_at,
                 mute: true,
                 nick: Some("a nickname".to_owned()),
@@ -60,16 +66,25 @@ mod tests {
             user: User {
                 accent_color: None,
                 avatar: Some(image_hash::AVATAR),
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: Some(image_hash::BANNER),
                 bot: false,
                 discriminator: 1,
                 email: Some("address@example.com".to_owned()),
                 flags: Some(UserFlags::PREMIUM_EARLY_SUPPORTER | UserFlags::VERIFIED_DEVELOPER),
+                global_name: Some("test".to_owned()),
                 id: Id::new(3),
                 locale: Some("en-us".to_owned()),
                 mfa_enabled: Some(true),
                 name: "test".to_owned(),
                 premium_type: Some(PremiumType::Nitro),
+                primary_guild: Some(PrimaryGuild {
+                    identity_guild_id: Some(Id::new(169_256_939_211_980_800)),
+                    identity_enabled: Some(true),
+                    tag: Some("DISC".to_owned()),
+                    badge: Some("1269e74af4df7417b13759eae50c83dc".parse().unwrap()),
+                }),
                 public_flags: Some(
                     UserFlags::PREMIUM_EARLY_SUPPORTER | UserFlags::VERIFIED_DEVELOPER,
                 ),
@@ -94,13 +109,16 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "PartialMember",
-                    len: 7,
+                    len: 8,
                 },
                 Token::Str("communication_disabled_until"),
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str("2015-04-26T06:26:56.936000+00:00"),
                 Token::Str("mute"),
                 Token::Bool(true),
@@ -120,13 +138,17 @@ mod tests {
                 Token::Str("user"),
                 Token::Struct {
                     name: "User",
-                    len: 14,
+                    len: 18,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
                 Token::Some,
                 Token::Str(image_hash::AVATAR_INPUT),
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
+                Token::None,
                 Token::Str("banner"),
                 Token::Some,
                 Token::Str(image_hash::BANNER_INPUT),
@@ -140,6 +162,9 @@ mod tests {
                 Token::Str("flags"),
                 Token::Some,
                 Token::U64(131_584),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("3"),
@@ -154,6 +179,26 @@ mod tests {
                 Token::Str("premium_type"),
                 Token::Some,
                 Token::U8(2),
+                Token::Str("primary_guild"),
+                Token::Some,
+                Token::Struct {
+                    name: "PrimaryGuild",
+                    len: 4,
+                },
+                Token::Str("identity_guild_id"),
+                Token::Some,
+                Token::NewtypeStruct { name: "Id" },
+                Token::Str("169256939211980800"),
+                Token::Str("identity_enabled"),
+                Token::Some,
+                Token::Bool(true),
+                Token::Str("tag"),
+                Token::Some,
+                Token::Str("DISC"),
+                Token::Str("badge"),
+                Token::Some,
+                Token::Str("1269e74af4df7417b13759eae50c83dc"),
+                Token::StructEnd,
                 Token::Str("public_flags"),
                 Token::Some,
                 Token::U64(131_584),

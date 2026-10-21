@@ -1,0 +1,200 @@
+---
+source: tests/contract.rs
+expression: messages
+---
+[
+  {
+    "message_id": "0:s1:2",
+    "payload": {
+      "body": {
+        "d": {
+          "attachments": [],
+          "author": {
+            "avatar": null,
+            "bot": false,
+            "discriminator": "0",
+            "global_name": "AUTHOR",
+            "id": "1",
+            "public_flags": 0,
+            "username": "author"
+          },
+          "channel_id": "1003",
+          "components": [],
+          "content": "hello",
+          "edited_timestamp": null,
+          "embeds": [],
+          "guild_id": "1000",
+          "id": "2001",
+          "mention_everyone": false,
+          "mention_roles": [],
+          "mentions": [],
+          "pinned": false,
+          "timestamp": "2024-01-01T00:00:00.000000+00:00",
+          "tts": false,
+          "type": 0
+        },
+        "op": 0,
+        "t": "MESSAGE_CREATE"
+      },
+      "d_is_verbatim": true,
+      "prefix": "{\"op\":0,\"t\":\"MESSAGE_CREATE\",\"d\":"
+    },
+    "routing_key": "MESSAGE_CREATE"
+  },
+  {
+    "message_id": "0:s1:3",
+    "payload": {
+      "body": {
+        "d": {
+          "attachments": [],
+          "author": {
+            "avatar": null,
+            "bot": false,
+            "discriminator": "0",
+            "global_name": "AUTHOR",
+            "id": "1",
+            "public_flags": 0,
+            "username": "author"
+          },
+          "channel_id": "1003",
+          "components": [],
+          "content": "edited",
+          "edited_timestamp": "2026-10-20T11:59:00.000000+00:00",
+          "embeds": [],
+          "guild_id": "1000",
+          "id": "2001",
+          "mention_everyone": false,
+          "mention_roles": [],
+          "mentions": [],
+          "pinned": false,
+          "timestamp": "2024-01-01T00:00:00.000000+00:00",
+          "tts": false,
+          "type": 0
+        },
+        "old": {
+          "attachments": [],
+          "author": {
+            "accent_color": null,
+            "avatar": null,
+            "avatar_decoration": null,
+            "avatar_decoration_data": null,
+            "banner": null,
+            "bot": false,
+            "discriminator": "0",
+            "global_name": "AUTHOR",
+            "id": "1",
+            "public_flags": 0,
+            "username": "author"
+          },
+          "call": null,
+          "channel_id": "1003",
+          "content": "hello",
+          "edited_timestamp": null,
+          "embeds": [],
+          "guild_id": "1000",
+          "id": "2001",
+          "mention_everyone": false,
+          "mention_roles": [],
+          "mentions": [],
+          "pinned": false,
+          "sticker_items": [],
+          "timestamp": "2024-01-01T00:00:00.000000+00:00",
+          "tts": false,
+          "type": 0
+        },
+        "op": 0,
+        "t": "MESSAGE_UPDATE"
+      },
+      "d_is_verbatim": true,
+      "prefix": "{\"op\":0,\"t\":\"MESSAGE_UPDATE\",\"d\":"
+    },
+    "routing_key": "MESSAGE_UPDATE"
+  },
+  {
+    "message_id": "0:s1:4",
+    "payload": {
+      "body": {
+        "d": {
+          "flags": 0,
+          "guild_id": "1000",
+          "id": "1003",
+          "last_message_id": null,
+          "name": "renamed",
+          "nsfw": false,
+          "parent_id": null,
+          "permission_overwrites": [],
+          "position": 0,
+          "rate_limit_per_user": 0,
+          "topic": null,
+          "type": 0
+        },
+        "old": {
+          "flags": 0,
+          "guild_id": "1000",
+          "id": "1003",
+          "name": "general",
+          "nsfw": false,
+          "permission_overwrites": [],
+          "position": 0,
+          "rate_limit_per_user": 0,
+          "type": 0
+        },
+        "op": 0,
+        "t": "CHANNEL_UPDATE"
+      },
+      "d_is_verbatim": true,
+      "prefix": "{\"op\":0,\"t\":\"CHANNEL_UPDATE\",\"d\":"
+    },
+    "routing_key": "CHANNEL_UPDATE"
+  },
+  {
+    "message_id": "0:s1:5",
+    "payload": {
+      "body": {
+        "d": {
+          "guild_id": "1000",
+          "role_id": "1001"
+        },
+        "old": {
+          "color": 0,
+          "colors": {
+            "primary_color": 0,
+            "secondary_color": null,
+            "tertiary_color": null
+          },
+          "flags": 0,
+          "hoist": false,
+          "id": "1001",
+          "managed": false,
+          "mentionable": false,
+          "name": "mods",
+          "permissions": "2251799813685248",
+          "position": 1
+        },
+        "op": 0,
+        "t": "GUILD_ROLE_DELETE"
+      },
+      "d_is_verbatim": true,
+      "prefix": "{\"op\":0,\"t\":\"GUILD_ROLE_DELETE\",\"d\":"
+    },
+    "routing_key": "GUILD_ROLE_DELETE"
+  },
+  {
+    "message_id": "0::6",
+    "payload": {
+      "body": {
+        "d": {
+          "channel_id": "1003",
+          "guild_id": "1000",
+          "timestamp": 1792497600,
+          "user_id": "10"
+        },
+        "op": 0,
+        "t": "TYPING_START"
+      },
+      "d_is_verbatim": true,
+      "prefix": "{\"op\":0,\"t\":\"TYPING_START\",\"d\":"
+    },
+    "routing_key": "TYPING_START"
+  }
+]

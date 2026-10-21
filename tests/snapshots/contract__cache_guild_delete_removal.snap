@@ -1,0 +1,131 @@
+---
+source: tests/contract.rs
+expression: contract
+---
+{
+  "events": [
+    {
+      "event": "GUILD_DELETE",
+      "outcome": {
+        "guild_known": false,
+        "old": {
+          "afk_channel_id": null,
+          "afk_timeout": 300,
+          "application_id": null,
+          "banner": null,
+          "channels": [],
+          "default_message_notifications": 0,
+          "description": null,
+          "discovery_splash": null,
+          "emojis": [],
+          "explicit_content_filter": 0,
+          "features": [],
+          "icon": null,
+          "id": "1000",
+          "joined_at": "2024-01-01T00:00:00.000000+00:00",
+          "large": false,
+          "member_count": 2,
+          "members": [],
+          "mfa_level": 0,
+          "name": "g",
+          "nsfw_level": 0,
+          "owner_id": "1",
+          "preferred_locale": "en-US",
+          "premium_progress_bar_enabled": false,
+          "premium_subscription_count": 0,
+          "premium_tier": 0,
+          "presences": [],
+          "public_updates_channel_id": null,
+          "roles": [],
+          "rules_channel_id": null,
+          "splash": null,
+          "system_channel_flags": 0,
+          "system_channel_id": null,
+          "threads": [
+            {
+              "flags": 0,
+              "guild_id": "1000",
+              "id": "1005",
+              "member_count": 1,
+              "message_count": 0,
+              "name": "thread1005",
+              "owner_id": "1",
+              "parent_id": "1003",
+              "rate_limit_per_user": 0,
+              "thread_metadata": {
+                "archive_timestamp": "2024-01-01T00:00:00.000000+00:00",
+                "archived": false,
+                "auto_archive_duration": 1440,
+                "locked": false
+              },
+              "type": 11
+            }
+          ],
+          "unavailable": false,
+          "vanity_url_code": null,
+          "verification_level": 1,
+          "voice_states": []
+        },
+        "previous_guild": {
+          "afk_channel_id": null,
+          "afk_timeout": 300,
+          "application_id": null,
+          "banner": null,
+          "channels": [],
+          "default_message_notifications": 0,
+          "description": null,
+          "discovery_splash": null,
+          "emojis": [],
+          "explicit_content_filter": 0,
+          "features": [],
+          "icon": null,
+          "id": "1000",
+          "joined_at": "2024-01-01T00:00:00.000000+00:00",
+          "large": false,
+          "member_count": 2,
+          "members": [],
+          "mfa_level": 0,
+          "name": "g",
+          "nsfw_level": 0,
+          "owner_id": "1",
+          "preferred_locale": "en-US",
+          "premium_progress_bar_enabled": false,
+          "premium_subscription_count": 0,
+          "premium_tier": 0,
+          "presences": [],
+          "public_updates_channel_id": null,
+          "roles": [],
+          "rules_channel_id": null,
+          "splash": null,
+          "system_channel_flags": 0,
+          "system_channel_id": null,
+          "threads": [
+            {
+              "flags": 0,
+              "guild_id": "1000",
+              "id": "1005",
+              "member_count": 1,
+              "message_count": 0,
+              "name": "thread1005",
+              "owner_id": "1",
+              "parent_id": "1003",
+              "rate_limit_per_user": 0,
+              "thread_metadata": {
+                "archive_timestamp": "2024-01-01T00:00:00.000000+00:00",
+                "archived": false,
+                "auto_archive_duration": 1440,
+                "locked": false
+              },
+              "type": 11
+            }
+          ],
+          "unavailable": false,
+          "vanity_url_code": null,
+          "verification_level": 1,
+          "voice_states": []
+        }
+      }
+    }
+  ],
+  "redis": {}
+}

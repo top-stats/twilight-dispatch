@@ -13,6 +13,7 @@ bitflags! {
     /// [Discord Docs/Gateway Intents].
     ///
     /// [Discord Docs/Gateway Intents]: https://discord.com/developers/docs/topics/gateway#gateway-intents
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub struct Intents: u64 {
         /// Guilds intent.
         ///
@@ -73,15 +74,17 @@ bitflags! {
         /// [`GUILD_MEMBER_REMOVE`]: super::event::Event::MemberRemove
         /// [`THREAD_MEMBERS_UPDATE`]: super::event::Event::ThreadMembersUpdate
         const GUILD_MEMBERS = 1 << 1;
-        /// Guild bans intent.
+        /// Guild moderation intent.
         ///
         /// Event(s) received:
+        ///  - [`GUILD_AUDIT_LOG_ENTRY_CREATE`]
         ///  - [`GUILD_BAN_ADD`]
         ///  - [`GUILD_BAN_REMOVE`]
         ///
+        /// [`GUILD_AUDIT_LOG_ENTRY_CREATE`]: super::event::Event::
         /// [`GUILD_BAN_ADD`]: super::event::Event::BanAdd
         /// [`GUILD_BAN_REMOVE`]: super::event::Event::BanRemove
-        const GUILD_BANS = 1 << 2;
+        const GUILD_MODERATION = 1 << 2;
         /// Guild emojis and stickers intent.
         ///
         /// Event(s) received:
@@ -259,6 +262,24 @@ bitflags! {
         ///
         /// [`AUTO_MODERATION_ACTION_EXECUTION`]: super::event::Event::AutoModerationActionExecution
         const AUTO_MODERATION_EXECUTION = 1 << 21;
+        /// Guild polls intent.
+        ///
+        /// Event(s) received:
+        /// - [`MESSAGE_POLL_VOTE_ADD`]
+        /// - [`MESSAGE_POLL_VOTE_REMOVE`]
+        ///
+        /// [`MESSAGE_POLL_VOTE_ADD`]: super::event::Event::MessagePollVoteAdd
+        /// [`MESSAGE_POLL_VOTE_REMOVE`]: super::event::Event::MessagePollVoteRemove
+        const GUILD_MESSAGE_POLLS = 1 << 24;
+        /// Direct message polls intent.
+        ///
+        /// Event(s) received:
+        /// - [`MESSAGE_POLL_VOTE_ADD`]
+        /// - [`MESSAGE_POLL_VOTE_REMOVE`]
+        ///
+        /// [`MESSAGE_POLL_VOTE_ADD`]: super::event::Event::MessagePollVoteAdd
+        /// [`MESSAGE_POLL_VOTE_REMOVE`]: super::event::Event::MessagePollVoteRemove
+        const DIRECT_MESSAGE_POLLS = 1 << 25;
     }
 }
 
@@ -274,5 +295,81 @@ impl Serialize for Intents {
         S: Serializer,
     {
         serializer.serialize_u64(self.bits())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(deprecated)]
+
+    use super::Intents;
+    use serde::{Deserialize, Serialize};
+    use serde_test::Token;
+    use static_assertions::{assert_impl_all, const_assert_eq};
+    use std::{
+        fmt::{Binary, Debug, LowerHex, Octal, UpperHex},
+        hash::Hash,
+        ops::{
+            BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Sub, SubAssign,
+        },
+    };
+
+    assert_impl_all!(
+        Intents: Binary,
+        BitAnd,
+        BitAndAssign,
+        BitOr,
+        BitOrAssign,
+        BitXor,
+        BitXorAssign,
+        Clone,
+        Copy,
+        Debug,
+        Deserialize<'static>,
+        Eq,
+        Extend<Intents>,
+        FromIterator<Intents>,
+        Hash,
+        LowerHex,
+        Not,
+        Octal,
+        PartialEq,
+        Send,
+        Serialize,
+        Sub,
+        SubAssign,
+        Sync,
+        UpperHex
+    );
+    const_assert_eq!(Intents::GUILDS.bits(), 1);
+    const_assert_eq!(Intents::GUILD_MEMBERS.bits(), 1 << 1);
+    const_assert_eq!(Intents::GUILD_MODERATION.bits(), 1 << 2);
+    const_assert_eq!(Intents::GUILD_EMOJIS_AND_STICKERS.bits(), 1 << 3);
+    const_assert_eq!(Intents::GUILD_INTEGRATIONS.bits(), 1 << 4);
+    const_assert_eq!(Intents::GUILD_WEBHOOKS.bits(), 1 << 5);
+    const_assert_eq!(Intents::GUILD_INVITES.bits(), 1 << 6);
+    const_assert_eq!(Intents::GUILD_VOICE_STATES.bits(), 1 << 7);
+    const_assert_eq!(Intents::GUILD_PRESENCES.bits(), 1 << 8);
+    const_assert_eq!(Intents::GUILD_MESSAGES.bits(), 1 << 9);
+    const_assert_eq!(Intents::GUILD_MESSAGE_REACTIONS.bits(), 1 << 10);
+    const_assert_eq!(Intents::GUILD_MESSAGE_TYPING.bits(), 1 << 11);
+    const_assert_eq!(Intents::DIRECT_MESSAGES.bits(), 1 << 12);
+    const_assert_eq!(Intents::DIRECT_MESSAGE_REACTIONS.bits(), 1 << 13);
+    const_assert_eq!(Intents::DIRECT_MESSAGE_TYPING.bits(), 1 << 14);
+    const_assert_eq!(Intents::MESSAGE_CONTENT.bits(), 1 << 15);
+    const_assert_eq!(Intents::GUILD_SCHEDULED_EVENTS.bits(), 1 << 16);
+    const_assert_eq!(Intents::AUTO_MODERATION_CONFIGURATION.bits(), 1 << 20);
+    const_assert_eq!(Intents::AUTO_MODERATION_EXECUTION.bits(), 1 << 21);
+    const_assert_eq!(Intents::GUILD_MESSAGE_POLLS.bits(), 1 << 24);
+    const_assert_eq!(Intents::DIRECT_MESSAGE_POLLS.bits(), 1 << 25);
+
+    #[test]
+    fn serde() {
+        serde_test::assert_tokens(
+            &Intents::MESSAGE_CONTENT,
+            &[Token::U64(Intents::MESSAGE_CONTENT.bits())],
+        );
+        // Deserialization truncates unknown bits.
+        serde_test::assert_de_tokens(&Intents::empty(), &[Token::U64(1 << 63)]);
     }
 }

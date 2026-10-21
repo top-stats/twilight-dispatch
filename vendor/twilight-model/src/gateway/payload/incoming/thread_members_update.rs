@@ -1,13 +1,13 @@
 use crate::{
     channel::thread::member::{ThreadMember, ThreadMemberIntermediary},
     id::{
-        marker::{ChannelMarker, GuildMarker, UserMarker},
         Id,
+        marker::{ChannelMarker, GuildMarker, UserMarker},
     },
 };
 use serde::{
-    de::{value::MapAccessDeserializer, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use std::fmt::{Formatter, Result as FmtResult};
 
@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for ThreadMembersUpdate {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 struct ThreadMembersUpdateIntermediary {
-    /// ThreadMembers without the guild ID.
+    /// [`ThreadMember`]s without the guild ID.
     #[serde(default)]
     pub added_members: Vec<ThreadMemberIntermediary>,
     pub guild_id: Id<GuildMarker>,
@@ -92,7 +92,7 @@ mod tests {
         gateway::presence::{
             Activity, ActivityEmoji, ActivityType, ClientStatus, Presence, Status, UserOrId,
         },
-        guild::Member,
+        guild::{Member, MemberFlags},
         id::Id,
         test::image_hash,
         user::User,
@@ -107,14 +107,17 @@ mod tests {
         const JOIN_TIMESTAMP: &str = "2015-04-26T06:26:56.936000+00:00";
         const PREMIUM_SINCE: &str = "2021-03-16T14:29:19.046000+00:00";
 
-        let joined_at = Timestamp::from_str(JOIN_TIMESTAMP).expect("timestamp error");
+        let joined_at = Some(Timestamp::from_str(JOIN_TIMESTAMP).expect("timestamp error"));
         let premium_since = Timestamp::from_str(PREMIUM_SINCE).expect("timestamp error");
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let member = Member {
             avatar: Some(image_hash::AVATAR),
+            avatar_decoration_data: None,
+            banner: None,
             communication_disabled_until: None,
             deaf: false,
-            guild_id: Id::new(2),
+            flags,
             joined_at,
             mute: true,
             nick: Some("twilight".to_owned()),
@@ -124,16 +127,20 @@ mod tests {
             user: User {
                 accent_color: None,
                 avatar: None,
+                avatar_decoration: None,
+                avatar_decoration_data: None,
                 banner: None,
                 bot: false,
                 discriminator: 1,
                 email: None,
                 flags: None,
+                global_name: Some("test".to_owned()),
                 id: Id::new(3),
                 locale: None,
                 mfa_enabled: None,
                 name: "twilight".to_owned(),
                 premium_type: None,
+                primary_guild: None,
                 public_flags: None,
                 system: None,
                 verified: None,
@@ -216,7 +223,7 @@ mod tests {
                 Token::Some,
                 Token::Struct {
                     name: "Member",
-                    len: 11,
+                    len: 12,
                 },
                 Token::Str("avatar"),
                 Token::Some,
@@ -225,10 +232,13 @@ mod tests {
                 Token::None,
                 Token::Str("deaf"),
                 Token::Bool(false),
+                Token::Str("flags"),
+                Token::U64(flags.bits()),
                 Token::Str("guild_id"),
                 Token::NewtypeStruct { name: "GuildId" },
                 Token::Str("1"),
                 Token::Str("joined_at"),
+                Token::Some,
                 Token::Str(JOIN_TIMESTAMP),
                 Token::Str("mute"),
                 Token::Bool(true),
@@ -246,11 +256,15 @@ mod tests {
                 Token::Str("user"),
                 Token::Struct {
                     name: "User",
-                    len: 7,
+                    len: 9,
                 },
                 Token::Str("accent_color"),
                 Token::None,
                 Token::Str("avatar"),
+                Token::None,
+                Token::Str("avatar_decoration"),
+                Token::None,
+                Token::Str("avatar_decoration_data"),
                 Token::None,
                 Token::Str("banner"),
                 Token::None,
@@ -258,6 +272,9 @@ mod tests {
                 Token::Bool(false),
                 Token::Str("discriminator"),
                 Token::Str("0001"),
+                Token::Str("global_name"),
+                Token::Some,
+                Token::Str("test"),
                 Token::Str("id"),
                 Token::NewtypeStruct { name: "UserId" },
                 Token::Str("3"),

@@ -1,37 +1,38 @@
 #![allow(clippy::wildcard_imports)]
 
 pub mod gateway;
-pub mod shard;
 
 mod dispatch;
 mod kind;
 
 pub use self::{
     dispatch::{DispatchEvent, DispatchEventWithTypeDeserializer},
-    gateway::{GatewayEvent, GatewayEventDeserializer, GatewayEventDeserializerOwned},
+    gateway::{GatewayEvent, GatewayEventDeserializer},
     kind::EventType,
 };
 
-use self::shard::*;
-use super::payload::incoming::*;
-use crate::id::{marker::GuildMarker, Id};
+use super::{CloseFrame, payload::incoming::*};
+use crate::gateway::payload::incoming::rate_limited::RateLimitMetadata;
+use crate::id::{Id, marker::GuildMarker};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 
 /// Any type of event that a shard emits.
 ///
-/// This brings together all of the types of [`DispatchEvent`]s,
-/// [`GatewayEvent`]s, and [`ShardEvent`]s.
+/// Flattened type containing all the variants of [`DispatchEvent`] and
+/// [`GatewayEvent`], along with a [gateway close event].
+///
+/// [gateway close event]: Self::GatewayClose
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// Message was blocked by AutoMod according to a rule.
     AutoModerationActionExecution(AutoModerationActionExecution),
     /// Sent when an auto moderation rule is created.
-    AutoModerationRuleCreate(Box<AutoModerationRuleCreate>),
+    AutoModerationRuleCreate(AutoModerationRuleCreate),
     /// Sent when an auto moderation rule is deleted.
-    AutoModerationRuleDelete(Box<AutoModerationRuleDelete>),
+    AutoModerationRuleDelete(AutoModerationRuleDelete),
     /// Sent when an auto moderation rule is updated.
-    AutoModerationRuleUpdate(Box<AutoModerationRuleUpdate>),
+    AutoModerationRuleUpdate(AutoModerationRuleUpdate),
     /// A user was banned from a guild.
     BanAdd(BanAdd),
     /// A user's ban from a guild was removed.
@@ -46,20 +47,33 @@ pub enum Event {
     ChannelUpdate(Box<ChannelUpdate>),
     /// A command's permissions were updated.
     CommandPermissionsUpdate(CommandPermissionsUpdate),
-    /// A heartbeat was sent to or received from the gateway.
-    GatewayHeartbeat(u64),
+    /// A user subscribes to a SKU.
+    EntitlementCreate(EntitlementCreate),
+    /// A user's entitlement is removed.
+    EntitlementDelete(EntitlementDelete),
+    /// A user's subscription renews for the
+    /// next billing period.
+    ///
+    /// The `ends_at` field will have an updated value with
+    /// the new expiration date.
+    EntitlementUpdate(EntitlementUpdate),
+    /// Close message with an optional frame including information about the
+    /// reason for the close.
+    GatewayClose(Option<CloseFrame<'static>>),
+    /// A heartbeat was received from the gateway.
+    GatewayHeartbeat,
     /// A heartbeat acknowledgement was received from the gateway.
     GatewayHeartbeatAck,
     /// A "hello" packet was received from the gateway.
-    GatewayHello(u64),
+    GatewayHello(Hello),
     /// A shard's session was invalidated.
     ///
     /// `true` if resumable. If not, then the shard must do a full reconnect.
     GatewayInvalidateSession(bool),
     /// The gateway is indicating to perform a reconnect.
     GatewayReconnect,
-    /// Undocumented event, should be ignored.
-    GiftCodeUpdate,
+    /// A audit log entry was created.
+    GuildAuditLogEntryCreate(Box<GuildAuditLogEntryCreate>),
     /// A guild was created.
     GuildCreate(Box<GuildCreate>),
     /// A guild was deleted or the current user was removed from a guild.
@@ -84,9 +98,9 @@ pub enum Event {
     GuildUpdate(Box<GuildUpdate>),
     /// A guild integration was created.
     IntegrationCreate(Box<IntegrationCreate>),
-    /// A guild integration was updated.
-    IntegrationDelete(IntegrationDelete),
     /// A guild integration was deleted.
+    IntegrationDelete(IntegrationDelete),
+    /// A guild integration was updated.
     IntegrationUpdate(Box<IntegrationUpdate>),
     /// An interaction was invoked by a user.
     InteractionCreate(Box<InteractionCreate>),
@@ -108,14 +122,16 @@ pub enum Event {
     MessageDelete(MessageDelete),
     /// Multiple messages were deleted in a channel.
     MessageDeleteBulk(MessageDeleteBulk),
+    /// A vote was added to a poll.
+    MessagePollVoteAdd(MessagePollVoteAdd),
+    /// A vote was removed from a poll.
+    MessagePollVoteRemove(MessagePollVoteRemove),
     /// A message was updated in a channel.
     MessageUpdate(Box<MessageUpdate>),
     /// A user's active presence (such as game or online status) was updated.
     PresenceUpdate(Box<PresenceUpdate>),
-    /// Multiple presences outside of a guild were updated.
-    ///
-    /// For bots this is always empty and useless.
-    PresencesReplace,
+    /// A shard was rate limited for a gateway opcode.
+    RateLimited(RateLimited),
     /// A reaction was added to a message.
     ReactionAdd(Box<ReactionAdd>),
     /// A reaction was removed from a message.
@@ -126,7 +142,7 @@ pub enum Event {
     /// removed.
     ReactionRemoveEmoji(ReactionRemoveEmoji),
     /// A shard is now "ready" and fully connected.
-    Ready(Box<Ready>),
+    Ready(Ready),
     /// A shard has successfully resumed.
     Resumed,
     /// A role was created in a guild.
@@ -135,23 +151,6 @@ pub enum Event {
     RoleDelete(RoleDelete),
     /// A role was updated in a guild.
     RoleUpdate(RoleUpdate),
-    /// A shard is now in a connected stage after being fully connected to the
-    /// gateway.
-    ShardConnected(Connected),
-    /// A shard is now in a connecting stage after starting to connect to the
-    /// gateway.
-    ShardConnecting(Connecting),
-    /// A shard is now in a disconnected stage after the connection was closed.
-    ShardDisconnected(Disconnected),
-    /// A shard is now in a identifying stage after starting a new session.
-    ShardIdentifying(Identifying),
-    /// A shard is now in a reconnecting stage after a disconnect or session was
-    /// ended.
-    ShardReconnecting(Reconnecting),
-    /// A payload of bytes came in through the shard's connection.
-    ShardPayload(Payload),
-    /// A shard is now in a Resuming stage after a disconnect.
-    ShardResuming(Resuming),
     /// A stage instance was created in a stage channel.
     StageInstanceCreate(StageInstanceCreate),
     /// A stage instance was deleted in a stage channel.
@@ -186,13 +185,7 @@ pub enum Event {
 }
 
 impl Event {
-    /// Retrieve the guild ID of an event if it took place in a guild.
-    ///
-    /// While events such as [`MessageDelete`] will never include a guild ID, events
-    /// such as [`BanAdd`] and only some [`Channel`] related events will include
-    /// one. Guild variants will include a guild ID while DM Channels don't.
-    ///
-    /// [`Channel`]: crate::channel::Channel
+    /// Guild ID of the event, if available.
     pub const fn guild_id(&self) -> Option<Id<GuildMarker>> {
         match self {
             Event::AutoModerationActionExecution(e) => Some(e.guild_id),
@@ -203,9 +196,11 @@ impl Event {
             Event::BanRemove(e) => Some(e.guild_id),
             Event::ChannelCreate(e) => e.0.guild_id,
             Event::ChannelDelete(e) => e.0.guild_id,
+            Event::ChannelPinsUpdate(e) => e.guild_id,
             Event::ChannelUpdate(e) => e.0.guild_id,
             Event::CommandPermissionsUpdate(e) => Some(e.0.guild_id),
-            Event::GuildCreate(e) => Some(e.0.id),
+            Event::GuildAuditLogEntryCreate(e) => e.0.guild_id,
+            Event::GuildCreate(e) => Some(e.id()),
             Event::GuildDelete(e) => Some(e.id),
             Event::GuildEmojisUpdate(e) => Some(e.guild_id),
             Event::GuildIntegrationsUpdate(e) => Some(e.guild_id),
@@ -222,12 +217,21 @@ impl Event {
             Event::InteractionCreate(e) => e.0.guild_id,
             Event::InviteCreate(e) => Some(e.guild_id),
             Event::InviteDelete(e) => Some(e.guild_id),
-            Event::MemberAdd(e) => Some(e.0.guild_id),
+            Event::MemberAdd(e) => Some(e.guild_id),
             Event::MemberChunk(e) => Some(e.guild_id),
             Event::MemberRemove(e) => Some(e.guild_id),
             Event::MemberUpdate(e) => Some(e.guild_id),
             Event::MessageCreate(e) => e.0.guild_id,
+            Event::MessageDelete(e) => e.guild_id,
+            Event::MessageDeleteBulk(e) => e.guild_id,
+            Event::MessageUpdate(e) => e.0.guild_id,
+            Event::MessagePollVoteAdd(e) => e.guild_id,
+            Event::MessagePollVoteRemove(e) => e.guild_id,
             Event::PresenceUpdate(e) => Some(e.0.guild_id),
+            Event::RateLimited(RateLimited {
+                meta: RateLimitMetadata::RequestGuildMembers { guild_id, .. },
+                ..
+            }) => Some(*guild_id),
             Event::ReactionAdd(e) => e.0.guild_id,
             Event::ReactionRemove(e) => e.0.guild_id,
             Event::ReactionRemoveAll(e) => e.guild_id,
@@ -241,6 +245,7 @@ impl Event {
             Event::ThreadCreate(e) => e.0.guild_id,
             Event::ThreadDelete(e) => Some(e.guild_id),
             Event::ThreadListSync(e) => Some(e.guild_id),
+            Event::ThreadMemberUpdate(e) => Some(e.guild_id),
             Event::ThreadMembersUpdate(e) => Some(e.guild_id),
             Event::ThreadUpdate(e) => e.0.guild_id,
             Event::TypingStart(e) => e.guild_id,
@@ -248,27 +253,17 @@ impl Event {
             Event::VoiceServerUpdate(e) => Some(e.guild_id),
             Event::VoiceStateUpdate(e) => e.0.guild_id,
             Event::WebhooksUpdate(e) => Some(e.guild_id),
-            Event::ChannelPinsUpdate(_)
-            | Event::GatewayHeartbeat(_)
+            Event::GatewayClose(_)
+            | Event::EntitlementCreate(_)
+            | Event::EntitlementDelete(_)
+            | Event::EntitlementUpdate(_)
+            | Event::GatewayHeartbeat
             | Event::GatewayHeartbeatAck
             | Event::GatewayHello(_)
             | Event::GatewayInvalidateSession(_)
             | Event::GatewayReconnect
-            | Event::GiftCodeUpdate
-            | Event::MessageDelete(_)
-            | Event::MessageDeleteBulk(_)
-            | Event::MessageUpdate(_)
-            | Event::PresencesReplace
             | Event::Ready(_)
             | Event::Resumed
-            | Event::ShardConnected(_)
-            | Event::ShardConnecting(_)
-            | Event::ShardDisconnected(_)
-            | Event::ShardIdentifying(_)
-            | Event::ShardPayload(_)
-            | Event::ShardReconnecting(_)
-            | Event::ShardResuming(_)
-            | Event::ThreadMemberUpdate(_)
             | Event::UserUpdate(_) => None,
         }
     }
@@ -286,12 +281,16 @@ impl Event {
             Self::ChannelPinsUpdate(_) => EventType::ChannelPinsUpdate,
             Self::ChannelUpdate(_) => EventType::ChannelUpdate,
             Self::CommandPermissionsUpdate(_) => EventType::CommandPermissionsUpdate,
-            Self::GatewayHeartbeat(_) => EventType::GatewayHeartbeat,
+            Self::EntitlementCreate(_) => EventType::EntitlementCreate,
+            Self::EntitlementDelete(_) => EventType::EntitlementDelete,
+            Self::EntitlementUpdate(_) => EventType::EntitlementUpdate,
+            Self::GatewayClose(_) => EventType::GatewayClose,
+            Self::GatewayHeartbeat => EventType::GatewayHeartbeat,
             Self::GatewayHeartbeatAck => EventType::GatewayHeartbeatAck,
             Self::GatewayHello(_) => EventType::GatewayHello,
             Self::GatewayInvalidateSession(_) => EventType::GatewayInvalidateSession,
             Self::GatewayReconnect => EventType::GatewayReconnect,
-            Self::GiftCodeUpdate => EventType::GiftCodeUpdate,
+            Self::GuildAuditLogEntryCreate(_) => EventType::GuildAuditLogEntryCreate,
             Self::GuildCreate(_) => EventType::GuildCreate,
             Self::GuildDelete(_) => EventType::GuildDelete,
             Self::GuildEmojisUpdate(_) => EventType::GuildEmojisUpdate,
@@ -316,9 +315,11 @@ impl Event {
             Self::MessageCreate(_) => EventType::MessageCreate,
             Self::MessageDelete(_) => EventType::MessageDelete,
             Self::MessageDeleteBulk(_) => EventType::MessageDeleteBulk,
+            Self::MessagePollVoteAdd(_) => EventType::MessagePollVoteAdd,
+            Self::MessagePollVoteRemove(_) => EventType::MessagePollVoteRemove,
             Self::MessageUpdate(_) => EventType::MessageUpdate,
             Self::PresenceUpdate(_) => EventType::PresenceUpdate,
-            Self::PresencesReplace => EventType::PresencesReplace,
+            Self::RateLimited(_) => EventType::RateLimited,
             Self::ReactionAdd(_) => EventType::ReactionAdd,
             Self::ReactionRemove(_) => EventType::ReactionRemove,
             Self::ReactionRemoveAll(_) => EventType::ReactionRemoveAll,
@@ -328,13 +329,6 @@ impl Event {
             Self::RoleCreate(_) => EventType::RoleCreate,
             Self::RoleDelete(_) => EventType::RoleDelete,
             Self::RoleUpdate(_) => EventType::RoleUpdate,
-            Self::ShardConnected(_) => EventType::ShardConnected,
-            Self::ShardConnecting(_) => EventType::ShardConnecting,
-            Self::ShardDisconnected(_) => EventType::ShardDisconnected,
-            Self::ShardIdentifying(_) => EventType::ShardIdentifying,
-            Self::ShardReconnecting(_) => EventType::ShardReconnecting,
-            Self::ShardPayload(_) => EventType::ShardPayload,
-            Self::ShardResuming(_) => EventType::ShardResuming,
             Self::StageInstanceCreate(_) => EventType::StageInstanceCreate,
             Self::StageInstanceDelete(_) => EventType::StageInstanceDelete,
             Self::StageInstanceUpdate(_) => EventType::StageInstanceUpdate,
@@ -370,7 +364,10 @@ impl From<DispatchEvent> for Event {
             DispatchEvent::ChannelPinsUpdate(v) => Self::ChannelPinsUpdate(v),
             DispatchEvent::ChannelUpdate(v) => Self::ChannelUpdate(v),
             DispatchEvent::CommandPermissionsUpdate(v) => Self::CommandPermissionsUpdate(v),
-            DispatchEvent::GiftCodeUpdate => Self::GiftCodeUpdate,
+            DispatchEvent::EntitlementCreate(v) => Self::EntitlementCreate(v),
+            DispatchEvent::EntitlementDelete(v) => Self::EntitlementDelete(v),
+            DispatchEvent::EntitlementUpdate(v) => Self::EntitlementUpdate(v),
+            DispatchEvent::GuildAuditLogEntryCreate(v) => Self::GuildAuditLogEntryCreate(v),
             DispatchEvent::GuildCreate(v) => Self::GuildCreate(v),
             DispatchEvent::GuildDelete(v) => Self::GuildDelete(v),
             DispatchEvent::GuildEmojisUpdate(v) => Self::GuildEmojisUpdate(v),
@@ -400,9 +397,11 @@ impl From<DispatchEvent> for Event {
             DispatchEvent::MessageCreate(v) => Self::MessageCreate(v),
             DispatchEvent::MessageDelete(v) => Self::MessageDelete(v),
             DispatchEvent::MessageDeleteBulk(v) => Self::MessageDeleteBulk(v),
+            DispatchEvent::MessagePollVoteAdd(v) => Self::MessagePollVoteAdd(v),
+            DispatchEvent::MessagePollVoteRemove(v) => Self::MessagePollVoteRemove(v),
             DispatchEvent::MessageUpdate(v) => Self::MessageUpdate(v),
             DispatchEvent::PresenceUpdate(v) => Self::PresenceUpdate(v),
-            DispatchEvent::PresencesReplace => Self::PresencesReplace,
+            DispatchEvent::RateLimited(v) => Self::RateLimited(v),
             DispatchEvent::ReactionAdd(v) => Self::ReactionAdd(v),
             DispatchEvent::ReactionRemove(v) => Self::ReactionRemove(v),
             DispatchEvent::ReactionRemoveAll(v) => Self::ReactionRemoveAll(v),
@@ -432,25 +431,11 @@ impl From<GatewayEvent> for Event {
     fn from(event: GatewayEvent) -> Self {
         match event {
             GatewayEvent::Dispatch(_, e) => Self::from(e),
-            GatewayEvent::Heartbeat(interval) => Self::GatewayHeartbeat(interval),
+            GatewayEvent::Heartbeat => Self::GatewayHeartbeat,
             GatewayEvent::HeartbeatAck => Self::GatewayHeartbeatAck,
             GatewayEvent::Hello(interval) => Self::GatewayHello(interval),
             GatewayEvent::InvalidateSession(r) => Self::GatewayInvalidateSession(r),
             GatewayEvent::Reconnect => Self::GatewayReconnect,
-        }
-    }
-}
-
-impl From<ShardEvent> for Event {
-    fn from(event: ShardEvent) -> Self {
-        match event {
-            ShardEvent::Connected(v) => Self::ShardConnected(v),
-            ShardEvent::Connecting(v) => Self::ShardConnecting(v),
-            ShardEvent::Disconnected(v) => Self::ShardDisconnected(v),
-            ShardEvent::Identifying(v) => Self::ShardIdentifying(v),
-            ShardEvent::Payload(v) => Self::ShardPayload(v),
-            ShardEvent::Reconnecting(v) => Self::ShardReconnecting(v),
-            ShardEvent::Resuming(v) => Self::ShardResuming(v),
         }
     }
 }
@@ -488,7 +473,7 @@ impl Error for EventConversionError {}
 
 #[cfg(test)]
 mod tests {
-    //! `EVENT_THRESHOLD` is equivalent to 192 bytes. This was decided based on
+    //! `EVENT_THRESHOLD` is equivalent to 312 bytes. This was decided based on
     //! the size of `Event` at the time of writing. The assertions here are to
     //! ensure that in the case the events themselves grow or shrink past the
     //! threshold, they are properly boxed or unboxed respectively.
@@ -502,7 +487,7 @@ mod tests {
     //! wrapping the event in the `Event` type and move the assertion to the
     //! "unboxed" section.
 
-    use super::{super::payload::incoming::*, shard::*, Event};
+    use super::{super::payload::incoming::*, Event};
     use static_assertions::const_assert;
     use std::mem;
 
@@ -510,14 +495,11 @@ mod tests {
     // requires a variable to be used in a function, so this is a false
     // positive.
     #[allow(dead_code)]
-    const EVENT_THRESHOLD: usize = 184;
+    const EVENT_THRESHOLD: usize = 312;
 
     const_assert!(mem::size_of::<Event>() == EVENT_THRESHOLD);
 
     // Boxed events.
-    const_assert!(mem::size_of::<AutoModerationRuleCreate>() > EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<AutoModerationRuleDelete>() > EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<AutoModerationRuleUpdate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ChannelCreate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ChannelDelete>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ChannelUpdate>() > EVENT_THRESHOLD);
@@ -536,38 +518,34 @@ mod tests {
     const_assert!(mem::size_of::<PresenceUpdate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ReactionAdd>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ReactionRemove>() > EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Ready>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ThreadCreate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ThreadMemberUpdate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ThreadUpdate>() > EVENT_THRESHOLD);
     const_assert!(mem::size_of::<TypingStart>() > EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<VoiceStateUpdate>() > EVENT_THRESHOLD);
 
     // Unboxed.
+    const_assert!(mem::size_of::<AutoModerationRuleCreate>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<AutoModerationRuleDelete>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<AutoModerationRuleUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<AutoModerationActionExecution>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<BanAdd>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<BanRemove>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ChannelPinsUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<CommandPermissionsUpdate>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Connected>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Connecting>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Disconnected>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<GuildDelete>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<GuildEmojisUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<GuildIntegrationsUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<GuildScheduledEventUserAdd>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<GuildScheduledEventUserRemove>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Identifying>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<IntegrationDelete>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<InviteDelete>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<MemberChunk>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<MemberRemove>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<MessageDelete>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<MessageDeleteBulk>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Payload>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<MemberRemove>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<RateLimited>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<Ready>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<ReactionRemoveAll>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Reconnecting>() <= EVENT_THRESHOLD);
-    const_assert!(mem::size_of::<Resuming>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<RoleCreate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<RoleDelete>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<RoleUpdate>() <= EVENT_THRESHOLD);
@@ -581,4 +559,6 @@ mod tests {
     const_assert!(mem::size_of::<UserUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<VoiceServerUpdate>() <= EVENT_THRESHOLD);
     const_assert!(mem::size_of::<WebhooksUpdate>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<MessagePollVoteAdd>() <= EVENT_THRESHOLD);
+    const_assert!(mem::size_of::<MessagePollVoteRemove>() <= EVENT_THRESHOLD);
 }

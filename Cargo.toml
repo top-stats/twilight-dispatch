@@ -1,30 +1,55 @@
 [package]
 name = "twilight-dispatch"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2021"
+rust-version = "1.89"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "twilight-dispatch"
+path = "src/main.rs"
 
 [dependencies]
-dotenv = { version = "0.15", default-features = false }
-futures-util = { version = "0.3", default-features = false }
-hyper = { version = "0.14", default-features = false, features = ["server", "tcp", "http1"] }
-lapin = { version = "2.0", default-features = false }
-lazy_static = { version = "1.4", default-features = false }
-prometheus = { version = "0.13", default-features = false, features = ["process"] }
-redis = { version = "0.22", default-features = false, features = ["tokio-comp"] }
-serde = { version = "1.0", default-features = false }
+bytes = { version = "1.10", default-features = false, features = ["std"] }
+dotenvy = { version = "0.15.7", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = { version = "0.1.3", default-features = false }
+hyper = { version = "1.6", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.16", default-features = false, features = ["tokio"] }
+lapin = { version = "4.12", default-features = false, features = ["tokio"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+# twilight uses rustls without picking a crypto provider; main() installs ring.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std", "raw_value"] }
 serde_repr = { version = "0.1", default-features = false }
-simd-json = { version = "0.7", default-features = false, features = ["serde_impl"] }
-time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
-tokio = { version = "1.2", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
-tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt"] }
-twilight-gateway = { version = "0.14", default-features = false, features = ["rustls-webpki-roots", "simd-json", "zlib-simd"] }
-twilight-http = { version = "0.14", default-features = false, features = ["simd-json"] }
-twilight-model = { version = "0.14", default-features = false }
+time = { version = "0.3.41", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
+tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["ansi", "fmt", "env-filter"] }
+twilight-gateway = { version = "0.17.1", default-features = false, features = ["rustls-webpki-roots", "zstd"] }
+twilight-http = { version = "0.17.1", default-features = false, features = ["rustls-webpki-roots", "decompression"] }
+twilight-model = { version = "0.17.1", default-features = false }
+
+[dev-dependencies]
+insta = { version = "1.49", default-features = false, features = ["json", "redactions"] }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+# Fake Discord gateway in the end-to-end tests (same version twilight uses).
+tokio-websockets = { version = "0.13.3", default-features = false, features = ["server"] }
 
 [profile.release]
 lto = "thin"
 panic = "abort"
 
+# Dependencies are built without debug info in dev and test builds: the
+# target directory (CI cache, Docker volumes) is much smaller and linking is
+# faster. This crate keeps full debug info.
+[profile.dev.package."*"]
+debug = false
+
 [patch.crates-io]
+twilight-gateway = { path = "vendor/twilight-gateway" }
 twilight-model = { path = "vendor/twilight-model" }

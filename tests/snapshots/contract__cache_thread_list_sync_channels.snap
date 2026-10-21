@@ -1,0 +1,366 @@
+---
+source: tests/contract.rs
+expression: contract
+---
+{
+  "events": [
+    {
+      "event": "THREAD_LIST_SYNC",
+      "outcome": {
+        "guild_known": false,
+        "old": null,
+        "previous_guild": null
+      }
+    }
+  ],
+  "redis": {
+    "channel:1003": {
+      "type": "string",
+      "value": {
+        "flags": 0,
+        "guild_id": "1000",
+        "id": "1003",
+        "name": "general",
+        "nsfw": false,
+        "permission_overwrites": [],
+        "position": 0,
+        "rate_limit_per_user": 0,
+        "type": 0
+      }
+    },
+    "channel:1004": {
+      "type": "string",
+      "value": {
+        "flags": 0,
+        "guild_id": "1000",
+        "id": "1004",
+        "name": "random",
+        "nsfw": false,
+        "permission_overwrites": [],
+        "position": 0,
+        "rate_limit_per_user": 0,
+        "type": 0
+      }
+    },
+    "channel_keys": {
+      "type": "set",
+      "value": [
+        "channel:1003",
+        "channel:1004"
+      ]
+    },
+    "emoji:1000:1002": {
+      "type": "string",
+      "value": {
+        "animated": false,
+        "available": true,
+        "id": "1002",
+        "managed": false,
+        "name": "pog",
+        "require_colons": true
+      }
+    },
+    "emoji_keys": {
+      "type": "set",
+      "value": [
+        "emoji:1000:1002"
+      ]
+    },
+    "expiry_zset": {
+      "type": "zset",
+      "value": {
+        "member:1000:10": "now+60000ms"
+      }
+    },
+    "guild:1000": {
+      "type": "string",
+      "value": {
+        "afk_channel_id": null,
+        "afk_timeout": 300,
+        "application_id": null,
+        "banner": null,
+        "channels": [],
+        "default_message_notifications": 0,
+        "description": null,
+        "discovery_splash": null,
+        "emojis": [],
+        "explicit_content_filter": 0,
+        "features": [],
+        "icon": null,
+        "id": "1000",
+        "joined_at": "2024-01-01T00:00:00.000000+00:00",
+        "large": false,
+        "member_count": 2,
+        "members": [],
+        "mfa_level": 0,
+        "name": "g",
+        "nsfw_level": 0,
+        "owner_id": "1",
+        "preferred_locale": "en-US",
+        "premium_progress_bar_enabled": false,
+        "premium_subscription_count": 0,
+        "premium_tier": 0,
+        "presences": [],
+        "public_updates_channel_id": null,
+        "roles": [],
+        "rules_channel_id": null,
+        "splash": null,
+        "system_channel_flags": 0,
+        "system_channel_id": null,
+        "threads": [
+          {
+            "flags": 0,
+            "guild_id": "1000",
+            "id": "1005",
+            "member_count": 1,
+            "message_count": 0,
+            "name": "thread1005",
+            "owner_id": "1",
+            "parent_id": "1003",
+            "rate_limit_per_user": 0,
+            "thread_metadata": {
+              "archive_timestamp": "2024-01-01T00:00:00.000000+00:00",
+              "archived": false,
+              "auto_archive_duration": 1440,
+              "locked": false
+            },
+            "type": 11
+          }
+        ],
+        "unavailable": false,
+        "vanity_url_code": null,
+        "verification_level": 1,
+        "voice_states": []
+      }
+    },
+    "guild_keys": {
+      "type": "set",
+      "value": [
+        "guild:1000"
+      ]
+    },
+    "guild_keys:1000": {
+      "type": "set",
+      "value": [
+        "channel:1003",
+        "channel:1004",
+        "emoji:1000:1002",
+        "member:1000:10",
+        "member:1000:900",
+        "presence:1000:10",
+        "role:1000:1000",
+        "role:1000:1001",
+        "thread:1000:1005",
+        "thread:1000:1012",
+        "voice:1000:10"
+      ]
+    },
+    "member:1000:10": {
+      "type": "string",
+      "value": {
+        "communication_disabled_until": null,
+        "deaf": false,
+        "flags": 0,
+        "guild_id": "1000",
+        "joined_at": "2024-01-01T00:00:00.000000+00:00",
+        "mute": false,
+        "nick": null,
+        "pending": false,
+        "roles": [
+          "1001"
+        ],
+        "user": {
+          "accent_color": null,
+          "avatar": null,
+          "avatar_decoration": null,
+          "avatar_decoration_data": null,
+          "banner": null,
+          "bot": false,
+          "discriminator": "0",
+          "global_name": "USER10",
+          "id": "10",
+          "public_flags": 0,
+          "username": "user10"
+        }
+      }
+    },
+    "member:1000:900": {
+      "type": "string",
+      "value": {
+        "communication_disabled_until": null,
+        "deaf": false,
+        "flags": 0,
+        "guild_id": "1000",
+        "joined_at": "2024-01-01T00:00:00.000000+00:00",
+        "mute": false,
+        "nick": null,
+        "pending": false,
+        "roles": [],
+        "user": {
+          "accent_color": null,
+          "avatar": null,
+          "avatar_decoration": null,
+          "avatar_decoration_data": null,
+          "banner": null,
+          "bot": true,
+          "discriminator": "0",
+          "global_name": "USER900",
+          "id": "900",
+          "public_flags": 0,
+          "username": "user900"
+        }
+      }
+    },
+    "member_keys": {
+      "type": "set",
+      "value": [
+        "member:1000:10",
+        "member:1000:900"
+      ]
+    },
+    "presence:1000:10": {
+      "type": "string",
+      "value": {
+        "activities": [],
+        "client_status": {
+          "desktop": "online"
+        },
+        "guild_id": "1000",
+        "status": "online",
+        "user": {
+          "id": "10"
+        }
+      }
+    },
+    "presence_keys": {
+      "type": "set",
+      "value": [
+        "presence:1000:10"
+      ]
+    },
+    "role:1000:1000": {
+      "type": "string",
+      "value": {
+        "color": 0,
+        "colors": {
+          "primary_color": 0,
+          "secondary_color": null,
+          "tertiary_color": null
+        },
+        "flags": 0,
+        "hoist": false,
+        "id": "1000",
+        "managed": false,
+        "mentionable": false,
+        "name": "@everyone",
+        "permissions": "2251799813685248",
+        "position": 1
+      }
+    },
+    "role:1000:1001": {
+      "type": "string",
+      "value": {
+        "color": 0,
+        "colors": {
+          "primary_color": 0,
+          "secondary_color": null,
+          "tertiary_color": null
+        },
+        "flags": 0,
+        "hoist": false,
+        "id": "1001",
+        "managed": false,
+        "mentionable": false,
+        "name": "mods",
+        "permissions": "2251799813685248",
+        "position": 1
+      }
+    },
+    "role_keys": {
+      "type": "set",
+      "value": [
+        "role:1000:1000",
+        "role:1000:1001"
+      ]
+    },
+    "thread:1000:1005": {
+      "type": "string",
+      "value": {
+        "flags": 0,
+        "guild_id": "1000",
+        "id": "1005",
+        "member_count": 1,
+        "message_count": 0,
+        "name": "thread1005",
+        "owner_id": "1",
+        "parent_id": "1003",
+        "rate_limit_per_user": 0,
+        "thread_metadata": {
+          "archive_timestamp": "2024-01-01T00:00:00.000000+00:00",
+          "archived": false,
+          "auto_archive_duration": 1440,
+          "locked": false
+        },
+        "type": 11
+      }
+    },
+    "thread:1000:1012": {
+      "type": "string",
+      "value": {
+        "flags": 0,
+        "guild_id": "1000",
+        "id": "1012",
+        "member_count": 1,
+        "message_count": 0,
+        "name": "thread1012",
+        "owner_id": "1",
+        "parent_id": "1004",
+        "rate_limit_per_user": 0,
+        "thread_metadata": {
+          "archive_timestamp": "2024-01-01T00:00:00.000000+00:00",
+          "archived": false,
+          "auto_archive_duration": 1440,
+          "locked": false
+        },
+        "type": 11
+      }
+    },
+    "thread_keys": {
+      "type": "set",
+      "value": [
+        "thread:1000:1005",
+        "thread:1000:1012"
+      ]
+    },
+    "thread_keys:1000": {
+      "type": "set",
+      "value": [
+        "thread:1000:1005",
+        "thread:1000:1012"
+      ]
+    },
+    "voice:1000:10": {
+      "type": "string",
+      "value": {
+        "channel_id": "1003",
+        "deaf": false,
+        "guild_id": "1000",
+        "mute": false,
+        "request_to_speak_timestamp": null,
+        "self_deaf": false,
+        "self_mute": false,
+        "self_stream": false,
+        "self_video": false,
+        "session_id": "abc",
+        "suppress": false,
+        "user_id": "10"
+      }
+    },
+    "voice_keys": {
+      "type": "set",
+      "value": [
+        "voice:1000:10"
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+---
+source: tests/contract.rs
+expression: "json!({\"problems\": health.problems, \"warnings\": health.warnings})"
+---
+{
+  "problems": [
+    "shard 3 is connected but received nothing for 240s",
+    "shard 4 is stuck waiting for the gateway to close the connection"
+  ],
+  "warnings": [
+    "shard 1 was closed by Discord with a non-reconnectable code (4014)",
+    "shard 2 was closed by Discord with a non-reconnectable code",
+    "not connected to the AMQP broker"
+  ]
+}

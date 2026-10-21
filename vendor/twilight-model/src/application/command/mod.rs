@@ -15,7 +15,7 @@ mod option;
 pub use self::{
     command_type::CommandType,
     option::{
-        CommandOption, CommandOptionChoice, CommandOptionChoiceData, CommandOptionType,
+        CommandOption, CommandOptionChoice, CommandOptionChoiceValue, CommandOptionType,
         CommandOptionValue,
     },
 };
@@ -23,12 +23,15 @@ pub use self::{
 use crate::{
     guild::Permissions,
     id::{
-        marker::{ApplicationMarker, CommandMarker, CommandVersionMarker, GuildMarker},
         Id,
+        marker::{ApplicationMarker, CommandMarker, CommandVersionMarker, GuildMarker},
     },
+    oauth::ApplicationIntegrationType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use super::interaction::InteractionContextType;
 
 /// Data sent to Discord to create a command.
 ///
@@ -41,6 +44,8 @@ use std::collections::HashMap;
 pub struct Command {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_id: Option<Id<ApplicationMarker>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contexts: Option<Vec<InteractionContextType>>,
     /// Default permissions required for a member to run the command.
     ///
     /// Setting this [`Permissions::empty()`] will prohibit anyone from running
@@ -50,6 +55,7 @@ pub struct Command {
     ///
     /// This is only relevant for globally-scoped commands. By default, commands
     /// are visible in DMs.
+    #[deprecated(note = "use contexts instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dm_permission: Option<bool>,
     /// Description of the command.
@@ -71,6 +77,8 @@ pub struct Command {
     pub guild_id: Option<Id<GuildMarker>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Id<CommandMarker>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_types: Option<Vec<ApplicationIntegrationType>>,
     #[serde(rename = "type")]
     pub kind: CommandType,
     pub name: String,
@@ -83,6 +91,11 @@ pub struct Command {
     /// [Discord Docs/Localization]: https://discord.com/developers/docs/interactions/application-commands#localization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_localizations: Option<HashMap<String, String>>,
+    /// Whether the command is age-restricted.
+    ///
+    /// Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsfw: Option<bool>,
     #[serde(default)]
     pub options: Vec<CommandOption>,
     /// Autoincrementing version identifier.
@@ -92,7 +105,7 @@ pub struct Command {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, CommandOption, CommandOptionChoice, CommandOptionChoiceData, CommandOptionType,
+        Command, CommandOption, CommandOptionChoice, CommandOptionChoiceValue, CommandOptionType,
         CommandOptionValue, CommandType,
     };
     use crate::{channel::ChannelType, guild::Permissions, id::Id};
@@ -100,10 +113,11 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     fn command_option_full() {
         let value = Command {
             application_id: Some(Id::new(100)),
+            contexts: None,
             default_member_permissions: Some(Permissions::ADMINISTRATOR),
             dm_permission: Some(false),
             description: "this command is a test".into(),
@@ -113,9 +127,11 @@ mod tests {
             )])),
             guild_id: Some(Id::new(300)),
             id: Some(Id::new(200)),
+            integration_types: None,
             kind: CommandType::ChatInput,
             name: "test command".into(),
             name_localizations: Some(HashMap::from([("en-US".into(), "test command".into())])),
+            nsfw: None,
             options: Vec::from([CommandOption {
                 autocomplete: None,
                 channel_types: None,
@@ -245,16 +261,14 @@ mod tests {
                         CommandOption {
                             autocomplete: Some(false),
                             channel_types: None,
-                            choices: Some(Vec::from([CommandOptionChoice::Number(
-                                CommandOptionChoiceData {
-                                    name: "number choice".to_owned(),
-                                    name_localizations: Some(HashMap::from([(
-                                        "en-US".to_owned(),
-                                        "number choice (but american)".to_owned(),
-                                    )])),
-                                    value: 10.0,
-                                },
-                            )])),
+                            choices: Some(Vec::from([CommandOptionChoice {
+                                name: "number choice".to_owned(),
+                                name_localizations: Some(HashMap::from([(
+                                    "en-US".to_owned(),
+                                    "number choice (but american)".to_owned(),
+                                )])),
+                                value: CommandOptionChoiceValue::Number(10.0),
+                            }])),
                             description: "number desc".to_owned(),
                             description_localizations: None,
                             kind: CommandOptionType::Number,
@@ -489,7 +503,7 @@ mod tests {
                 Token::Some,
                 Token::Seq { len: Some(1) },
                 Token::Struct {
-                    name: "CommandOptionChoiceData",
+                    name: "CommandOptionChoice",
                     len: 3,
                 },
                 Token::Str("name"),

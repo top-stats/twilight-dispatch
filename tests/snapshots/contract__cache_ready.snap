@@ -1,0 +1,54 @@
+---
+source: tests/contract.rs
+expression: contract
+---
+{
+  "events": [
+    {
+      "event": "READY",
+      "outcome": {
+        "guild_known": false,
+        "old": null,
+        "previous_guild": null
+      }
+    }
+  ],
+  "redis": {
+    "bot_user": {
+      "type": "string",
+      "value": {
+        "accent_color": null,
+        "avatar": null,
+        "banner": null,
+        "bot": true,
+        "discriminator": "0",
+        "flags": 0,
+        "id": "900",
+        "mfa_enabled": false,
+        "username": "bot",
+        "verified": true
+      }
+    },
+    "guild:1000": {
+      "type": "string",
+      "value": {
+        "id": "1000",
+        "unavailable": true
+      }
+    },
+    "guild:2000": {
+      "type": "string",
+      "value": {
+        "id": "2000",
+        "unavailable": true
+      }
+    },
+    "guild_keys": {
+      "type": "set",
+      "value": [
+        "guild:1000",
+        "guild:2000"
+      ]
+    }
+  }
+}

@@ -1,0 +1,166 @@
+---
+source: tests/contract.rs
+expression: families
+---
+[
+  {
+    "help": "1 while connected to the AMQP broker",
+    "labels": [],
+    "name": "amqp_connected",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Gateway events that could not be published",
+    "labels": [],
+    "name": "amqp_publish_failures",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Reconnects to the AMQP broker",
+    "labels": [],
+    "name": "amqp_reconnects",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Gateway commands from gateway.send by outcome (sent, forwarded, dropped, invalid)",
+    "labels": [
+      "shard",
+      "result"
+    ],
+    "name": "gateway_commands",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Events received through the Discord gateway",
+    "labels": [
+      "type",
+      "shard"
+    ],
+    "name": "gateway_events",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Discord guild join and leave events",
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_guild_events",
+    "type": "COUNTER"
+  },
+  {
+    "help": "API latency with the Discord gateway",
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_latencies",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Dispatch payloads that could not be parsed for the cache",
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_parse_errors",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Discord shard connection events",
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_shard_events",
+    "type": "COUNTER"
+  },
+  {
+    "help": "1 when a shard was closed with a non-reconnectable code",
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_shard_fatal",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Seconds since a shard last received anything",
+    "labels": [
+      "shard"
+    ],
+    "name": "gateway_shard_silence_seconds",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of gateway connections with Discord",
+    "labels": [],
+    "name": "gateway_shards",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Status of the gateway connections",
+    "labels": [
+      "type"
+    ],
+    "name": "gateway_statuses",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of channels in state cache",
+    "labels": [],
+    "name": "state_channels",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of emojis in state cache",
+    "labels": [],
+    "name": "state_emojis",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of guilds in state cache",
+    "labels": [],
+    "name": "state_guilds",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of members in state cache",
+    "labels": [],
+    "name": "state_members",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of messages in state cache",
+    "labels": [],
+    "name": "state_messages",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of presences in state cache",
+    "labels": [],
+    "name": "state_presences",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of roles in state cache",
+    "labels": [],
+    "name": "state_roles",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Number of threads in state cache",
+    "labels": [],
+    "name": "state_threads",
+    "type": "GAUGE"
+  },
+  {
+    "help": "Failed or skipped state cache updates",
+    "labels": [
+      "reason"
+    ],
+    "name": "state_update_errors",
+    "type": "COUNTER"
+  },
+  {
+    "help": "Number of voices in state cache",
+    "labels": [],
+    "name": "state_voices",
+    "type": "GAUGE"
+  }
+]

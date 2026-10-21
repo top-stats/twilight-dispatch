@@ -1,14 +1,14 @@
 use crate::{
     gateway::presence::{Presence, PresenceListDeserializer},
-    guild::member::{Member, MemberListDeserializer},
+    guild::Member,
     id::{
-        marker::{GuildMarker, UserMarker},
         Id,
+        marker::{GuildMarker, UserMarker},
     },
 };
 use serde::{
-    de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
     Deserialize, Serialize,
+    de::{Deserializer, Error as DeError, IgnoredAny, MapAccess, Visitor},
 };
 use std::fmt::{Formatter, Result as FmtResult};
 
@@ -56,25 +56,12 @@ impl<'de> Visitor<'de> for MemberChunkVisitor {
         let mut not_found = None;
         let mut presences = None;
 
-        let span = tracing::trace_span!("deserializing member chunk");
-        let _span_enter = span.enter();
-
         loop {
-            let span_child = tracing::trace_span!("iterating over element");
-            let _span_child_enter = span_child.enter();
-
             let key = match map.next_key() {
-                Ok(Some(key)) => {
-                    tracing::trace!(?key, "found key");
-
-                    key
-                }
+                Ok(Some(key)) => key,
                 Ok(None) => break,
-                Err(why) => {
-                    // Encountered when we run into an unknown key.
+                Err(_) => {
                     map.next_value::<IgnoredAny>()?;
-
-                    tracing::trace!("ran into an unknown key: {why:?}");
 
                     continue;
                 }
@@ -107,12 +94,7 @@ impl<'de> Visitor<'de> for MemberChunkVisitor {
                         return Err(DeError::duplicate_field("members"));
                     }
 
-                    // Since the guild ID may not be deserialized yet we'll use
-                    // a temporary placeholder value and update it with the real
-                    // guild ID after all the fields have been deserialized.
-                    let deserializer = MemberListDeserializer::new(Id::new(1));
-
-                    members = Some(map.next_value_seed(deserializer)?);
+                    members = Some(map.next_value()?);
                 }
                 Field::Nonce => {
                     if nonce.is_some() {
@@ -143,22 +125,9 @@ impl<'de> Visitor<'de> for MemberChunkVisitor {
         let chunk_count = chunk_count.ok_or_else(|| DeError::missing_field("chunk_count"))?;
         let chunk_index = chunk_index.ok_or_else(|| DeError::missing_field("chunk_index"))?;
         let guild_id = guild_id.ok_or_else(|| DeError::missing_field("guild_id"))?;
-        let mut members = members.ok_or_else(|| DeError::missing_field("members"))?;
+        let members = members.ok_or_else(|| DeError::missing_field("members"))?;
         let not_found = not_found.unwrap_or_default();
         let mut presences = presences.unwrap_or_default();
-
-        tracing::trace!(
-            %chunk_count,
-            %chunk_index,
-            ?guild_id,
-            ?members,
-            ?not_found,
-            ?presences,
-        );
-
-        for member in &mut members {
-            member.guild_id = guild_id;
-        }
 
         for presence in &mut presences {
             presence.guild_id = guild_id;
@@ -197,7 +166,7 @@ mod tests {
     use super::super::MemberChunk;
     use crate::{
         gateway::presence::{ClientStatus, Presence, Status, UserOrId},
-        guild::Member,
+        guild::{Member, MemberFlags},
         id::Id,
         test::image_hash,
         user::{User, UserFlags},
@@ -208,7 +177,8 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn simple_member_chunk() -> Result<(), TimestampParseError> {
-        let joined_at = Timestamp::from_str("2020-04-04T04:04:04.000000+00:00")?;
+        let joined_at = Some(Timestamp::from_str("2020-04-04T04:04:04.000000+00:00")?);
+        let flags = MemberFlags::BYPASSES_VERIFICATION | MemberFlags::DID_REJOIN;
 
         let input = serde_json::json!({
             "chunk_count": 1,
@@ -217,6 +187,7 @@ mod tests {
             "members": [{
                 "communication_disabled_until": null,
                 "deaf": false,
+                "flags": flags.bits(),
                 "hoisted_role": "6",
                 "joined_at": "2020-04-04T04:04:04.000000+00:00",
                 "mute": false,
@@ -226,6 +197,7 @@ mod tests {
                 "user": {
                     "avatar": image_hash::AVATAR_INPUT,
                     "discriminator": "0001",
+                    "global_name": "test",
                     "id": "5",
                     "public_flags": 131_072,
                     "username": "test",
@@ -233,6 +205,7 @@ mod tests {
             }, {
                 "communication_disabled_until": null,
                 "deaf": false,
+                "flags": flags.bits(),
                 "hoisted_role": "6",
                 "joined_at": "2020-04-04T04:04:04.000000+00:00",
                 "mute": false,
@@ -241,12 +214,14 @@ mod tests {
                 "user": {
                     "avatar": image_hash::AVATAR_INPUT,
                     "discriminator": "0001",
+                    "global_name": "test",
                     "id": "6",
                     "username": "test",
                 },
             }, {
                 "communication_disabled_until": null,
                 "deaf": false,
+                "flags": flags.bits(),
                 "hoisted_role": "6",
                 "joined_at": "2020-04-04T04:04:04.000000+00:00",
                 "mute": false,
@@ -256,12 +231,14 @@ mod tests {
                     "avatar": image_hash::AVATAR_INPUT,
                     "bot": true,
                     "discriminator": "0001",
+                    "global_name": "test",
                     "id": "3",
                     "username": "test",
                 },
             }, {
                 "communication_disabled_until": null,
                 "deaf": false,
+                "flags": flags.bits(),
                 "hoisted_role": "6",
                 "joined_at": "2020-04-04T04:04:04.000000+00:00",
                 "mute": false,
@@ -274,6 +251,7 @@ mod tests {
                     "avatar": image_hash::AVATAR_INPUT,
                     "bot": true,
                     "discriminator": "0001",
+                    "global_name": "test",
                     "id": "2",
                     "username": "test",
                 },
@@ -318,9 +296,11 @@ mod tests {
             members: Vec::from([
                 Member {
                     avatar: None,
+                    avatar_decoration_data: None,
+                    banner: None,
                     communication_disabled_until: None,
                     deaf: false,
-                    guild_id: Id::new(1),
+                    flags,
                     joined_at,
                     mute: false,
                     nick: Some("chunk".to_owned()),
@@ -331,6 +311,8 @@ mod tests {
                         id: Id::new(2),
                         accent_color: None,
                         avatar: Some(image_hash::AVATAR),
+                        avatar_decoration: None,
+                        avatar_decoration_data: None,
                         banner: None,
                         bot: true,
                         discriminator: 1,
@@ -340,16 +322,20 @@ mod tests {
                         verified: None,
                         email: None,
                         flags: None,
+                        global_name: Some("test".to_owned()),
                         premium_type: None,
-                        system: None,
+                        primary_guild: None,
                         public_flags: None,
+                        system: None,
                     },
                 },
                 Member {
                     avatar: None,
+                    avatar_decoration_data: None,
+                    banner: None,
                     communication_disabled_until: None,
                     deaf: false,
-                    guild_id: Id::new(1),
+                    flags,
                     joined_at,
                     mute: false,
                     nick: Some("chunk".to_owned()),
@@ -360,6 +346,8 @@ mod tests {
                         id: Id::new(3),
                         accent_color: None,
                         avatar: Some(image_hash::AVATAR),
+                        avatar_decoration: None,
+                        avatar_decoration_data: None,
                         banner: None,
                         bot: true,
                         discriminator: 1,
@@ -369,16 +357,20 @@ mod tests {
                         verified: None,
                         email: None,
                         flags: None,
+                        global_name: Some("test".to_owned()),
                         premium_type: None,
-                        system: None,
+                        primary_guild: None,
                         public_flags: None,
+                        system: None,
                     },
                 },
                 Member {
                     avatar: None,
+                    avatar_decoration_data: None,
+                    banner: None,
                     communication_disabled_until: None,
                     deaf: false,
-                    guild_id: Id::new(1),
+                    flags,
                     joined_at,
                     mute: false,
                     nick: Some("chunk".to_owned()),
@@ -389,6 +381,8 @@ mod tests {
                         id: Id::new(5),
                         accent_color: None,
                         avatar: Some(image_hash::AVATAR),
+                        avatar_decoration: None,
+                        avatar_decoration_data: None,
                         banner: None,
                         bot: false,
                         discriminator: 1,
@@ -398,16 +392,20 @@ mod tests {
                         verified: None,
                         email: None,
                         flags: None,
+                        global_name: Some("test".to_owned()),
                         premium_type: None,
-                        system: None,
+                        primary_guild: None,
                         public_flags: Some(UserFlags::VERIFIED_DEVELOPER),
+                        system: None,
                     },
                 },
                 Member {
                     avatar: None,
+                    avatar_decoration_data: None,
+                    banner: None,
                     communication_disabled_until: None,
                     deaf: false,
-                    guild_id: Id::new(1),
+                    flags,
                     joined_at,
                     mute: false,
                     nick: Some("chunk".to_owned()),
@@ -418,6 +416,8 @@ mod tests {
                         id: Id::new(6),
                         accent_color: None,
                         avatar: Some(image_hash::AVATAR),
+                        avatar_decoration: None,
+                        avatar_decoration_data: None,
                         banner: None,
                         bot: false,
                         discriminator: 1,
@@ -427,9 +427,11 @@ mod tests {
                         verified: None,
                         email: None,
                         flags: None,
+                        global_name: Some("test".to_owned()),
                         premium_type: None,
-                        system: None,
+                        primary_guild: None,
                         public_flags: None,
+                        system: None,
                     },
                 },
             ]),

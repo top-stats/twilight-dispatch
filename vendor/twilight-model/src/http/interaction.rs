@@ -1,9 +1,11 @@
 //! Models used when responding to interactions over HTTP.
+#![allow(deprecated)]
 
 use super::attachment::Attachment;
 use crate::{
     application::command::CommandOptionChoice,
     channel::message::{AllowedMentions, Component, Embed, MessageFlags},
+    poll::Poll,
 };
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
@@ -73,6 +75,9 @@ pub struct InteractionResponseData {
     /// Whether the response is TTS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tts: Option<bool>,
+    /// A poll of the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
 }
 
 /// Type of interaction response.
@@ -100,6 +105,14 @@ pub enum InteractionResponseType {
     ApplicationCommandAutocompleteResult = 8,
     /// Respond to an interaction with a popup modal.
     Modal = 9,
+    /// Respond to an interaction with an upgrade button, only available
+    /// for apps with monetization enabled
+    ///
+    /// Deprecated: Please send a [`InteractionResponseType::ChannelMessageWithSource`]
+    /// with an [`Button`](crate::channel::message::component::Button) with the style [`ButtonStyle::Premium`](crate::channel::message::component::ButtonStyle)
+    /// instead.
+    #[deprecated(note = "Deprecated by Discord in favor of Premium Buttons")]
+    PremiumRequired = 10,
 }
 
 #[cfg(test)]
@@ -150,6 +163,7 @@ mod tests {
                 flags: Some(MessageFlags::EPHEMERAL),
                 title: None,
                 tts: None,
+                poll: None,
             }),
         };
 

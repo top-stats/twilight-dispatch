@@ -2,10 +2,10 @@ use super::TemplateRole;
 use crate::{
     channel::Channel,
     guild::{
-        DefaultMessageNotificationLevel, ExplicitContentFilter, SystemChannelFlags,
+        AfkTimeout, DefaultMessageNotificationLevel, ExplicitContentFilter, SystemChannelFlags,
         VerificationLevel,
     },
-    id::{marker::ChannelMarker, Id},
+    id::{Id, marker::ChannelMarker},
     util::image_hash::ImageHash,
 };
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TemplateGuild {
     pub afk_channel_id: Option<Id<ChannelMarker>>,
-    pub afk_timeout: u64,
+    pub afk_timeout: AfkTimeout,
     pub channels: Vec<Channel>,
     pub default_message_notifications: DefaultMessageNotificationLevel,
     pub description: Option<String>,

@@ -1,0 +1,48 @@
+---
+source: tests/contract.rs
+expression: contract
+---
+{
+  "events": [
+    {
+      "event": "USER_UPDATE",
+      "outcome": {
+        "guild_known": false,
+        "old": {
+          "accent_color": null,
+          "avatar": null,
+          "banner": null,
+          "bot": true,
+          "discriminator": "0",
+          "flags": 0,
+          "id": "900",
+          "mfa_enabled": false,
+          "username": "bot",
+          "verified": true
+        },
+        "previous_guild": null
+      }
+    }
+  ],
+  "redis": {
+    "bot_user": {
+      "type": "string",
+      "value": {
+        "accent_color": null,
+        "avatar": null,
+        "banner": null,
+        "bot": true,
+        "discriminator": "0",
+        "flags": 0,
+        "global_name": "Bot",
+        "id": "900",
+        "locale": "en-US",
+        "mfa_enabled": true,
+        "premium_type": 0,
+        "public_flags": 0,
+        "username": "renamed-bot",
+        "verified": true
+      }
+    }
+  }
+}

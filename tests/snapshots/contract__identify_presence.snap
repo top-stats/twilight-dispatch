@@ -1,0 +1,81 @@
+---
+source: tests/contract.rs
+expression: presences
+---
+{
+  "custom_status": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "Counting servers",
+        "state": "Counting servers",
+        "type": 4
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "online"
+  },
+  "custom_status_with_state": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "Custom Status",
+        "state": "Counting servers",
+        "type": 4
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "online"
+  },
+  "env_example_playing": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "Testing",
+        "type": 0
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "online"
+  },
+  "listening_idle": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "music",
+        "type": 2
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "idle"
+  },
+  "streaming": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "Live",
+        "type": 1,
+        "url": "https://twitch.tv/topstats"
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "online"
+  },
+  "watching_dnd": {
+    "activities": [
+      {
+        "created_at": null,
+        "name": "servers",
+        "type": 3
+      }
+    ],
+    "afk": false,
+    "since": null,
+    "status": "dnd"
+  }
+}
