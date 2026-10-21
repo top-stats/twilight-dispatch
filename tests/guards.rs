@@ -660,7 +660,8 @@ enum Cache {
 
 const CACHES: [Cache; 2] = [Cache::Everything, Cache::Nothing];
 
-/// A Redis that answers reads as `Cache` says and every write with OK.
+/// A Redis that answers reads as `Cache` says, SCRIPT LOAD with the script's
+/// SHA1 and every other write with OK.
 struct Fake(Cache);
 
 /// A cached value for any key, with what every read-modify-write looks at.
@@ -721,6 +722,10 @@ impl Fake {
             }
             "SMEMBERS" => RedisValue::Array(Vec::new()),
             "EXISTS" => RedisValue::Int(i64::from(everything)),
+            // redis-rs checks the SHA1 that SCRIPT LOAD answers with.
+            "SCRIPT" if args[1] == "LOAD" => {
+                bulk(redis::Script::new(&args[2]).get_hash().to_owned())
+            }
             _ => RedisValue::Okay,
         }
     }
@@ -753,6 +758,18 @@ impl ConnectionLike for Fake {
 
     fn get_db(&self) -> i64 {
         0
+    }
+}
+
+/// `Script::load_async` asserts (in debug builds) that SCRIPT LOAD answers
+/// with the script's SHA1, so a cache arm that loads a script would panic in
+/// every guard that runs it against the fake.
+#[tokio::test]
+async fn the_fake_loads_scripts_as_redis_does() {
+    let script = redis::Script::new("return 1");
+    for cache in CACHES {
+        let hash = script.load_async(&mut Fake(cache)).await.unwrap();
+        assert_eq!(hash, script.get_hash(), "{cache:?}");
     }
 }
 
