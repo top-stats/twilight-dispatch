@@ -745,7 +745,10 @@ where
         let deadline = *self
             .close_deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + CLOSE_TIMEOUT);
-        let mut fatal = false;
+        // Fatally closed already: `run` handled the gateway's close
+        // (`on_close`), but saw the shutdown before the end of the stream,
+        // which is where the shard is marked fatal. That is still owed.
+        let mut fatal = self.shard.state() == ShardState::FatallyClosed;
         // A disconnected shard has nothing to close; a close queued now would
         // open a new connection just to close it. Whatever it did not
         // receive is replayed after the restart.

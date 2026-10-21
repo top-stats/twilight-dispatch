@@ -1852,6 +1852,83 @@ async fn a_fatal_close_while_shutting_down_is_recorded() {
     );
 }
 
+/// The fatal close is already waiting when a shutdown comes during READY's
+/// cache update. Afterwards `run()` may handle the close first and then the
+/// shutdown before the stream ends, so the shutdown's close starts on a
+/// fatally closed shard. `select!` picks at random, one shard in four takes
+/// that way, so this runs 24 shards at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fatal_close_handled_just_before_the_shutdown_is_recorded() {
+    let _metrics = METRICS.write().await;
+    let Some(redis) = common::redis(READY_DB).await else {
+        return;
+    };
+    let shards = 40..64;
+    let kinds = ["Disconnected", "Reconnecting", "FatallyClosed"];
+    let before = kinds.map(shard_events);
+    let runs = join_all(shards.clone().map(|shard| {
+        let redis = redis.clone();
+        async move {
+            let fake = FakeDiscord::start().await;
+            let opts = Opts {
+                state: StateConfig {
+                    enabled: true,
+                    ..StateConfig::default()
+                },
+                discord: discord_log(&fake),
+                ..Opts::default()
+            };
+            let mut running = start_with(&fake.gateway.url(), shard, redis, Unresponsive, opts);
+            let mut conn = fake.gateway.accept().await;
+            conn.hello(QUIET).await;
+            conn.expect_identify().await;
+            conn.ready(1, "A", [shard, TOTAL], &[]).await;
+            // Received, so its cache update (which never ends) is running.
+            eventually("READY to be received", || {
+                (received(shard, "READY") == 1).then_some(())
+            })
+            .await;
+            conn.close(4004, "Authentication failed").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            running.shutdown.send_replace(true);
+            running.join(CLOSE_TIMEOUT + Duration::from_secs(3)).await;
+            (shard, running.snapshot(), fake)
+        }
+    }))
+    .await;
+
+    let missed: Vec<_> = runs
+        .iter()
+        .filter(|(_, s, _)| {
+            !(s.fatal && !s.active && s.status == "FatallyClosed" && s.close_code == Some(4004))
+        })
+        .map(|(shard, s, _)| (shard, s))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "not recorded as fatally closed: {missed:?}"
+    );
+    let deltas: Vec<u64> = kinds
+        .iter()
+        .zip(before)
+        .map(|(kind, before)| shard_events(kind) - before)
+        .collect();
+    let count = shards.len() as u64;
+    assert_eq!(deltas, [count, 0, count], "{kinds:?}");
+    for (shard, _, fake) in &runs {
+        let posts = fake.api.wait_posts(LOG_CHANNEL, 3).await;
+        let title = |what: &str| format!("[Shard {shard}] {what}");
+        assert_eq!(
+            logged(&posts),
+            [
+                (title("Ready"), u64::from(READY_COLOR)),
+                (title("Disconnected"), u64::from(DISCONNECT_COLOR)),
+                (title("Fatally closed"), u64::from(DISCONNECT_COLOR)),
+            ]
+        );
+    }
+}
+
 /// Commands sent through the shard's `MessageSender` (what the gateway.send
 /// consumer uses) reach the gateway: queued until the session is identified,
 /// then in order; a reconnect command closes resumably and the shard resumes.
