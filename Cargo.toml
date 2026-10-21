@@ -44,6 +44,12 @@ tokio-websockets = { version = "0.13.3", default-features = false, features = ["
 lto = "thin"
 panic = "abort"
 
+# Dependencies are built without debug info in dev and test builds: the
+# target directory (CI cache, Docker volumes) is much smaller and linking is
+# faster. This crate keeps full debug info.
+[profile.dev.package."*"]
+debug = false
+
 [patch.crates-io]
 twilight-gateway = { path = "vendor/twilight-gateway" }
 twilight-model = { path = "vendor/twilight-model" }
