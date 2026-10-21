@@ -358,4 +358,29 @@ mod tests {
         let total = RUNNER_SHUTDOWN + WORKER_SHUTDOWN + SAVE_SHUTDOWN + Duration::from_secs(1);
         assert!(total < Duration::from_secs(10), "{total:?}");
     }
+
+    /// `run` shuts down when `docker stop` / Swarm (SIGTERM) or Ctrl-C
+    /// (SIGINT) asks, and only then. One test for both: a signal reaches
+    /// every listener in the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_waits_for_sigterm_or_sigint() {
+        for signal in ["TERM", "INT"] {
+            let wait = shutdown_signal();
+            tokio::pin!(wait);
+            // Polled, so its handlers are installed and the signal below
+            // does not end the test process.
+            let early = tokio::time::timeout(Duration::from_millis(200), &mut wait).await;
+            assert!(early.is_err(), "returned without SIG{signal}");
+            let status = std::process::Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(std::process::id().to_string())
+                .status()
+                .expect("kill runs");
+            assert!(status.success(), "kill -{signal}: {status}");
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap_or_else(|_| panic!("SIG{signal} did not end the wait"));
+        }
+    }
 }

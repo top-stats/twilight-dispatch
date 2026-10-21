@@ -12,8 +12,9 @@
 //! - the registry snapshot (`refresh()`): session, resume URL, status, close
 //!   code, fatal flag and the resume point after READY;
 //! - shutdown: a resumable close that still dispatches what arrives while
-//!   closing, all within one close timeout (the gateway's answer, held events
-//!   and READY's cache update) from when the shutdown came, also in a
+//!   closing (also past a message twilight rejects) and is not reported as a
+//!   fatal close, all within one close timeout (the gateway's answer, held
+//!   events and READY's cache update) from when the shutdown came, also in a
 //!   backpressure pause or during READY's cache update; no new connection
 //!   when the shard is already disconnected and no RESUME when the connection
 //!   drops while closing;
@@ -1396,7 +1397,8 @@ async fn events_of_one_guild_stay_in_order_across_workers() {
 // Shutdown
 
 /// Shutdown closes resumably (4000) and keeps dispatching what arrives until
-/// the gateway answers; the session is kept with the last sequence.
+/// the gateway answers; the session is kept with the last sequence and the
+/// shard is not reported as fatally closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_closes_resumably_and_dispatches_what_arrives_while_closing() {
     let _metrics = METRICS.read().await;
@@ -1426,6 +1428,9 @@ async fn shutdown_closes_resumably_and_dispatches_what_arrives_while_closing() {
     assert_ids(&running.recorder.published(), &running.ids("A", 1..=10));
     let snapshot = running.snapshot();
     assert!(!snapshot.active);
+    // The gateway's answer is no fatal close: /healthcheck and
+    // `gateway_shard_fatal` must not report a shard that was only stopped.
+    assert!(!snapshot.fatal, "{snapshot:?}");
     assert_eq!(snapshot.session_id.as_deref(), Some("A"));
     assert_eq!(
         running.handle.session_info(),
@@ -1467,6 +1472,40 @@ async fn shutdown_gives_up_on_a_gateway_that_never_answers_the_close() {
     assert_eq!(
         running.handle.session_info(),
         Some(session("A", 6, &fake.gateway.resume_url()))
+    );
+}
+
+/// A message twilight rejects while closing (here one that is not JSON) does
+/// not end the wait for the gateway's answer: what arrives after it is still
+/// dispatched now instead of replayed after the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_keeps_reading_past_a_message_twilight_rejects() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 37;
+    let mut running = start(&relay.url(), shard, redis, Opts::default());
+
+    let mut conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_published(1).await;
+    relay.hold(true);
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    conn.send_text("not json").await;
+    send_typing(&conn, 2..=3).await;
+    running.recorder.wait_published(3).await;
+    assert!(!running.finished(), "returned before the gateway answered");
+
+    relay.hold(false);
+    assert_eq!(conn.expect_close().await, Some(4000), "closed resumably");
+    running.join(Duration::from_secs(3)).await;
+    assert_ids(&running.recorder.published(), &running.ids("A", 1..=3));
+    assert_eq!(
+        running.handle.session_info(),
+        Some(session("A", 3, &fake.gateway.resume_url()))
     );
 }
 
