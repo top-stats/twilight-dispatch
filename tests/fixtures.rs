@@ -7,7 +7,58 @@ mod common;
 
 use common::*;
 use serde_json::json;
+use twilight_dispatch::gateway::runner::{prepare, Prepared};
 use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+
+/// GUILD_CREATE is an untagged enum in twilight 0.17, so its own error never
+/// says what failed; the parse error must, or a guild that is not cached
+/// cannot be diagnosed from the log.
+#[test]
+fn guild_create_parse_errors_name_the_failing_value() {
+    let mut guild = guild(1000, "g");
+    guild["channels"][0]["parent_id"] = json!("0");
+    guild["presences"][0]["activities"] = json!([{
+        "type": 4, "name": "Custom Status", "created_at": 1, "emoji": {"id": "1", "name": null},
+    }]);
+    for (d, inner) in [
+        (
+            guild.clone(),
+            "invalid value: integer `0`, expected non zero u64",
+        ),
+        (
+            {
+                let mut guild = guild.clone();
+                guild["channels"][0]["parent_id"] = json!(null);
+                guild
+            },
+            "invalid type: null, expected a string",
+        ),
+    ] {
+        let Prepared::Dispatch { parse_error, .. } =
+            prepare(&raw("GUILD_CREATE", 1, d), &state_all())
+        else {
+            panic!("not a dispatch");
+        };
+        let parse_error = parse_error.expect("does not parse");
+        assert!(
+            parse_error.contains("untagged enum GuildCreate"),
+            "{parse_error}"
+        );
+        assert!(parse_error.contains(inner), "{parse_error}");
+    }
+
+    // Other events keep their own error.
+    let mut channel = channel(1003, Some(1000), "general");
+    channel["parent_id"] = json!(0);
+    let Prepared::Dispatch { parse_error, .. } =
+        prepare(&raw("CHANNEL_UPDATE", 1, channel), &state_all())
+    else {
+        panic!("not a dispatch");
+    };
+    assert!(parse_error
+        .unwrap()
+        .starts_with("invalid value: integer `0`, expected non zero u64"));
+}
 
 #[test]
 fn fixtures_parse() {

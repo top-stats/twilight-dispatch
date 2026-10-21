@@ -125,7 +125,18 @@ fn parse_typed(json: &str, envelope: &Envelope<'_>) -> Result<Event, String> {
     deserializer
         .deserialize(&mut json_deserializer)
         .map(Event::from)
-        .map_err(|err| err.to_string())
+        .map_err(|err| match (envelope.kind(), envelope.d) {
+            // GuildCreate is an untagged enum, whose error ("did not match any
+            // variant") hides which field failed; parse `d` as the guild
+            // again, only on this path, to say.
+            (Some("GUILD_CREATE"), Some(d)) => {
+                match serde_json::from_str::<twilight_model::guild::Guild>(d.get()) {
+                    Err(inner) => format!("{err}: {inner}"),
+                    Ok(_) => err.to_string(),
+                }
+            }
+            _ => err.to_string(),
+        })
 }
 
 pub fn is_fatal_close(code: u16) -> bool {
