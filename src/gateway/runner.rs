@@ -3,7 +3,8 @@
 //!
 //! twilight-gateway only heartbeats, identifies and reconnects while the shard
 //! is being polled, so nothing slow is awaited here: cache updates and
-//! publishing happen in the workers. Two exceptions, both bounded:
+//! publishing happen in the workers. Two exceptions, both bounded and both
+//! cut short by a shutdown (which then has [`CLOSE_TIMEOUT`] in all):
 //! - READY's cache update (at most [`READY_TIMEOUT`]), which must land before
 //!   the guilds that follow it so they are not mistaken for new joins;
 //! - backpressure: when a worker queue is full the shard is first closed
@@ -52,9 +53,11 @@ use twilight_model::{
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes>
 pub const FATAL_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
 
-/// How long a resumable shutdown may take in all: waiting for the gateway to
-/// answer the close, and for room in the worker queues for what arrived until
-/// then. `app` waits a little longer for the runners before aborting them.
+/// How long a resumable shutdown may take in all, from when the runner sees
+/// it (also in a backpressure pause or during READY's cache update): waiting
+/// for the gateway to answer the close, and for room in the worker queues for
+/// what arrived until then. `app` waits a little longer for the runners
+/// before aborting them.
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Upper bound for READY's inline cache update, well below the ~41 s heartbeat.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -239,6 +242,9 @@ struct Runner<C> {
     paused_at: Option<Instant>,
     /// While shutting down: when [`Runner::close`] has to be done.
     close_deadline: Option<tokio::time::Instant>,
+    /// The shutdown signal, for the one wait inside handling a message
+    /// (READY's cache update); `run` waits on its own receiver.
+    shutdown: watch::Receiver<bool>,
     /// Discord asked to reconnect (op 7 or 9) and that was counted then, so
     /// the close that ends the connection is not counted again.
     reconnect_counted: bool,
@@ -268,6 +274,7 @@ pub async fn run<C>(
         held: VecDeque::new(),
         paused_at: None,
         close_deadline: None,
+        shutdown: shutdown.clone(),
         reconnect_counted: false,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
@@ -590,11 +597,24 @@ where
         };
         let mut conn = self.ctx.redis.clone();
         let limit = tokio::time::Instant::now() + self.ctx.cache_timeout.min(READY_TIMEOUT);
-        // A READY that arrives while closing must not hold up the shutdown.
-        let limit = self
-            .close_deadline
-            .map_or(limit, |deadline| deadline.min(limit));
-        match tokio::time::timeout_at(limit, cache::update(&mut conn, event, &update_ctx)).await {
+        let update = cache::update(&mut conn, event, &update_ctx);
+        tokio::pin!(update);
+        // Neither a READY that arrives while closing nor a shutdown requested
+        // while it is applied may hold up the shutdown: the update then has
+        // until the close's deadline, which `close` keeps.
+        let result = if let Some(deadline) = self.close_deadline {
+            tokio::time::timeout_at(deadline.min(limit), update).await
+        } else {
+            tokio::select! {
+                result = tokio::time::timeout_at(limit, &mut update) => result,
+                () = shutdown_requested(&mut self.shutdown) => {
+                    let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
+                    self.close_deadline = Some(deadline);
+                    tokio::time::timeout_at(deadline.min(limit), update).await
+                }
+            }
+        };
+        match result {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => warn!(
                 "[Shard {}] Failed to update state for READY: {}",
@@ -692,8 +712,10 @@ where
     /// all within [`CLOSE_TIMEOUT`].
     async fn close(&mut self) {
         info!("[Shard {}] Shutting down", self.id);
-        let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
-        self.close_deadline = Some(deadline);
+        // Set already when READY's cache update saw the shutdown first.
+        let deadline = *self
+            .close_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + CLOSE_TIMEOUT);
         // A disconnected shard has nothing to close; a close queued now would
         // open a new connection just to close it. Whatever it did not
         // receive is replayed after the restart.

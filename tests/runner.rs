@@ -1577,6 +1577,56 @@ async fn shutdown_does_not_wait_for_readys_cache_update_past_the_close_timeout()
     );
 }
 
+/// The other way round: a shutdown that comes during READY's cache update is
+/// seen then, and the update and the close share one close timeout from it,
+/// so a gateway that never answers the close costs nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_during_readys_cache_update_takes_one_close_timeout() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(READY_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 34;
+    let opts = Opts {
+        state: StateConfig {
+            enabled: true,
+            ..StateConfig::default()
+        },
+        ..Opts::default()
+    };
+    let mut running = start_with(&relay.url(), shard, redis, Unresponsive, opts);
+
+    let mut conn = fake.gateway.accept().await;
+    conn.hello(QUIET).await;
+    conn.expect_identify().await;
+    relay.hold(true);
+    conn.ready(1, "A", [shard, TOTAL], &[]).await;
+    // Received, so its cache update (which never ends) is running.
+    eventually("READY to be received", || {
+        (received(shard, "READY") == 1).then_some(())
+    })
+    .await;
+    let stopping = Instant::now();
+    running.shutdown.send_replace(true);
+    eventually("run() to return", || running.finished().then_some(())).await;
+    let took = stopping.elapsed();
+    assert!(
+        took >= CLOSE_TIMEOUT - Duration::from_millis(500)
+            && took < CLOSE_TIMEOUT + Duration::from_millis(700),
+        "shutdown took {took:?}"
+    );
+    // The close still went out, if only at the deadline.
+    relay.wait_held().await;
+    running.join(WAIT).await;
+    assert_ids(&running.recorder.published(), &running.ids("A", 1..=1));
+    assert_eq!(
+        running.handle.session_info(),
+        Some(session("A", 1, &fake.gateway.resume_url()))
+    );
+}
+
 /// The gateway drops the connection instead of answering the shutdown's
 /// close: nothing is left to wait for, so `run()` returns promptly and the
 /// shard does not resume a new connection during the shutdown, nor counts

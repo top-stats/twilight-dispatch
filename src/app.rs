@@ -31,10 +31,11 @@ use twilight_http::Client;
 
 /// Shutdown budget. Docker and Swarm kill the container 10 s after SIGTERM by
 /// default (raise stop_grace_period for more headroom). A runner closes its
-/// shard within `runner::CLOSE_TIMEOUT`; one aborted before that would not
-/// mirror its final session, so the runners get a second more. Then the
-/// workers drain and the sessions are saved, 8 s in all, which leaves time to
-/// close the broker connection (at most 1 s).
+/// shard within `runner::CLOSE_TIMEOUT`, also when the shutdown finds it in a
+/// backpressure pause or in READY's cache update; one aborted before that
+/// would not mirror its final session, so the runners get a second more.
+/// Then the workers drain and the sessions are saved, 8 s in all, which
+/// leaves time to close the broker connection (at most 1 s).
 const RUNNER_SHUTDOWN: Duration = runner::CLOSE_TIMEOUT.saturating_add(Duration::from_secs(1));
 const WORKER_SHUTDOWN: Duration = Duration::from_secs(2);
 const SAVE_SHUTDOWN: Duration = Duration::from_secs(1);
