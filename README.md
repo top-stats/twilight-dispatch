@@ -1,15 +1,20 @@
 # THIS IS A FORK, WE ARE USING THIS TO IMPLEMENT FEATURES WE NEED BUT DO NOT INTEND ON MAKING A FEATURE REQUEST FOR. IF YOU HAVE A FEATURE REQUEST PLEASE GO TO THE ORIGINAL REPOSITORY.
 
-## https://github.com/twilight-rs/twilight
+## https://github.com/chamburr/twilight-dispatch
 
 ## twilight-dispatch
 
-Connects to the Discord gateway, keeps a state cache in Redis and publishes
-every dispatch event to the `gateway` topic exchange of an AMQP broker
-(LavinMQ / RabbitMQ) as `{"op", "t", "d", "old"?}`, with the event name as the
-routing key. Gateway commands published to the `gateway.send` queue
-(`{"op": 0, "shard": N, "data": {...}}` to send, `{"op": 1, "shard": N}` to
-reconnect a shard) are sent to the matching shard.
+Connects to the Discord gateway (with the
+[twilight](https://github.com/twilight-rs/twilight) library), keeps a state
+cache in Redis and publishes every dispatch event to the `gateway` topic
+exchange of an AMQP broker (LavinMQ / RabbitMQ) as `{"op", "t", "d", "old"?}`,
+with the event name as the routing key. Gateway commands published to the
+`gateway.send` queue (`{"op": 0, "shard": N, "data": {...}}` to send,
+`{"op": 1, "shard": N}` to reconnect a shard) are sent to the matching shard.
+Only the gateway opcodes 3, 4, 8, 31 and 43 may be sent, and `data` (as
+compact JSON) may be at most 4096 bytes; other commands, and commands for a
+shard the bot does not have, are dropped and counted in
+`gateway_commands{result="invalid"}`.
 
 Configuration is read from environment variables (or `.env`); see
 [`.env.example`](.env.example).
@@ -17,11 +22,22 @@ Configuration is read from environment variables (or `.env`); see
 ### Operations
 
 - `GET /metrics` (Prometheus) and `GET /healthcheck` on `PROMETHEUS_HOST:PROMETHEUS_PORT`.
-  `/healthcheck` returns 503 only when restarting helps (a connected shard that
-  stopped receiving anything). Broker outages and shards closed by Discord with
+  `/healthcheck` returns 503 only when restarting helps: a connected shard
+  that received nothing for longer than `SHARD_SILENCE_SECS`, or a shard whose
+  closed connection has not finished closing after 2 minutes (twilight would
+  wait for it forever). Broker outages and shards closed by Discord with
   a non-reconnectable code are reported as `warnings` with status 200, because
   a restart would re-identify every shard and burn the daily identify limit.
   The image's `HEALTHCHECK` runs `twilight-dispatch healthcheck`.
+- The binary takes no argument (run the service) or `healthcheck`; any other
+  argument exits with status 2 without starting anything. A `.env` that
+  cannot be parsed is reported as `Failed to load .env: ...` (dotenvy applies
+  only the lines before the bad one).
+- Every log line of a shard, twilight's own included, is prefixed with
+  `shard{id=N}:`. Logs have ANSI colours only when stdout is a terminal and
+  `NO_COLOR` is not set.
+- The image runs as the unprivileged user `10001:10001`; a `.env` mounted
+  into `/usr/app` must be readable by it.
 - On SIGTERM shards are closed resumably, queued events are flushed and the
   sessions are saved, so the next start resumes them. Set
   `stop_grace_period: 30s` in Swarm / Compose (Docker's default is 10s).
@@ -31,11 +47,15 @@ Configuration is read from environment variables (or `.env`); see
   connection, so a broker crash or a connection drop right after the write
   can lose it. With `AMQP_CONFIRMS=true` it counts as published only once the
   broker confirmed it (publisher confirms); only then may the saved resume
-  point pass it. An event the broker nacked, did not confirm within 5 s, or whose connection dropped
-  first is retried and, failing that, replayed by Discord on the next
-  resume. Delivery is at-least-once: when the connection drops after the
-  broker stored an event but before its confirm arrived, the event is
-  published again (as after a restart), so consumers should dedupe by the
+  point pass it. An event the broker nacked, did not confirm within 5 s, or
+  whose connection dropped first is retried and, failing that, dropped. The
+  saved resume point stays before it for 15 minutes (`seq::FAILED_RETENTION`),
+  so a restart within that time that resumes the saved sessions (`RESUME` on,
+  `SHARDS_*` set, `SHARDS_TOTAL` unchanged) makes Discord replay it. A
+  reconnect of the running process resumes from the shard's own sequence and
+  does not replay it. Delivery is at-least-once: when the connection drops
+  after the broker stored an event but before its confirm arrived, the event
+  is published again (as after a restart), so consumers should dedupe by the
   `message_id` property (`shard:session:seq`). Each worker waits for its
   confirm before the next event, and LavinMQ confirms only after syncing its
   data directory, so the broker's disk bounds the rate per worker.
@@ -45,16 +65,20 @@ Configuration is read from environment variables (or `.env`); see
   Measured on a dev machine (LavinMQ 2.10 with its default disk sync, 1 KiB
   events): about 200 events/s from one worker, 2.5k/s from 32 and 10k/s from
   128 (about 60k/s from 32 before confirms). Raise it (up to 1024) when shards
-  log `Event queue is full; pausing the shard until it drains`. It does not
-  help one busy guild: a guild's events always use the same worker, to stay in
-  order, so a guild is capped at one worker's rate (presence updates of a
-  large guild, which the `INTENTS` of `.env.example` include, can exceed it),
-  and while its worker's queue is full the whole shard pauses. Only faster
-  confirms (the broker's disk) lift that cap. The numbers depend on the disk:
-  compare the production peak of `gateway_events` with a measurement on the
-  production broker.
+  log `Event queue is full; pausing the shard until it drains`. Each worker
+  buffers up to 1024 events, so memory for queued events grows with `WORKERS`
+  (about a million payloads at 1024). It does not help one busy guild: a
+  guild's events always use the same worker, to stay in order, so a guild is
+  capped at one worker's rate (presence updates of a large guild, which the
+  `INTENTS` of `.env.example` include, can exceed it), and while its worker's
+  queue is full the whole shard pauses. Only faster confirms (the broker's
+  disk) lift that cap. The numbers depend on the disk: compare the production
+  peak of `gateway_events` with a measurement on the production broker.
 - Events of one guild are cached and published in order; a consumer that reads
-  the cache after receiving an event sees that event applied.
+  the cache after receiving an event sees that event applied if its cache
+  update succeeded (an update that failed or was skipped while Redis is down
+  is not applied, and one that timed out may still be applied after the event
+  was published).
 - Active threads are cached under `thread:<guild>:<thread>` (indexed in
   `thread_keys`, `thread_keys:<guild>` and `guild_keys:<guild>`), the live
   copy that thread events keep current; `channel:` keys never hold threads.
@@ -65,6 +89,16 @@ Configuration is read from environment variables (or `.env`); see
   forwards the others to the `gateway.send.shards` direct exchange (routing key:
   shard id), where each process binds an exclusive queue for the shards it
   runs. Commands for shards no running process has are dropped by the broker.
+  Commands for one shard are not guaranteed to run in the order they were
+  published: one that the shard's own process consumes runs at once, while an
+  earlier one that another process consumed is still being forwarded.
+- Every second each process writes the status of its shards into
+  `gateway_statuses` (a JSON array of `{"shard", "status", "latency",
+  "last_ack"}`) and keeps the entries of the shards it does not run, so the
+  key holds the shards of every process. An entry of a shard that no running
+  process has (for example after its process stopped) keeps its last status
+  until a process running that shard writes it again. A process that starts
+  with a different shard total clears the list.
 - Identifies take turns across processes through Redis, so every process of
   the bot must use the same Redis database. Discord allows one identify per
   5 s in each bucket `shard % max_concurrency` (Discord's `max_concurrency`,
@@ -86,17 +120,41 @@ Configuration is read from environment variables (or `.env`); see
 scripts/test.sh
 ```
 
-Starts Redis and LavinMQ in Docker and runs `cargo fmt --check`, clippy and
-all unit and integration tests. Plain `cargo test` runs the unit tests and
-skips the integration tests unless `TEST_REDIS_URL` / `TEST_AMQP_URL` are set
-(`REQUIRE_SERVICES=1` turns a missing service into a failure).
+Starts Redis and LavinMQ in Docker and runs `cargo fmt --check`, clippy,
+rustdoc (warnings are errors) and all unit and integration tests. Plain
+`cargo test` runs the unit tests and skips the integration tests unless
+`TEST_REDIS_URL` / `TEST_AMQP_URL` are set (`REQUIRE_SERVICES=1` turns a
+missing service into a failure). The broker outage tests also need
+`TEST_AMQP_HTTP`, the address of LavinMQ's management API (e.g.
+`127.0.0.1:15672`).
+
+`tests/repo_files.rs` reads the repository's own files and fails on a change
+no build step catches: a vendored twilight crate that is no longer the one
+built (an unused `[patch.crates-io]` entry only warns), a patch hunk without
+its marker or a `PATCHES.md` naming something that does not exist, a second
+rustls in `Cargo.lock`, an image that runs as root, and in CI an action not
+pinned to a commit, a checkout that keeps the token or a job without a
+timeout.
 
 CI (`.github/workflows/docker.yml`) runs the same checks on every push and
-pull request on GitHub-hosted runners, with Redis and LavinMQ as service
-containers; the image is only built and published (self-hosted runner) for
-pushes to `main` and tags, after the tests passed.
+pull request on GitHub-hosted runners, as separate jobs (format; clippy and
+rustdoc; tests), with Redis and LavinMQ as service containers. A coverage job
+runs the tests under `cargo llvm-cov`, adds the per-file line coverage of
+`src/` to the run's summary, lists the lines no test runs in its log and
+uploads `lcov.info` as an artifact. The image is only built and published
+(self-hosted runner) for pushes to `main` and tags, after the format, clippy
+and test jobs passed. Actions are pinned to commits and kept current by
+Dependabot (`.github/dependabot.yml`), which also proposes crate updates
+except for the twilight crates.
 
 ### Vendored crates
 
-`vendor/twilight-model` is twilight-model 0.17.1 with a few patches (see
-[`vendor/twilight-model/PATCHES.md`](vendor/twilight-model/PATCHES.md)).
+Both are used through `[patch.crates-io]` in `Cargo.toml`; to upgrade twilight,
+re-apply the patches each `PATCHES.md` lists.
+
+- `vendor/twilight-model` is twilight-model 0.17.1 with a few patches (see
+  [`vendor/twilight-model/PATCHES.md`](vendor/twilight-model/PATCHES.md)).
+- `vendor/twilight-gateway` is twilight-gateway 0.17.1 with one patch: a
+  4007/4009 close drops the session, so the shard identifies anew instead of
+  resuming the dead session forever (see
+  [`vendor/twilight-gateway/PATCHES.md`](vendor/twilight-gateway/PATCHES.md)).

@@ -12,6 +12,14 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# No token permissions unless a job asks for them (every job does).
+permissions: {}
+
+# Actions are pinned to the commit of a release (the comment names it), so a
+# moved tag cannot change what runs; Dependabot (.github/dependabot.yml)
+# proposes updates. Checkouts do not keep the token in .git/config: no job
+# pushes to git, and the image job runs on a persistent self-hosted runner.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Superseded pull request runs are cancelled; image builds always finish.
@@ -30,7 +38,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Same toolchain as rust-toolchain.toml and the Docker image.
       - name: Install Rust
@@ -50,13 +60,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -94,14 +106,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Same toolchain as rust-toolchain.toml and the Docker image.
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Wait for Redis and LavinMQ
         run: |
@@ -118,8 +132,11 @@ jobs:
       - name: Test
         run: cargo test --locked --no-fail-fast
 
-  # Line coverage of the service code (src/; not tests/ or vendor/), with the
-  # lines no test runs listed in the log.
+  # Line coverage of the service code, with the lines no test runs listed in
+  # the log. Counted: src/, including its #[cfg(test)] modules; not tests/,
+  # vendor/ or the test-only src/model_patches.rs. A test that runs the binary
+  # counts only when the child inherits LLVM_PROFILE_FILE (tests/cli.rs clears
+  # the environment, so its runs are not counted).
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -143,22 +160,24 @@ jobs:
       TEST_REDIS_URL: redis://127.0.0.1:6379
       TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/%2f
       TEST_AMQP_HTTP: 127.0.0.1:15672
-      IGNORE_FILES: '/(vendor|tests)/'
+      IGNORE_FILES: '/(vendor|tests)/|/src/model_patches\.rs$'
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Wait for Redis and LavinMQ
         run: |
@@ -197,7 +216,7 @@ jobs:
 
       - name: Upload lcov.info
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lcov
           path: lcov.info
@@ -207,19 +226,23 @@ jobs:
     # Only pushes publish an image; pull requests stop after the tests.
     if: github.event_name == 'push'
     runs-on: self-hosted
+    # A hung build or push would otherwise hold the runner for 6 hours.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -227,7 +250,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -240,7 +263,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           push: true

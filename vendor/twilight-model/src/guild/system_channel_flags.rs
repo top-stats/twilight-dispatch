@@ -24,6 +24,7 @@ bitflags! {
 
 impl<'de> Deserialize<'de> for SystemChannelFlags {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep bits twilight does not know. (twilight-dispatch patch, PATCHES.md 3)
         Ok(Self::from_bits_retain(u64::deserialize(deserializer)?))
     }
 }

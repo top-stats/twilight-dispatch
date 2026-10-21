@@ -107,6 +107,7 @@ impl Visitor<'_> for PermissionsVisitor {
     }
 
     fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
+        // Keep bits twilight does not know. (twilight-dispatch patch, PATCHES.md 3)
         Ok(Permissions::from_bits_retain(v))
     }
 

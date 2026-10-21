@@ -3,6 +3,11 @@ name = "twilight-dispatch"
 version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
+description = "Discord gateway to AMQP bridge with a Redis state cache"
+license = "ISC"
+repository = "https://github.com/top-stats/twilight-dispatch"
+# A deployed service, not a library for crates.io.
+publish = false
 
 [lib]
 path = "src/lib.rs"

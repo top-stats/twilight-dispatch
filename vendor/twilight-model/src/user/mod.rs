@@ -54,11 +54,6 @@ pub(crate) mod discriminator {
     // Allow this lint because taking a reference is required by serde.
     #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S: Serializer>(value: &u16, serializer: S) -> Result<S::Ok, S::Error> {
-        // Users on the new username system have discriminator "0", not
-        // "0000". (twilight-dispatch patch)
-        if *value == 0 {
-            return serializer.serialize_str("0");
-        }
         serializer.collect_str(&DiscriminatorDisplay(*value))
     }
 }

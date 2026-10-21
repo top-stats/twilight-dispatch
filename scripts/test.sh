@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the full test suite (unit + integration) in Docker:
 # Redis and LavinMQ (the production broker) are started on a private network,
-# then cargo fmt --check, clippy and cargo test run in the Rust image.
+# then cargo fmt --check, clippy, rustdoc and cargo test run in the Rust image
+# (the checks of CI's fmt, clippy and test jobs).
 #
 #   scripts/test.sh                 # everything
 #   scripts/test.sh --test cache    # only tests/cache.rs (any cargo test arguments work)
@@ -46,5 +47,6 @@ MSYS_NO_PATHCONV=1 docker run --rm --network "$NAME" \
         rustup component add rustfmt clippy >/dev/null 2>&1
         cargo fmt --check
         cargo clippy --locked --all-targets -- -D warnings
+        RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps
         cargo test --locked --no-fail-fast $*
     "
