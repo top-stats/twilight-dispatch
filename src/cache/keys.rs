@@ -429,8 +429,9 @@ mod tests {
     #[test]
     fn stale_guilds_only_considers_this_shard() {
         let total = 4;
+        // Bounded: with a broken formula the test fails instead of hanging.
         let on = |shard: u32| -> Vec<u64> {
-            (1u64..)
+            (1u64..64)
                 .map(|n| n << 22)
                 .filter(|id| shard_for_guild(*id, total) == shard)
                 .take(3)

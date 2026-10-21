@@ -453,3 +453,81 @@ async fn legacy_entries_survive_a_failed_probe() {
     // Nothing was deleted: the next run migrates them.
     assert!(redis.transactions().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// When an expiry run stops, scripted
+
+/// A scripted Redis for the expiry job: every ZRANGEBYSCORE finds the same
+/// `due` keys and every script run removes `removed` of them.
+struct DueEveryTime {
+    due: Vec<String>,
+    removed: u64,
+    queries: usize,
+}
+
+impl DueEveryTime {
+    fn new(due: usize, removed: u64) -> Self {
+        Self {
+            due: (0..due).map(|id| format!("message:7:{id}")).collect(),
+            removed,
+            queries: 0,
+        }
+    }
+}
+
+impl ConnectionLike for DueEveryTime {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        let reply = match args(cmd)[0].as_str() {
+            "ZRANGEBYSCORE" => {
+                self.queries += 1;
+                // Nothing is due after a few rounds, so a run that does not
+                // stop fails the test instead of hanging it.
+                let due = self.due.iter().filter(|_| self.queries <= 3);
+                redis::Value::Array(due.map(|key| bulk(key)).collect())
+            }
+            "EVALSHA" => redis::Value::Int(self.removed as i64),
+            other => panic!("unexpected command {other}"),
+        };
+        Box::pin(async move { Ok(reply) })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        _pipeline: &'a redis::Pipeline,
+        _offset: usize,
+        _count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        panic!("the expiry job sends no pipelines")
+    }
+
+    fn get_db(&self) -> i64 {
+        0
+    }
+}
+
+/// The job runs every second on Redis' single thread: fewer due keys than a
+/// batch means there is nothing left, so it does not ask again.
+#[tokio::test]
+async fn an_expiry_run_ends_with_a_batch_that_is_not_full() {
+    let mut redis = DueEveryTime::new(3, 3);
+    assert_eq!(jobs::expire_due(&mut redis, 1_000).await.unwrap(), 3);
+    assert_eq!(redis.queries, 1);
+}
+
+/// A full batch of which the script removes nothing (refreshed after they
+/// were read, or not removable at all) ends the run. Keys that stay due but
+/// are never removed would otherwise keep the job looping on Redis.
+#[tokio::test]
+async fn an_expiry_run_ends_when_a_full_batch_removes_nothing() {
+    let mut redis = DueEveryTime::new(EXPIRY_BATCH, 0);
+    assert_eq!(jobs::expire_due(&mut redis, 1_000).await.unwrap(), 0);
+    assert_eq!(redis.queries, 1);
+
+    // Removing some of a full batch goes on with the next one.
+    let mut redis = DueEveryTime::new(EXPIRY_BATCH, 1);
+    assert_eq!(jobs::expire_due(&mut redis, 1_000).await.unwrap(), 3);
+    assert_eq!(redis.queries, 4);
+}

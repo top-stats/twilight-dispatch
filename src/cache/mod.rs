@@ -851,6 +851,12 @@ mod tests {
         assert!(joined_recently(at(now_ms - 1_000), now_ms));
         assert!(!joined_recently(at(now_ms - RECENT_JOIN_MS - 1), now_ms));
         assert!(!joined_recently(None, now_ms), "guests have no joined_at");
+
+        // Spelled out in minutes: the bounds above follow the constant, so
+        // they cannot tell a window of seconds or of an hour from this one.
+        let minutes_ago = |minutes: i64| at(now_ms - minutes * 60 * 1000);
+        assert!(joined_recently(minutes_ago(14), now_ms), "a join");
+        assert!(!joined_recently(minutes_ago(16), now_ms), "a re-sent add");
     }
 
     #[test]
