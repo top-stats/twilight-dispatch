@@ -381,6 +381,11 @@ where
     /// Count and log the end of a connection: at its close, or at the next
     /// HELLO when it ended without one (see [`Prepared::Hello`]). twilight
     /// reconnects unless the gateway closed it with a fatal `code`.
+    ///
+    /// Never counted twice, but not exact either: a connection that ends
+    /// without a close is not counted when no HELLO follows (the shard shuts
+    /// down first), and when the next connection is closed before its HELLO
+    /// both ends are counted as one.
     fn disconnected(&mut self, code: Option<u16>) {
         self.connection_open = false;
         SHARD_EVENTS.with_label_values(&["Disconnected"]).inc();
