@@ -594,6 +594,44 @@ async fn deletes_of_a_previous_session_are_still_applied() {
     );
 }
 
+/// A guild joined just before the session ended is logged once, by the new
+/// session's GUILD_CREATE. The stale one is not applied, so the guild is still
+/// unknown when the new one arrives; judging the stale one by its recent
+/// `joined_at` (as without the cache) would log the join twice.
+#[tokio::test]
+async fn a_join_queued_before_a_new_session_is_logged_once() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(7).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let registry = Arc::new(Registry::new([handle.clone()]));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = context(
+        conn.clone(),
+        registry,
+        recorder.clone(),
+        Duration::from_secs(5),
+    );
+    let mut joined = guild(1000, "g");
+    joined["joined_at"] = json!(now_iso());
+    let joins = || GUILD_EVENTS.with_label_values(&["Join"]).get();
+    let before = joins();
+
+    let stale = job(&handle, "GUILD_CREATE", 2, joined.clone(), true);
+    handle.new_session(1);
+    worker::process(&ctx, &mut conn, stale).await;
+    assert!(!exists(&mut conn, "guild:1000").await);
+    assert_eq!(joins() - before, 0, "the stale GUILD_CREATE is no join");
+
+    let current = job(&handle, "GUILD_CREATE", 2, joined, true);
+    worker::process(&ctx, &mut conn, current).await;
+    assert!(exists(&mut conn, "guild:1000").await);
+    assert_eq!(joins() - before, 1);
+    assert_eq!(recorder.published.lock().unwrap().len(), 2);
+    assert_eq!(handle.in_flight(), 0);
+}
+
 /// Which jobs of a previous session (queued before READY of the new one) are
 /// still applied to the cache (`worker::only_removes`), for every event the
 /// cache can receive: only removals that nothing replays.

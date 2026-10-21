@@ -475,7 +475,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::Poll;
+    use std::{io::ErrorKind, task::Poll};
     use twilight_model::gateway::payload::incoming::MessageDelete;
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
     enum Fake {
         /// Never answers, like a stalled or paused Redis.
         Hang,
-        BrokenPipe,
+        Io(ErrorKind),
         /// An error about the command, not the connection (like WRONGTYPE).
         Rejected,
         /// Nil, as for a key that is not cached.
@@ -534,9 +534,7 @@ mod tests {
             Box::pin(async move {
                 match self {
                     Self::Hang => std::future::pending().await,
-                    Self::BrokenPipe => {
-                        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
-                    }
+                    Self::Io(kind) => Err(std::io::Error::from(kind).into()),
                     Self::Rejected => {
                         Err((redis::ErrorKind::UnexpectedReturnType, "WRONGTYPE").into())
                     }
@@ -611,7 +609,13 @@ mod tests {
     async fn every_way_a_probe_ends_releases_it() {
         let short = Duration::from_millis(10);
         for (mut conn, reopens) in [
-            (Fake::BrokenPipe, true),
+            (Fake::Io(ErrorKind::BrokenPipe), true),
+            // The connection's own response timeout (redis_conn::RESPONSE_TIMEOUT),
+            // which a stalled Redis hits before the default CACHE_TIMEOUT_MS.
+            (Fake::Io(ErrorKind::TimedOut), true),
+            // Neither a timeout nor a dropped or refused connection, like a
+            // failed DNS lookup of the Redis host while it restarts.
+            (Fake::Io(ErrorKind::Other), true),
             (Fake::Hang, true),
             (Fake::Rejected, false),
         ] {
