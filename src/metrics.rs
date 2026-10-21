@@ -954,4 +954,53 @@ mod tests {
 
         server.abort();
     }
+
+    /// Set in the process that `the_first_scrape_lists_every_metric` starts.
+    const FRESH_PROCESS: &str = "TWILIGHT_DISPATCH_TEST_FRESH_PROCESS";
+
+    #[tokio::test]
+    async fn the_first_scrape_lists_every_metric() {
+        // The other tests in this binary use metrics, and the first use of one
+        // registers them all, so only a process of its own shows what /metrics
+        // lists before anything used a metric.
+        if std::env::var_os(FRESH_PROCESS).is_none() {
+            let test = "metrics::tests::the_first_scrape_lists_every_metric";
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact"])
+                .env(FRESH_PROCESS, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(run_server(listener));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        server.abort();
+
+        // A counter that is missing until its first increment hides that
+        // increment from increase() and rate(), which only see the change
+        // between two scrapes. Vectors cannot be listed before their first
+        // child.
+        for metric in descriptors().iter().filter(|m| m.labels.is_empty()) {
+            let line = format!("{} 0", metric.name);
+            assert!(response.lines().any(|l| l == line), "{line} in\n{response}");
+        }
+    }
 }
