@@ -92,8 +92,10 @@ use tokio::{
 };
 use tokio_websockets::{CloseCode, Message, ServerBuilder, WebSocketStream};
 
-/// Default bound for every wait.
-pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Default bound for every wait. Only a failing test waits this long, so it
+/// is generous: a loaded machine can take over 10 s from starting the
+/// service to its first gateway connection (identify queue, broker connect).
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the fake REST API reports about the bot.
 #[derive(Clone, Debug)]
