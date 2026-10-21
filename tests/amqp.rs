@@ -3,7 +3,8 @@
 //! AMQP supervision against a real broker (set TEST_AMQP_URL; CI uses
 //! LavinMQ, the production broker). The tests that close connections from
 //! the broker side or check acknowledgements also use its management API
-//! (TEST_AMQP_HTTP, e.g. `127.0.0.1:15672`).
+//! (TEST_AMQP_HTTP, e.g. `127.0.0.1:15672`). The outage tests connect
+//! through a TCP proxy ([`Proxy`]) that plays a broker going away.
 
 mod common;
 
@@ -17,9 +18,19 @@ use lapin::{
     BasicProperties, Connection, ConnectionProperties,
 };
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::watch,
+};
 use twilight_dispatch::{
-    amqp::Amqp,
+    amqp::{Amqp, OUTAGE_BUDGET},
     commands::run_consumer,
     constants::{QUEUE_RECV, QUEUE_SEND, SHARD_EXCHANGE},
     gateway::registry::{Registry, ShardHandle},
@@ -28,8 +39,17 @@ use twilight_dispatch::{
 use twilight_gateway::{Intents, Shard, ShardId};
 
 /// The tests share the `gateway.recv` and `gateway.send` queues and the
-/// command counters, so they run one at a time.
+/// command counters, so they run one at a time. The broker-side kills also
+/// hit every connection named "twilight-dispatch".
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The generation of the installed link, `None` while there is none.
+fn generation(amqp: &Amqp) -> Option<u64> {
+    amqp.subscribe()
+        .borrow()
+        .as_ref()
+        .map(|link| link.generation)
+}
 
 async fn receive_one(url: &str) -> (String, Vec<u8>) {
     let connection = Connection::connect(url, ConnectionProperties::default())
@@ -91,13 +111,19 @@ async fn publishes_to_the_gateway_exchange() {
     let _serial = SERIAL.lock().await;
     let amqp = Amqp::connect(url.clone(), true).await.unwrap();
     purge(&url, QUEUE_RECV).await;
+    let link = generation(&amqp);
 
-    amqp.publish("MESSAGE_CREATE", br#"{"op":0}"#, BasicProperties::default())
-        .await
-        .unwrap();
-    let (routing_key, body) = receive_one(&url).await;
-    assert_eq!(routing_key, "MESSAGE_CREATE");
-    assert_eq!(body, br#"{"op":0}"#);
+    for _ in 0..2 {
+        amqp.publish("MESSAGE_CREATE", br#"{"op":0}"#, BasicProperties::default())
+            .await
+            .unwrap();
+        let (routing_key, body) = receive_one(&url).await;
+        assert_eq!(routing_key, "MESSAGE_CREATE");
+        assert_eq!(body, br#"{"op":0}"#);
+    }
+    // A healthy connection is kept: publishing does not reconnect.
+    assert!(link.is_some());
+    assert_eq!(generation(&amqp), link);
     amqp.close().await;
 }
 
@@ -109,14 +135,51 @@ async fn publishing_survives_a_closed_channel() {
     let _serial = SERIAL.lock().await;
     let amqp = Amqp::connect(url.clone(), true).await.unwrap();
     purge(&url, QUEUE_RECV).await;
+    let broken = generation(&amqp).unwrap();
 
     amqp.break_channel_for_tests().await;
     amqp.publish("GUILD_CREATE", b"{}", BasicProperties::default())
         .await
         .unwrap();
     assert!(amqp.is_connected());
+    assert!(
+        generation(&amqp).is_some_and(|link| link > broken),
+        "published on a new link"
+    );
     let (routing_key, _) = receive_one(&url).await;
     assert_eq!(routing_key, "GUILD_CREATE");
+    amqp.close().await;
+}
+
+/// `mark_broken` with the generation of the current link drops it at once
+/// (and the supervisor connects again); a report about an older link, from
+/// a caller that noticed late, leaves its replacement alone.
+#[tokio::test]
+async fn only_reports_about_the_current_link_drop_it() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let amqp = Amqp::connect(url, false).await.unwrap();
+    let first = generation(&amqp).unwrap();
+
+    // Nothing is awaited in between, so the supervisor cannot reconnect yet.
+    amqp.mark_broken(Some(first));
+    assert!(!amqp.is_connected(), "the reported link is dropped");
+    assert_eq!(generation(&amqp), None);
+    wait_until(|| amqp.is_connected()).await;
+    let second = generation(&amqp).unwrap();
+    assert!(second > first, "{first} -> {second}");
+
+    amqp.mark_broken(Some(first));
+    assert!(amqp.is_connected(), "a stale report is ignored");
+    assert_eq!(generation(&amqp), Some(second));
+
+    // `None`: whatever link is current.
+    amqp.mark_broken(None);
+    assert_eq!(generation(&amqp), None);
+    wait_until(|| amqp.is_connected()).await;
+    assert!(generation(&amqp).is_some_and(|link| link > second));
     amqp.close().await;
 }
 
@@ -333,6 +396,41 @@ async fn publishing_survives_the_broker_closing_the_connection() {
     amqp.close().await;
 }
 
+/// The supervisor replaces a broken link on its own, not only once a
+/// publish fails on it: until then `is_connected` (amqp_connected and the
+/// healthcheck) would report a dead connection as up, and a quiet bot
+/// would only find out at its next event.
+#[tokio::test]
+async fn broken_links_are_replaced_without_traffic() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let Some(api) = management_api() else {
+        return;
+    };
+    let amqp = Amqp::connect(url, false).await.unwrap();
+    let replaced = |after: u64| generation(&amqp).is_some_and(|link| link > after);
+
+    // A channel exception: the connection itself stays up.
+    let first = generation(&amqp).unwrap();
+    amqp.break_channel_for_tests().await;
+    wait_until(|| replaced(first) && amqp.is_connected()).await;
+    assert!(
+        replaced(first) && amqp.is_connected(),
+        "after a channel error"
+    );
+
+    let second = generation(&amqp).unwrap();
+    kill_our_connections(&api).await;
+    wait_until(|| replaced(second) && amqp.is_connected()).await;
+    assert!(
+        replaced(second) && amqp.is_connected(),
+        "after the broker closed the connection"
+    );
+    amqp.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // The gateway command consumer
 
@@ -429,6 +527,80 @@ async fn the_command_consumer_follows_reconnects() {
     assert_eq!(commands("", "invalid"), invalid + 1, "dropped once");
     assert_eq!(commands("0", "sent"), sent + 2);
 
+    // It consumes until the connection is closed, then returns rather than
+    // waiting for a link that never comes.
+    amqp.close().await;
+    tokio::time::timeout(Duration::from_secs(5), consumer)
+        .await
+        .expect("the consumer returns once the connection is closed")
+        .unwrap();
+}
+
+/// The warnings this test binary logged.
+static WARNINGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+struct WarningWriter;
+
+impl std::io::Write for WarningWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        WARNINGS.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Collect warnings in [`WARNINGS`]; returns how many bytes there already
+/// are, so a test can read only its own.
+fn capture_warnings() -> usize {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(|| WarningWriter)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+    WARNINGS.lock().unwrap().len()
+}
+
+fn warnings_since(start: usize) -> String {
+    String::from_utf8_lossy(&WARNINGS.lock().unwrap()[start..]).into_owned()
+}
+
+/// A shard of this process that stopped for good (a fatal close code) has
+/// no sender: its commands are dropped, counted and logged as a warning
+/// naming the shard. Commands that reach their shard are not warned about.
+#[tokio::test]
+async fn commands_for_a_stopped_shard_are_dropped_with_a_warning() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let Some(api) = management_api() else {
+        return;
+    };
+    let logged = capture_warnings();
+    let running = idle_shard(0, 2);
+    purge(&url, QUEUE_SEND).await;
+    let amqp = Amqp::connect(url.clone(), true).await.unwrap();
+    let registry = Arc::new(Registry::new([
+        Arc::new(ShardHandle::new(0, Some(running.sender()), None)),
+        Arc::new(ShardHandle::new(1, None, None)),
+    ]));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 2));
+    wait_for_consumers(&api, 1).await;
+
+    let (sent, dropped) = (commands("0", "sent"), commands("1", "dropped"));
+    send_command(&url, presence(0, 1).as_bytes()).await;
+    send_command(&url, presence(1, 2).as_bytes()).await;
+    wait_until(|| commands("0", "sent") > sent && commands("1", "dropped") > dropped).await;
+    assert_eq!(commands("0", "sent"), sent + 1);
+    assert_eq!(commands("1", "dropped"), dropped + 1);
+    wait_until_acked(&api, QUEUE_SEND).await;
+
+    let warnings = warnings_since(logged);
+    assert!(warnings.contains("Shard 1 "), "{warnings}");
+    assert!(!warnings.contains("Shard 0 "), "{warnings}");
     consumer.abort();
     amqp.close().await;
 }
@@ -596,4 +768,247 @@ async fn commands_reach_the_process_running_the_shard() {
         consumer.abort();
         amqp.close().await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// A broker that goes away
+
+/// What [`Proxy`] does with connections.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    /// Forward them to the broker.
+    Up,
+    /// Close them at once, as a restarting broker does: a fast failure.
+    Down,
+    /// Accept them but forward nothing until the mode changes, as a broker
+    /// that is slow to answer; they go through if it changes to `Up`.
+    Hold,
+    /// Forward them but close each one [`FLAKY_LIFETIME`] after it reached
+    /// the broker, as a broker that closes every channel when low on disk.
+    Flaky,
+}
+
+const FLAKY_LIFETIME: Duration = Duration::from_millis(500);
+
+/// A TCP proxy in front of the test broker, so a test can take the broker
+/// away and bring it back without touching the real one (other tests use
+/// it). Changing the mode closes every connection it is forwarding.
+struct Proxy {
+    /// TEST_AMQP_URL with the proxy's address.
+    url: String,
+    mode: watch::Sender<Mode>,
+    /// Connections accepted so far: connection attempts.
+    accepted: Arc<AtomicUsize>,
+    /// Connections forwarded to the broker so far, and those of them that
+    /// are closed again.
+    forwarded: Arc<(AtomicUsize, AtomicUsize)>,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl Proxy {
+    async fn start(url: &str) -> Self {
+        // amqp://user:pass@host:port/vhost
+        let (credentials, rest) = url.split_once('@').expect("credentials in TEST_AMQP_URL");
+        let (broker, vhost) = rest.split_once('/').unwrap_or((rest, ""));
+        let broker = broker.to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("{credentials}@{}/{vhost}", listener.local_addr().unwrap());
+        let mode = watch::Sender::new(Mode::Up);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let forwarded = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let listener = tokio::spawn({
+            let (modes, accepted, forwarded) =
+                (mode.subscribe(), accepted.clone(), forwarded.clone());
+            async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    let relay = relay(client, broker.clone(), modes.clone(), forwarded.clone());
+                    tokio::spawn(relay);
+                }
+            }
+        });
+        Self {
+            url,
+            mode,
+            accepted,
+            forwarded,
+            listener,
+        }
+    }
+
+    fn set(&self, mode: Mode) {
+        self.mode.send_replace(mode);
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn forwarded(&self) -> usize {
+        self.forwarded.0.load(Ordering::SeqCst)
+    }
+
+    /// Connections being forwarded right now.
+    fn forwarding(&self) -> usize {
+        self.forwarded() - self.forwarded.1.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        // Dropping `mode` closes the forwarded connections.
+        self.listener.abort();
+    }
+}
+
+async fn relay(
+    mut client: TcpStream,
+    broker: String,
+    mut mode: watch::Receiver<Mode>,
+    forwarded: Arc<(AtomicUsize, AtomicUsize)>,
+) {
+    let current = *mode.borrow_and_update();
+    let flaky = match current {
+        Mode::Down => return,
+        Mode::Hold => {
+            if mode.changed().await.is_err() || *mode.borrow_and_update() != Mode::Up {
+                return;
+            }
+            false
+        }
+        Mode::Up => false,
+        Mode::Flaky => true,
+    };
+    let Ok(mut broker) = TcpStream::connect(broker).await else {
+        return;
+    };
+    forwarded.0.fetch_add(1, Ordering::SeqCst);
+    let closed = async {
+        if flaky {
+            tokio::time::sleep(FLAKY_LIFETIME).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut client, &mut broker) => {}
+        _ = mode.changed() => {}
+        _ = closed => {}
+    }
+    forwarded.1.fetch_add(1, Ordering::SeqCst);
+}
+
+/// During an outage publishes wait for the reconnect, but only for
+/// OUTAGE_BUDGET from the start of the outage, not per message: after that
+/// they fail at once, so a long outage cannot stall the workers (and with
+/// them the shards). Meanwhile the supervisor retries with a backoff capped
+/// at 2 s for refused connections, so it neither hammers the broker nor
+/// stays away long once the broker is back.
+#[tokio::test]
+async fn an_outage_stalls_publishes_only_within_the_budget() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let proxy = Proxy::start(&url).await;
+    let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
+    let publish = || amqp.publish("TYPING_START", b"{}", BasicProperties::default());
+    publish().await.unwrap();
+
+    proxy.set(Mode::Down);
+    wait_until(|| !amqp.is_connected()).await;
+    assert!(!amqp.is_connected(), "the closed connection is noticed");
+    let attempts = proxy.accepted();
+    let outage = Instant::now();
+    assert!(publish().await.is_err());
+    let waited = outage.elapsed();
+    assert!(
+        waited >= OUTAGE_BUDGET - Duration::from_secs(1)
+            && waited <= OUTAGE_BUDGET + Duration::from_secs(3),
+        "the first publish waited {waited:?}"
+    );
+    let started = Instant::now();
+    assert!(publish().await.is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "a publish after the budget waited {:?}",
+        started.elapsed()
+    );
+    // 250 ms, 500 ms, 1 s, then every 2 s.
+    let attempts = proxy.accepted() - attempts;
+    assert!(
+        (5..=20).contains(&attempts),
+        "{attempts} connection attempts in {waited:?}"
+    );
+
+    proxy.set(Mode::Up);
+    let back = Instant::now();
+    wait_until(|| amqp.is_connected()).await;
+    assert!(
+        amqp.is_connected() && back.elapsed() < Duration::from_secs(4),
+        "connected {:?} after the broker was back",
+        back.elapsed()
+    );
+    publish().await.unwrap();
+    amqp.close().await;
+}
+
+/// A link that breaks right after it was installed counts as a failed
+/// attempt: against a broker that drops every connection soon after the
+/// handshake the supervisor backs off (250 ms, 500 ms, 1 s, 2 s, 4 s...)
+/// instead of reconnecting at every check.
+#[tokio::test]
+async fn links_that_break_right_away_are_retried_with_backoff() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let proxy = Proxy::start(&url).await;
+    let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
+
+    let before = proxy.accepted();
+    proxy.set(Mode::Flaky);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    // About 5 in 10 s; without the backoff 8 to 10 (one per check).
+    let attempts = proxy.accepted() - before;
+    assert!(
+        (2..=6).contains(&attempts),
+        "{attempts} connections in 10 s"
+    );
+    amqp.close().await;
+}
+
+/// `close` is final, even while the supervisor is connecting: the link that
+/// connects afterwards is closed rather than installed, and publishes fail
+/// at once instead of waiting for the broker.
+#[tokio::test]
+async fn closing_is_final_even_during_a_reconnect() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let proxy = Proxy::start(&url).await;
+    let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
+    assert_eq!(proxy.forwarding(), 1);
+
+    let (accepted, forwarded) = (proxy.accepted(), proxy.forwarded());
+    proxy.set(Mode::Hold);
+    wait_until(|| proxy.accepted() > accepted).await;
+    assert!(proxy.accepted() > accepted, "the supervisor is connecting");
+    amqp.close().await;
+    // The held connection goes through now and completes the handshake.
+    proxy.set(Mode::Up);
+    wait_until(|| proxy.forwarded() > forwarded && proxy.forwarding() == 0).await;
+    assert!(
+        proxy.forwarded() > forwarded,
+        "the held connection went through"
+    );
+    assert_eq!(proxy.forwarding(), 0, "the late connection is closed");
+    assert!(!amqp.is_connected());
+    assert_eq!(generation(&amqp), None);
+
+    let started = Instant::now();
+    let published = amqp.publish("TYPING_START", b"{}", BasicProperties::default());
+    assert!(published.await.is_err());
+    assert!(started.elapsed() < Duration::from_millis(500));
 }
