@@ -338,20 +338,7 @@ where
         self.handle.update(|s| s.close_wait_since = None);
         match item {
             None => {
-                error!(
-                    "[Shard {}] Closed by Discord with a non-reconnectable code; it will not reconnect",
-                    self.id
-                );
-                self.handle.update(|s| {
-                    s.fatal = true;
-                    s.active = false;
-                    s.status = "FatallyClosed";
-                });
-                SHARD_EVENTS.with_label_values(&["FatallyClosed"]).inc();
-                self.ctx.discord.shard(
-                    DISCONNECT_COLOR,
-                    format!("[Shard {}] Fatally closed", self.id),
-                );
+                self.fatally_closed();
                 return false;
             }
             Some(Err(err)) => {
@@ -403,6 +390,25 @@ where
         self.ctx.discord.shard(
             DISCONNECT_COLOR,
             format!("[Shard {}] Disconnected", self.id),
+        );
+    }
+
+    /// The shard stopped for good: the gateway closed it with a code that
+    /// does not allow reconnecting.
+    fn fatally_closed(&self) {
+        error!(
+            "[Shard {}] Closed by Discord with a non-reconnectable code; it will not reconnect",
+            self.id
+        );
+        self.handle.update(|s| {
+            s.fatal = true;
+            s.active = false;
+            s.status = "FatallyClosed";
+        });
+        SHARD_EVENTS.with_label_values(&["FatallyClosed"]).inc();
+        self.ctx.discord.shard(
+            DISCONNECT_COLOR,
+            format!("[Shard {}] Fatally closed", self.id),
         );
     }
 
@@ -716,6 +722,7 @@ where
         let deadline = *self
             .close_deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + CLOSE_TIMEOUT);
+        let mut fatal = false;
         // A disconnected shard has nothing to close; a close queued now would
         // open a new connection just to close it. Whatever it did not
         // receive is replayed after the restart.
@@ -723,6 +730,16 @@ where
             self.shard.close(CloseFrame::RESUME);
             loop {
                 let json = match tokio::time::timeout_at(deadline, self.shard.next()).await {
+                    // No echo of the shard's 4000 but the gateway ending the
+                    // session for good (twilight ignores the code, as it
+                    // closed first): recorded as it is without a shutdown.
+                    Ok(Some(Ok(Message::Close(Some(frame))))) if is_fatal_close(frame.code) => {
+                        self.on_close(Some((frame.code, frame.reason.to_string())));
+                        fatal = true;
+                        break;
+                    }
+                    // twilight ends the stream only after yielding the fatal
+                    // close above, so `None` does not get here first.
                     Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
                     Ok(Some(Ok(Message::Text(json)))) => json,
                     // The connection is gone (it dropped instead of
@@ -766,6 +783,10 @@ where
         // record: a connection twilight opened meanwhile was never used.
         self.sync();
         self.handle.update(|s| s.active = false);
+        if fatal {
+            // After `sync`, which mirrors twilight's view of the close.
+            self.fatally_closed();
+        }
     }
 }
 

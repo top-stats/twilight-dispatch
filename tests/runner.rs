@@ -504,6 +504,30 @@ fn assert_ids(published: &[Published], expected: &[String]) {
     );
 }
 
+/// A Discord log that posts to `LOG_CHANNEL` of the fake API.
+fn discord_log(fake: &FakeDiscord) -> DiscordLog {
+    let proxy = fake.api.proxy().trim_start_matches("http://").to_owned();
+    let http = Client::builder()
+        .token(TOKEN.to_owned())
+        .proxy(proxy, true)
+        .build();
+    DiscordLog::new(Arc::new(http), LOG_CHANNEL, 0)
+}
+
+/// The title and color of each posted log embed.
+fn logged(posts: &[Value]) -> Vec<(String, u64)> {
+    posts
+        .iter()
+        .map(|post| {
+            let embed = &post["embeds"][0];
+            (
+                embed["title"].as_str().unwrap_or_default().to_owned(),
+                embed["color"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// A port nothing listens on right now.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -1773,6 +1797,57 @@ async fn fatal_close_codes_end_the_runner_without_reconnecting() {
     );
 }
 
+/// A fatal close that crosses the shutdown's close is the gateway ending the
+/// session, not its answer: it is recorded as without a shutdown (snapshot,
+/// metrics and log), although twilight ignores its code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fatal_close_while_shutting_down_is_recorded() {
+    let _metrics = METRICS.write().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let relay = Relay::start(&fake.gateway.url()).await;
+    let shard = 35;
+    let opts = Opts {
+        discord: discord_log(&fake),
+        ..Opts::default()
+    };
+    let mut running = start(&relay.url(), shard, redis, opts);
+    let conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_published(1).await;
+    let kinds = ["Disconnected", "Reconnecting", "FatallyClosed"];
+    let before = kinds.map(shard_events);
+
+    relay.hold(true);
+    running.shutdown.send_replace(true);
+    relay.wait_held().await;
+    // Sent before the gateway saw the shard's close.
+    conn.close(4004, "Authentication failed").await;
+    running.join(CLOSE_TIMEOUT + Duration::from_secs(2)).await;
+
+    let snapshot = running.snapshot();
+    assert!(snapshot.fatal && !snapshot.active, "{snapshot:?}");
+    assert_eq!(snapshot.status, "FatallyClosed");
+    assert_eq!(snapshot.close_code, Some(4004));
+    let deltas: Vec<u64> = kinds
+        .iter()
+        .zip(before)
+        .map(|(kind, before)| shard_events(kind) - before)
+        .collect();
+    assert_eq!(deltas, [1, 0, 1], "{kinds:?}");
+    let posts = fake.api.wait_posts(LOG_CHANNEL, 3).await;
+    let title = |what: &str| format!("[Shard {shard}] {what}");
+    assert_eq!(
+        logged(&posts),
+        [
+            (title("Ready"), u64::from(READY_COLOR)),
+            (title("Disconnected"), u64::from(DISCONNECT_COLOR)),
+            (title("Fatally closed"), u64::from(DISCONNECT_COLOR)),
+        ]
+    );
+}
+
 /// Commands sent through the shard's `MessageSender` (what the gateway.send
 /// consumer uses) reach the gateway: queued until the session is identified,
 /// then in order; a reconnect command closes resumably and the shard resumes.
@@ -1824,12 +1899,6 @@ async fn the_shard_lifecycle_is_counted_and_logged() {
     };
     let fake = FakeDiscord::start().await;
     let shard = 6;
-    let proxy = fake.api.proxy().trim_start_matches("http://").to_owned();
-    let http = Client::builder()
-        .token(TOKEN.to_owned())
-        .proxy(proxy, true)
-        .build();
-    let discord = DiscordLog::new(Arc::new(http), LOG_CHANNEL, 0);
     let kinds = [
         "Connecting",
         "Identifying",
@@ -1843,7 +1912,7 @@ async fn the_shard_lifecycle_is_counted_and_logged() {
     ];
     let before: Vec<u64> = kinds.iter().map(|kind| shard_events(kind)).collect();
     let opts = Opts {
-        discord,
+        discord: discord_log(&fake),
         ..Opts::default()
     };
     let mut running = start(&fake.gateway.url(), shard, redis, opts);
@@ -1879,19 +1948,9 @@ async fn the_shard_lifecycle_is_counted_and_logged() {
     assert_eq!(deltas, expected);
 
     let posts = fake.api.wait_posts(LOG_CHANNEL, 6).await;
-    let logged: Vec<(String, u64)> = posts
-        .iter()
-        .map(|post| {
-            let embed = &post["embeds"][0];
-            (
-                embed["title"].as_str().unwrap_or_default().to_owned(),
-                embed["color"].as_u64().unwrap_or_default(),
-            )
-        })
-        .collect();
     let title = |what: &str| format!("[Shard {shard}] {what}");
     assert_eq!(
-        logged,
+        logged(&posts),
         [
             (title("Ready"), u64::from(READY_COLOR)),
             (title("Disconnected"), u64::from(DISCONNECT_COLOR)),
