@@ -27,7 +27,8 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use prometheus::{
-    core::{MetricVec, MetricVecBuilder},
+    core::{Collector, Desc, MetricVec, MetricVecBuilder},
+    proto::MetricType,
     register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
     Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
@@ -46,8 +47,9 @@ use tracing::warn;
 ///
 /// The first use of any metric also registers all the others (see [`init`]),
 /// so /metrics lists every metric (vectors once they have a child) instead of
-/// only those something happened to touch, and a new metric shows up in the
-/// metric names snapshot without the test knowing about it.
+/// only those something happened to touch. [`descriptors`] lists vectors
+/// without a child too, so a new metric shows up in the metric names snapshot
+/// without the test knowing about it.
 pub struct Metric<T>(LazyLock<T>);
 
 impl<T> Metric<T> {
@@ -95,14 +97,70 @@ impl<B: MetricVecBuilder, const N: usize> Labelled<MetricVec<B>, N> {
     }
 }
 
-trait Register: Sync {
-    fn register(&self);
+/// A metric as it is declared, whether or not /metrics lists it yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Descriptor {
+    pub name: String,
+    pub help: String,
+    pub kind: MetricType,
+    /// The label names, in the order `with_label_values` takes the values.
+    pub labels: Vec<String>,
 }
 
-impl<T: Send + Sync> Register for Metric<T> {
+/// What [`descriptors`] reads from a metric. Its `Desc` has everything but
+/// the type, and `Collector::collect` would copy every child to get that.
+trait Describe {
+    const KIND: MetricType;
+    fn descs(&self) -> Vec<&Desc>;
+}
+
+macro_rules! describe {
+    ($($metric:ty => $kind:ident),*) => {$(
+        impl Describe for $metric {
+            const KIND: MetricType = MetricType::$kind;
+            fn descs(&self) -> Vec<&Desc> {
+                self.desc()
+            }
+        }
+    )*};
+}
+describe!(
+    IntCounter => COUNTER,
+    IntCounterVec => COUNTER,
+    IntGauge => GAUGE,
+    IntGaugeVec => GAUGE
+);
+
+impl<V: Describe, const N: usize> Describe for Labelled<V, N> {
+    const KIND: MetricType = V::KIND;
+    fn descs(&self) -> Vec<&Desc> {
+        self.0.descs()
+    }
+}
+
+trait Register: Sync {
+    fn register(&self);
+    fn describe(&self) -> Vec<Descriptor>;
+}
+
+impl<T: Describe + Send + Sync> Register for Metric<T> {
     fn register(&self) {
         // The inner value, not `deref`: that would wait for `REGISTERED`.
         LazyLock::force(&self.0);
+    }
+
+    fn describe(&self) -> Vec<Descriptor> {
+        let metric = LazyLock::force(&self.0);
+        metric
+            .descs()
+            .into_iter()
+            .map(|desc| Descriptor {
+                name: desc.fq_name.clone(),
+                help: desc.help.clone(),
+                kind: T::KIND,
+                labels: desc.variable_labels.clone(),
+            })
+            .collect()
     }
 }
 
@@ -111,6 +169,19 @@ static REGISTERED: LazyLock<()> = LazyLock::new(|| ALL.iter().for_each(|m| m.reg
 /// Register every metric now rather than on first use.
 pub fn init() {
     LazyLock::force(&REGISTERED);
+}
+
+/// Every metric, sorted by name like /metrics. Registers them all, like
+/// [`init`].
+///
+/// Built from the declarations rather than `prometheus::gather()`, which
+/// leaves a vector out until it has a child: a new vector is listed here
+/// before anything has used it.
+pub fn descriptors() -> Vec<Descriptor> {
+    init();
+    let mut all: Vec<Descriptor> = ALL.iter().flat_map(|metric| metric.describe()).collect();
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    all
 }
 
 // A vector's `N` is the length of the label array it registers, so the two
@@ -673,6 +744,40 @@ mod tests {
         for name in ["state_threads", "amqp_reconnects", "amqp_publish_failures"] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
+
+        let mut described: Vec<String> = descriptors().into_iter().map(|d| d.name).collect();
+        described.dedup();
+        assert_eq!(
+            described.len(),
+            defined,
+            "one name per metric: {described:?}"
+        );
+    }
+
+    #[test]
+    fn a_vector_without_a_child_is_described() {
+        // Not registered, so it cannot clash with anything; `describe` only
+        // creates it.
+        static UNUSED: Metric<Labelled<IntGaugeVec, 2>> = Metric::new(|| {
+            Labelled(
+                IntGaugeVec::new(prometheus::Opts::new("unused", "Never set"), &["b", "a"])
+                    .unwrap(),
+            )
+        });
+        assert_eq!(
+            UNUSED.describe(),
+            vec![Descriptor {
+                name: "unused".into(),
+                help: "Never set".into(),
+                kind: MetricType::GAUGE,
+                labels: vec!["b".into(), "a".into()],
+            }]
+        );
+        let Labelled(vec) = LazyLock::force(&UNUSED.0);
+        assert!(
+            vec.collect()[0].get_metric().is_empty(),
+            "describing creates no child"
+        );
     }
 
     #[test]

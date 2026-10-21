@@ -1449,38 +1449,12 @@ fn identify_presence() {
 
 #[test]
 fn prometheus_metric_names() {
-    use metrics::*;
-
-    // Vectors only show up once they have a child.
-    GATEWAY_EVENTS.with_label_values(&["READY", "0"]).inc_by(0);
-    SHARD_EVENTS.with_label_values(&["Connected"]).inc_by(0);
-    GUILD_EVENTS.with_label_values(&["Join"]).inc_by(0);
-    GATEWAY_SHARDS.add(0);
-    GATEWAY_STATUSES.with_label_values(&["Connected"]).add(0);
-    GATEWAY_LATENCIES.with_label_values(&["0"]).add(0);
-    for gauge in [
-        &*STATE_GUILDS,
-        &*STATE_CHANNELS,
-        &*STATE_MESSAGES,
-        &*STATE_ROLES,
-        &*STATE_EMOJIS,
-        &*STATE_MEMBERS,
-        &*STATE_PRESENCES,
-        &*STATE_VOICES,
-    ] {
-        gauge.add(0);
-    }
-    GATEWAY_PARSE_ERRORS.with_label_values(&["READY"]).inc_by(0);
-    STATE_UPDATE_ERRORS.with_label_values(&["error"]).inc_by(0);
-    AMQP_PUBLISH_FAILURES.inc_by(0);
-    AMQP_RECONNECTS.inc_by(0);
-    GATEWAY_COMMANDS.with_label_values(&["0", "sent"]).inc_by(0);
-    AMQP_CONNECTED.add(0);
-    SHARD_FATAL.with_label_values(&["0"]).add(0);
-    SHARD_SILENCE.with_label_values(&["0"]).add(0);
-
+    // Using one metric registers all of them, so /metrics lists every metric
+    // that is not a vector straight away (a vector once it has a child).
+    metrics::AMQP_RECONNECTS.inc_by(0);
     // process_* come from the prometheus crate (Linux only), not from us.
-    let families: Vec<Value> = prometheus::gather()
+    // Label names are sorted in /metrics.
+    let listed: BTreeMap<String, (String, Vec<String>)> = prometheus::gather()
         .iter()
         .filter(|family| !family.name().starts_with("process_"))
         .map(|family| {
@@ -1495,10 +1469,50 @@ fn prometheus_metric_names() {
                         .collect()
                 })
                 .unwrap_or_default();
+            let kind = format!("{:?}", family.get_field_type());
+            (family.name().to_owned(), (kind, labels))
+        })
+        .collect();
+
+    // The declarations rather than /metrics, which leaves a vector out until
+    // it has a child: a new vector is in the snapshot without this test
+    // having to use it.
+    let declared = metrics::descriptors();
+    for metric in &declared {
+        let mut labels = metric.labels.clone();
+        labels.sort();
+        match listed.get(&metric.name) {
+            Some(listed) => assert_eq!(
+                listed,
+                &(format!("{:?}", metric.kind), labels),
+                "{} in /metrics",
+                metric.name
+            ),
+            None => assert!(
+                !labels.is_empty(),
+                "{} is registered by the first use of any metric",
+                metric.name
+            ),
+        }
+    }
+    for name in listed.keys() {
+        assert!(
+            declared.iter().any(|metric| &metric.name == name),
+            "{name} in /metrics is not in metrics::descriptors()"
+        );
+    }
+
+    // Labels in the order they are declared, which is the order
+    // with_label_values takes the values in: swapping two still compiles but
+    // files every value under the other label.
+    let families: Vec<Value> = declared
+        .iter()
+        .map(|metric| {
             json!({
-                "name": family.name(),
-                "type": format!("{:?}", family.get_field_type()),
-                "labels": labels,
+                "name": metric.name,
+                "type": format!("{:?}", metric.kind),
+                "help": metric.help,
+                "labels": metric.labels,
             })
         })
         .collect();
