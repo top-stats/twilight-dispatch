@@ -42,6 +42,9 @@ const PAUSE_MIN: Duration = Duration::from_secs(60);
 /// The longest pause. A channel that answers every post with a 403 page then
 /// costs one request an hour, far from the ban limit (10,000 per 10 minutes).
 const PAUSE_MAX: Duration = Duration::from_secs(60 * 60);
+/// The pause bounds of [`DiscordLog::new`]. The unit test uses this constant
+/// too, so it checks the pauses production gets rather than a copy of them.
+const PAUSES: RangeInclusive<Duration> = PAUSE_MIN..=PAUSE_MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
@@ -108,12 +111,7 @@ impl DiscordLog {
     }
 
     pub fn new(client: Arc<Client>, log_channel: u64, log_guild_channel: u64) -> Self {
-        Self::with_pauses(
-            client,
-            log_channel,
-            log_guild_channel,
-            PAUSE_MIN..=PAUSE_MAX,
-        )
+        Self::with_pauses(client, log_channel, log_guild_channel, PAUSES)
     }
 
     /// [`DiscordLog::new`] with other bounds for the pause after an error
@@ -299,7 +297,7 @@ mod tests {
 
     #[test]
     fn pauses_double_up_to_an_hour_until_a_post_succeeds() {
-        let pauses = PAUSE_MIN..=PAUSE_MAX;
+        let pauses = PAUSES;
         let start = Instant::now();
         let mut state = ChannelState::default();
         assert!(state.accepts(start));
