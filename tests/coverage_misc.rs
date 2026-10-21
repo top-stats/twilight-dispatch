@@ -186,26 +186,23 @@ impl FakeRest {
         }
     }
 
-    /// Post `message` to the shard log, followed by a guild message that
-    /// shows when it was handled. Returns its request, or `None` if it was
-    /// dropped.
-    async fn post_shard(&self, log: &DiscordLog, message: &str) -> Option<Posted> {
+    /// Post `messages` to the shard log, followed by a guild message that
+    /// shows when they were handled. Returns the requests they caused, so
+    /// none for a message that was dropped.
+    async fn post_shard(&self, log: &DiscordLog, messages: &[&str]) -> Vec<Posted> {
         // Every call adds at least the guild message, so the count is a
         // unique marker.
         let before = self.posted().len();
-        log.shard(0, message);
+        for message in messages {
+            log.shard(0, *message);
+        }
         log.guild_join("handled", before as u64);
         let handled = format!("handled ({before})");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let posted = self.posted();
             if let Some(at) = posted.iter().position(|p| description(p) == handled) {
-                let sent = &posted[before..at];
-                assert!(
-                    sent.len() <= 1 && sent.iter().all(|p| title(p) == message),
-                    "{sent:?}"
-                );
-                return sent.first().cloned();
+                return posted[before..at].to_vec();
             }
             assert!(Instant::now() < deadline, "no {handled} in {posted:?}");
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -218,7 +215,7 @@ impl FakeRest {
     async fn post_shard_until_sent(&self, log: &DiscordLog, message: &str) -> Posted {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(sent) = self.post_shard(log, message).await {
+            if let Some(sent) = self.post_shard(log, &[message]).await.pop() {
                 return sent;
             }
             assert!(Instant::now() < deadline, "{message:?} was never sent");
@@ -1168,8 +1165,6 @@ async fn error_pages_without_a_status_pause_the_channel() {
 /// the pause, and a successful post resets it.
 #[tokio::test]
 async fn a_pause_ends_and_a_successful_post_resets_it() {
-    /// The first pause. The message right after an error page has to be
-    /// handled within it.
     const PAUSE: Duration = Duration::from_millis(50);
     logs();
     let rest = FakeRest::start().await;
@@ -1178,32 +1173,36 @@ async fn a_pause_ends_and_a_successful_post_resets_it() {
     let pauses = PAUSE..=Duration::from_secs(60);
     let log = DiscordLog::with_pauses(rest.client(), SHARD_LOG, GUILD_LOG, pauses);
 
-    // The first error page pauses the channel: the next message is dropped.
-    let first = rest.post_shard(&log, "first 502").await.expect("sent");
-    assert!(rest.post_shard(&log, "dropped").await.is_none(), "paused");
+    // The first error page pauses the channel. Both messages are queued
+    // before the first is sent, so the second is handled right after the
+    // error page, well within the pause, and dropped.
+    let sent = rest.post_shard(&log, &["502", "dropped"]).await;
+    let titles: Vec<&str> = sent.iter().map(title).collect();
+    assert_eq!(titles, ["502"]);
 
     // Once the pause is over, messages are sent again, and each error page
     // doubles the pause. A pause starts after its request arrived, so the
     // next request arrives at least the pause later.
-    let second = rest.post_shard_until_sent(&log, "second 502").await;
-    assert!(second.at.duration_since(first.at) >= PAUSE);
-    let third = rest.post_shard_until_sent(&log, "third 502").await;
-    assert!(third.at.duration_since(second.at) >= PAUSE * 2);
+    let mut last = sent[0].clone();
+    for pause in [PAUSE, PAUSE * 2, PAUSE * 4] {
+        let next = rest.post_shard_until_sent(&log, "502").await;
+        let waited = next.at.duration_since(last.at);
+        assert!(waited >= pause, "{waited:?} < {pause:?}");
+        last = next;
+    }
     rest.respond_with(SHARD_LOG, 200, "{}");
     let ok = rest.post_shard_until_sent(&log, "200").await;
-    assert!(ok.at.duration_since(third.at) >= PAUSE * 4);
+    assert!(ok.at.duration_since(last.at) >= PAUSE * 8);
 
     // The 200 reset the pause: the next error page pauses the channel for
-    // the minimum again, not for 8 times as long.
+    // the minimum again, not for 16 times as long.
     rest.respond_with(SHARD_LOG, 502, error_page);
-    let again = rest
-        .post_shard(&log, "502 after a 200")
-        .await
-        .expect("sent");
-    assert!(rest.post_shard(&log, "dropped").await.is_none(), "paused");
+    let sent = rest.post_shard(&log, &["502 after a 200", "dropped"]).await;
+    let titles: Vec<&str> = sent.iter().map(title).collect();
+    assert_eq!(titles, ["502 after a 200"]);
     let after = rest.post_shard_until_sent(&log, "after the pause").await;
-    let pause = after.at.duration_since(again.at);
-    assert!(pause >= PAUSE && pause < PAUSE * 4, "paused for {pause:?}");
+    let pause = after.at.duration_since(sent[0].at);
+    assert!(pause >= PAUSE && pause < PAUSE * 8, "paused for {pause:?}");
 }
 
 #[tokio::test]
