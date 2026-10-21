@@ -8,6 +8,7 @@ use crate::{
     discord_log::DiscordLog,
     gateway::{
         self,
+        queue::RedisQueue,
         registry::{Registry, ShardHandle},
         runner::{self, RunnerContext},
         sessions,
@@ -135,7 +136,12 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         _ => Default::default(),
     };
 
-    let created = gateway::create(&config, &http, saved).await?;
+    // Discord's identify limit is per bot, so the shards take turns with
+    // those of the bot's other processes (they share this Redis).
+    let created = gateway::create_with_queue(&config, &http, saved, |local, max_concurrency| {
+        RedisQueue::new(local, max_concurrency, redis.clone())
+    })
+    .await?;
     let range = created.range;
     if config.shards.is_none() {
         info!("Using Discord's recommended shard count of {}", range.total);

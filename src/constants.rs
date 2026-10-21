@@ -17,6 +17,10 @@ pub const SESSION_KEY: &str = "gateway_session";
 pub const STATUSES_KEY: &str = "gateway_statuses";
 pub const STARTED_KEY: &str = "gateway_started";
 pub const SHARDS_KEY: &str = "gateway_shards";
+/// Identify turns shared by every process of the bot: one key per Discord
+/// identify bucket (`shard % max_concurrency`), taken for one identify
+/// interval by the process whose shard identifies (`gateway::queue`).
+pub const IDENTIFY_KEY: &str = "gateway_identify";
 
 pub const BOT_USER_KEY: &str = "bot_user";
 pub const GUILD_KEY: &str = "guild";
@@ -52,6 +56,10 @@ pub const LEAVE_COLOR: u32 = 0xFF0000;
 
 pub fn session_key(shard: u32) -> String {
     format!("{SESSION_KEY}:{shard}")
+}
+
+pub fn identify_key(bucket: u32) -> String {
+    format!("{IDENTIFY_KEY}:{bucket}")
 }
 
 pub fn guild_key(guild: Id<GuildMarker>) -> String {
@@ -127,6 +135,7 @@ mod tests {
         assert_eq!(presence_key(g, u), "presence:1:6");
         assert_eq!(voice_key(g, u), "voice:1:6");
         assert_eq!(session_key(7), "gateway_session:7");
+        assert_eq!(identify_key(3), "gateway_identify:3");
         assert_eq!(thread_key(g, c), "thread:1:2");
     }
 }

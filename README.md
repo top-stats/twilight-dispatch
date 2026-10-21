@@ -39,6 +39,18 @@ Configuration is read from environment variables (or `.env`); see
   forwards the others to the `gateway.send.shards` direct exchange (routing key:
   shard id), where each process binds an exclusive queue for the shards it
   runs. Commands for shards no running process has are dropped by the broker.
+- Identifies take turns across processes through Redis, so every process of
+  the bot must use the same Redis database. Discord allows one identify per
+  5 s in each bucket `shard % max_concurrency` (Discord's `max_concurrency`,
+  also when `SHARDS_CONCURRENCY` is lower), whichever process sends it. Before
+  a shard identifies, its process takes the bucket's key
+  `gateway_identify:<bucket>` (`SET NX PX 5500`: the 5 s plus a 500 ms margin;
+  the value names the process) or waits until the holder's key expires. The
+  key is never deleted, so a process that crashed holding it delays the
+  bucket by no more than its own identify would have. If Redis answers with
+  an error or not within 2 s, the shard identifies with its process' own
+  queue only (logged once until Redis answers again). Each process still
+  keeps the daily session start limit for its own shards.
 
 ### Tests
 

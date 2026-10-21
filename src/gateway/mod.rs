@@ -1,6 +1,8 @@
-//! Discord gateway: shard creation, per-shard runners and ordered workers.
+//! Discord gateway: shard creation, the identify queue, per-shard runners and
+//! ordered workers.
 
 pub mod payload;
+pub mod queue;
 pub mod registry;
 pub mod runner;
 pub mod seq;
@@ -22,8 +24,8 @@ use twilight_model::gateway::{
 };
 
 /// Shards of this process plus what they were created from.
-pub struct Shards {
-    pub shards: Vec<Shard<InMemoryQueue>>,
+pub struct Shards<Q = InMemoryQueue> {
+    pub shards: Vec<Shard<Q>>,
     pub range: ShardRange,
     pub resumed: HashMap<u32, SessionInfo>,
 }
@@ -77,12 +79,26 @@ pub fn concurrency(discord: u16, configured: Option<u16>) -> u16 {
         .unwrap_or(1)
 }
 
-/// Create this process' shards, resuming saved sessions where possible.
+/// Create this process' shards, resuming saved sessions where possible. Their
+/// identifies only take turns within this process.
 pub async fn create(
     config: &Config,
     http: &Client,
     saved: HashMap<u32, SessionInfo>,
 ) -> ApiResult<Shards> {
+    create_with_queue(config, http, saved, |local, _| local).await
+}
+
+/// [`create`] with the identify queue that `queue` builds from the local one
+/// (this process' bucket spacing and daily limit, from Discord's session
+/// start limit) and Discord's `max_concurrency`, for example a
+/// [`queue::RedisQueue`] that also takes turns with other processes.
+pub async fn create_with_queue<Q: Clone>(
+    config: &Config,
+    http: &Client,
+    saved: HashMap<u32, SessionInfo>,
+    queue: impl FnOnce(InMemoryQueue, u16) -> Q,
+) -> ApiResult<Shards<Q>> {
     let info = http.gateway().authed().await?.model().await?;
     let limit = info.session_start_limit;
 
@@ -132,7 +148,7 @@ pub async fn create(
         "Identify concurrency {} (Discord allows {}), {} identifies left today",
         max_concurrency, limit.max_concurrency, limit.remaining
     );
-    let queue = InMemoryQueue::new(
+    let local = InMemoryQueue::new(
         max_concurrency,
         limit.remaining.min(limit.total),
         Duration::from_millis(limit.reset_after),
@@ -142,7 +158,7 @@ pub async fn create(
     let mut base = ConfigBuilder::new(config.bot_token.clone(), config.intents)
         .presence(presence(config)?)
         .large_threshold(config.large_threshold)
-        .queue(queue);
+        .queue(queue(local, limit.max_concurrency));
     if let Some(url) = &config.discord_gateway_url {
         base = base.proxy_url(url.clone());
     }

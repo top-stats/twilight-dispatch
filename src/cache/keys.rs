@@ -296,12 +296,13 @@ mod tests {
     }
 
     /// Gateway bookkeeping keys, written with plain commands, never planned.
-    const NOT_CACHED: [&str; 5] = [
+    const NOT_CACHED: [&str; 6] = [
         crate::constants::SESSIONS_KEY,
         crate::constants::SESSION_KEY,
         crate::constants::STATUSES_KEY,
         crate::constants::STARTED_KEY,
         crate::constants::SHARDS_KEY,
+        crate::constants::IDENTIFY_KEY,
     ];
 
     /// A new cache prefix must say what it belongs to (and be counted), or

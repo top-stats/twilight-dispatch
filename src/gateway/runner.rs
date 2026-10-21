@@ -41,7 +41,7 @@ use tokio::sync::{
 use tracing::{error, info, warn};
 use twilight_gateway::{
     error::{ReceiveMessageError, ReceiveMessageErrorType},
-    queue::InMemoryQueue,
+    queue::Queue,
     CloseFrame, Message, Shard, ShardState,
 };
 use twilight_model::{
@@ -229,8 +229,8 @@ pub fn prepare(json: &str, state: &StateConfig) -> Prepared {
     }
 }
 
-struct Runner<C> {
-    shard: Shard<InMemoryQueue>,
+struct Runner<C, Q> {
+    shard: Shard<Q>,
     handle: Arc<ShardHandle>,
     ctx: Arc<RunnerContext<C>>,
     id: u32,
@@ -256,13 +256,14 @@ struct Runner<C> {
 
 /// Run a shard until it is fatally closed or `shutdown` flips to true. On
 /// shutdown the connection is closed resumably so the session survives.
-pub async fn run<C>(
-    shard: Shard<InMemoryQueue>,
+pub async fn run<C, Q>(
+    shard: Shard<Q>,
     handle: Arc<ShardHandle>,
     ctx: Arc<RunnerContext<C>>,
     mut shutdown: watch::Receiver<bool>,
 ) where
     C: ConnectionLike + Clone + Send + Sync + 'static,
+    Q: Queue + Unpin + Send + Sync + 'static,
 {
     let id = shard.id().number();
     let session = handle.snapshot().session_id.map(Arc::from);
@@ -332,9 +333,10 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
-impl<C> Runner<C>
+impl<C, Q> Runner<C, Q>
 where
     C: ConnectionLike + Clone + Send + Sync + 'static,
+    Q: Queue + Unpin + Send + Sync + 'static,
 {
     /// Handle one stream item. Returns false once the shard is finished.
     async fn on_item(&mut self, item: Option<Result<Message, ReceiveMessageError>>) -> bool {
