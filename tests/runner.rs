@@ -13,10 +13,14 @@
 //!   code, fatal flag and the resume point after READY;
 //! - shutdown: a resumable close that still dispatches what arrives while
 //!   closing, all within one close timeout (the gateway's answer, held events
-//!   and READY's cache update), no new connection when the shard is already
-//!   disconnected and no RESUME when the connection drops while closing;
-//! - fatal close codes end `run()`; gateway commands reach the gateway; shard
-//!   lifecycle metrics and Discord log messages.
+//!   and READY's cache update) from when the shutdown came, also in a
+//!   backpressure pause or during READY's cache update; no new connection
+//!   when the shard is already disconnected and no RESUME when the connection
+//!   drops while closing;
+//! - fatal close codes end `run()` and are recorded, also while shutting
+//!   down; gateway commands reach the gateway; shard lifecycle metrics
+//!   (one disconnect per connection, with or without a close frame) and
+//!   Discord log messages.
 //!
 //! twilight waits 1 s before every connection (2 s after a failed one), so
 //! most tests take one to four seconds. Tests asserting deltas of the
@@ -2010,7 +2014,8 @@ async fn a_reconnect_request_counts_one_reconnect_when_the_connection_drops() {
         let mut running = start(&relay.url(), shard, redis.clone(), Opts::default());
         let mut conn = identified(&fake, shard, "A", QUIET).await;
         running.recorder.wait_published(1).await;
-        let reconnecting = shard_events("Reconnecting");
+        let (reconnecting, disconnected) =
+            (shard_events("Reconnecting"), shard_events("Disconnected"));
 
         relay.hold(true);
         if op == 7 {
@@ -2027,12 +2032,70 @@ async fn a_reconnect_request_counts_one_reconnect_when_the_connection_drops() {
         conn.resumed(2).await;
         running.recorder.wait_published(2).await;
         assert_eq!(shard_events("Reconnecting") - reconnecting, 1, "op {op}");
+        assert_eq!(shard_events("Disconnected") - disconnected, 1, "op {op}");
         conn.close(4000, "").await;
         let (_conn, resume) = resumed(&fake).await;
         assert_eq!(resume, resume_d("A", 2), "op {op}");
         assert_eq!(shard_events("Reconnecting") - reconnecting, 2, "op {op}");
+        assert_eq!(shard_events("Disconnected") - disconnected, 2, "op {op}");
         running.stop().await;
     }
+}
+
+/// A connection that ends without a close frame, for which twilight yields
+/// nothing, is one disconnect and one reconnect like a resumable close,
+/// counted at the next connection's HELLO and never again by a later close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_connection_counts_one_disconnect_and_reconnect() {
+    let _metrics = METRICS.write().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let shard = 36;
+    let opts = Opts {
+        discord: discord_log(&fake),
+        ..Opts::default()
+    };
+    let mut running = start(&fake.gateway.url(), shard, redis, opts);
+    let conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_published(1).await;
+    let kinds = ["Connecting", "Disconnected", "Reconnecting"];
+    let before = kinds.map(shard_events);
+    let deltas = || -> Vec<u64> {
+        kinds
+            .iter()
+            .zip(before)
+            .map(|(kind, before)| shard_events(kind) - before)
+            .collect()
+    };
+
+    conn.drop_connection().await;
+    let (conn, resume) = resumed(&fake).await;
+    assert_eq!(resume, resume_d("A", 1));
+    conn.resumed(2).await;
+    running.recorder.wait_published(2).await;
+    assert_eq!(deltas(), [1, 1, 1], "{kinds:?}");
+
+    conn.close(4000, "").await;
+    let (_conn, resume) = resumed(&fake).await;
+    assert_eq!(resume, resume_d("A", 2));
+    assert_eq!(deltas(), [2, 2, 2], "{kinds:?}");
+    // Logged like a close, too.
+    let posts = fake.api.wait_posts(LOG_CHANNEL, 5).await;
+    let titles: Vec<String> = logged(&posts).into_iter().map(|(title, _)| title).collect();
+    let title = |what: &str| format!("[Shard {shard}] {what}");
+    assert_eq!(
+        titles,
+        [
+            title("Ready"),
+            title("Disconnected"),
+            title("Resumed"),
+            title("Connected"),
+            title("Disconnected"),
+        ]
+    );
+    running.stop().await;
 }
 
 /// A RECONNECT that arrives while shutting down is no reconnect: the shard

@@ -248,6 +248,8 @@ struct Runner<C> {
     /// Discord asked to reconnect (op 7 or 9) and that was counted then, so
     /// the close that ends the connection is not counted again.
     reconnect_counted: bool,
+    /// A connection started (HELLO) whose end was not counted yet.
+    connection_open: bool,
     parse_errors: Throttle,
     receive_errors: Throttle,
 }
@@ -276,6 +278,7 @@ pub async fn run<C>(
         close_deadline: None,
         shutdown: shutdown.clone(),
         reconnect_counted: false,
+        connection_open: false,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
     };
@@ -372,6 +375,14 @@ where
         }
         let code = frame.map(|(code, _)| code);
         self.handle.update(|s| s.close_code = code);
+        self.disconnected(code);
+    }
+
+    /// Count and log the end of a connection: at its close, or at the next
+    /// HELLO when it ended without one (see [`Prepared::Hello`]). twilight
+    /// reconnects unless the gateway closed it with a fatal `code`.
+    fn disconnected(&mut self, code: Option<u16>) {
+        self.connection_open = false;
         SHARD_EVENTS.with_label_values(&["Disconnected"]).inc();
         let counted = std::mem::take(&mut self.reconnect_counted);
         match code {
@@ -470,6 +481,18 @@ where
                 warn!("[Shard {}] Could not decode payload: {}", self.id, err)
             }
             Prepared::Hello => {
+                if self.connection_open {
+                    // twilight yields nothing for a connection that ends
+                    // without a close frame and reconnects on its own, so
+                    // this HELLO is the first sign that the last one ended.
+                    // A close clears the flag, so no end is counted twice.
+                    info!(
+                        "[Shard {}] Disconnected (the connection ended without a close)",
+                        self.id
+                    );
+                    self.disconnected(None);
+                }
+                self.connection_open = true;
                 info!("[Shard {}] Hello", self.id);
                 SHARD_EVENTS.with_label_values(&["Connecting"]).inc();
                 // A new connection; the last one's end is settled.
