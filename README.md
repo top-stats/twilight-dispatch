@@ -47,10 +47,12 @@ Configuration is read from environment variables (or `.env`); see
   `gateway_identify:<bucket>` (`SET NX PX 5500`: the 5 s plus a 500 ms margin;
   the value names the process) or waits until the holder's key expires. The
   key is never deleted, so a process that crashed holding it delays the
-  bucket by no more than its own identify would have. If Redis answers with
-  an error or not within 2 s, the shard identifies with its process' own
-  queue only (logged once until Redis answers again). Each process still
-  keeps the daily session start limit for its own shards.
+  bucket by no more than its own identify would have. A process also keeps
+  its own identifies of a bucket 5.5 s apart and in order, counted from when
+  they happen, whatever Redis does. If Redis answers with an error or not
+  within 2 s, the shard identifies with that spacing only (logged once until
+  Redis answers again). Each process still keeps the daily session start
+  limit for its own shards.
 
 ### Tests
 

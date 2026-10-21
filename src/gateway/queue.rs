@@ -8,13 +8,21 @@
 //! session (op 9) and the shard identifies again, spending another session
 //! start.
 //!
-//! [`RedisQueue`] keeps the local queue for what it already does (spacing this
-//! process' identifies, the daily session start limit and its reset) and then
-//! also takes the bucket's key (`gateway_identify:<bucket>`) in Redis before
-//! the shard may identify. The key is a rate limit, not a lock: it is never
+//! [`RedisQueue`] keeps the local queue for the daily session start limit and
+//! its reset (and the buckets of a lowered SHARDS_CONCURRENCY), and then also
+//! takes the bucket's key (`gateway_identify:<bucket>`) in Redis before the
+//! shard may identify. The key is a rate limit, not a lock: it is never
 //! released but expires one identify interval (plus a margin) after it was
 //! taken, so a process that crashed right after taking it blocks no one for
 //! longer than an identify of its own would have.
+//!
+//! The local queue's 5 s alone would not keep this process' identifies of a
+//! bucket apart, since it counts them from when it let the previous shard
+//! through and that shard then waits for Redis: one that waited for another
+//! process' key until just before the next shard got through, or several
+//! waiting shards that Redis then fails at once, would identify less than
+//! 5 s apart. So [`RedisQueue`] also spaces them itself, from when it lets
+//! them identify, and lets them wait for Redis one at a time, in order.
 
 use crate::{constants::identify_key, models::FormattedDateTime, redis_conn::Redis};
 
@@ -27,7 +35,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::oneshot;
+use tokio::{
+    sync::{oneshot, Mutex},
+    time::Instant,
+};
 use tracing::{info, warn};
 use twilight_gateway::queue::{InMemoryQueue, Queue, IDENTIFY_DELAY};
 
@@ -80,8 +91,16 @@ struct Shared {
     /// the local queue to.
     max_concurrency: u32,
     /// How long a taken bucket stays taken: the identify interval plus
-    /// [`IDENTIFY_MARGIN`].
+    /// [`IDENTIFY_MARGIN`]. Also how far apart this process' identifies of a
+    /// bucket are when Redis takes no part, so that they are no closer
+    /// together without Redis than with it.
     hold: Duration,
+    /// When this process last let a shard of each of Discord's buckets
+    /// identify. A shard holds its bucket's lock from waiting for that
+    /// spacing until it may identify, so the shards of a bucket wait for
+    /// Redis one at a time and in the order the local queue let them through
+    /// (tokio's mutex is fair).
+    turns: Box<[Mutex<Option<Instant>>]>,
     /// The key's value, only for whoever inspects it: `<pid>:<start unix ms>`
     /// (the pid alone is 1 in every container).
     owner: String,
@@ -111,12 +130,14 @@ impl RedisQueue {
             std::process::id(),
             FormattedDateTime::now().unix_millis()
         );
+        let max_concurrency = max_concurrency.max(1);
         Self {
             local,
             shared: Arc::new(Shared {
                 redis,
-                max_concurrency: u32::from(max_concurrency.max(1)),
+                max_concurrency: u32::from(max_concurrency),
                 hold: interval.saturating_add(IDENTIFY_MARGIN),
+                turns: (0..max_concurrency).map(|_| Mutex::new(None)).collect(),
                 owner,
                 degraded: AtomicBool::new(false),
             }),
@@ -154,11 +175,25 @@ impl Queue for RedisQueue {
 }
 
 impl Shared {
-    /// Wait until this process may identify `shard`: the bucket's key was free
-    /// and is ours now, or Redis answered with an error or not within
-    /// [`REDIS_TIMEOUT`].
+    /// Wait until this process may identify `shard`: at least one hold after
+    /// its previous identify in the bucket, and once the bucket is ours (or
+    /// Redis failed).
     async fn take_turn(&self, shard: u32) {
-        let key = identify_key(shard % self.max_concurrency);
+        let bucket = shard % self.max_concurrency;
+        // Dropped unchanged if the shard stops waiting, which hands the turn
+        // to the next shard of the bucket.
+        let mut last = self.turns[bucket as usize].lock().await;
+        if let Some(last) = *last {
+            tokio::time::sleep_until(last + self.hold).await;
+        }
+        self.take_bucket(bucket).await;
+        *last = Some(Instant::now());
+    }
+
+    /// Wait until the bucket's key was free and is ours now, or Redis answered
+    /// with an error or not within [`REDIS_TIMEOUT`].
+    async fn take_bucket(&self, bucket: u32) {
+        let key = identify_key(bucket);
         let hold_ms = u64::try_from(self.hold.as_millis()).unwrap_or(u64::MAX);
         let mut take = TAKE.key(&key);
         take.arg(&self.owner).arg(hold_ms);

@@ -6,8 +6,9 @@
 //!
 //! Each `RedisQueue` here stands for one process of the bot. They take turns
 //! with a short injected interval, so the tests need not wait Discord's 5 s
-//! per identify; the local queue (`InMemoryQueue`) keeps its own 5 s, so no
-//! test identifies twice in one local bucket.
+//! per identify; the local queue (`InMemoryQueue`) keeps its own 5 s, so only
+//! the tests of one process' turns identify twice in one local bucket, with
+//! Discord's interval.
 
 mod common;
 #[path = "support/fake_discord.rs"]
@@ -18,12 +19,16 @@ use redis::aio::ConnectionManager;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::oneshot::{self, error::TryRecvError},
     task::JoinHandle,
 };
 use twilight_dispatch::{
@@ -219,11 +224,14 @@ async fn a_shard_that_stops_waiting_leaves_the_bucket_free() {
 // Redis unreachable, slow or failing
 
 /// A TCP proxy in front of the test Redis that can be taken down: it then
-/// drops its connections and refuses new ones, like an unreachable Redis.
+/// drops its connections and refuses new ones, like an unreachable Redis. It
+/// can also go silent, like a network that loses every packet: what clients
+/// send is dropped, so Redis neither runs nor answers it.
 struct Proxy {
     addr: SocketAddr,
     accept: JoinHandle<()>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    silent: Arc<AtomicBool>,
 }
 
 impl Proxy {
@@ -238,17 +246,20 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(Mutex::new(Vec::new()));
+        let silent = Arc::new(AtomicBool::new(false));
         let accept = {
             let connections = connections.clone();
+            let silent = silent.clone();
             tokio::spawn(async move {
-                while let Ok((mut client, _)) = listener.accept().await {
+                while let Ok((client, _)) = listener.accept().await {
                     let target = target.clone();
-                    let forward = tokio::spawn(async move {
-                        if let Ok(mut server) = TcpStream::connect(target).await {
-                            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    let silent = silent.clone();
+                    let connection = tokio::spawn(async move {
+                        if let Ok(server) = TcpStream::connect(target).await {
+                            forward(client, server, &silent).await;
                         }
                     });
-                    connections.lock().unwrap().push(forward);
+                    connections.lock().unwrap().push(connection);
                 }
             })
         };
@@ -256,6 +267,7 @@ impl Proxy {
             addr,
             accept,
             connections,
+            silent,
         }
     }
 
@@ -265,15 +277,45 @@ impl Proxy {
             .expect("connect through the proxy")
     }
 
-    /// Returns once the listener and every connection are closed.
-    async fn take_down(self) {
-        self.accept.abort();
-        let _ = self.accept.await;
+    fn silence(&self, silent: bool) {
+        self.silent.store(silent, Ordering::SeqCst);
+    }
+
+    /// Closes every connection but keeps accepting new ones, so clients
+    /// reconnect, as after a network outage. Returns once they are closed.
+    async fn reset(&self) {
         let connections = std::mem::take(&mut *self.connections.lock().unwrap());
         for connection in connections {
             connection.abort();
             let _ = connection.await;
         }
+    }
+
+    /// Returns once the listener and every connection are closed.
+    async fn take_down(mut self) {
+        self.accept.abort();
+        let _ = (&mut self.accept).await;
+        self.reset().await;
+    }
+}
+
+/// Copies between `client` and `server` until either closes, dropping what
+/// the client sends while `silent` is set.
+async fn forward(client: TcpStream, server: TcpStream, silent: &AtomicBool) {
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    let up = async {
+        let mut buf = vec![0; 16 * 1024];
+        while let Ok(read @ 1..) = from_client.read(&mut buf).await {
+            if !silent.load(Ordering::SeqCst) && to_server.write_all(&buf[..read]).await.is_err() {
+                break;
+            }
+        }
+    };
+    let down = tokio::io::copy(&mut from_server, &mut to_client);
+    tokio::select! {
+        () = up => {}
+        _ = down => {}
     }
 }
 
@@ -420,6 +462,75 @@ async fn identifies_go_ahead_at_once_when_redis_answers_with_an_error() {
     let waited = granted(queue.enqueue(0)).await - started;
     drop(full);
     assert!(waited < REDIS_TIMEOUT / 2, "waited {waited:?}");
+}
+
+// ---------------------------------------------------------------------------
+// One process' turns, with Discord's interval
+//
+// The local queue lets the shards of a bucket through 5 s apart, counted from
+// when it let the previous one through, before that one waited for Redis.
+
+/// One process' queue with Discord's interval, `max_concurrency` 1.
+fn process_with_discords_interval(redis: ConnectionManager) -> RedisQueue {
+    RedisQueue::new(InMemoryQueue::new(1, 1000, DAY, 1000), 1, redis)
+}
+
+/// A shard that waited `REDIS_TIMEOUT` for a Redis that does not answer
+/// identifies 2 s late. The next one is let through 3 s after that, and must
+/// not identify then just because Redis answers again by now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_process_identifies_apart_when_redis_stops_answering_for_a_while() {
+    let _serial = SERIAL.lock().await;
+    let Some(_) = common::redis(12).await else {
+        return;
+    };
+    let proxy = Proxy::start().await;
+    let queue = process_with_discords_interval(proxy.connect(12).await);
+    proxy.silence(true);
+    let started = Instant::now();
+    let (first, second) = (queue.enqueue(0), queue.enqueue(1));
+    let first = granted(first).await;
+    proxy.silence(false);
+    // Into a new connection: the old one waits for the answers Redis never
+    // got the commands for.
+    proxy.reset().await;
+    let second = granted(second).await;
+
+    let apart = second - first;
+    assert!(apart >= IDENTIFY_DELAY, "identified {apart:?} apart");
+    let waited = second - started;
+    assert!(
+        waited < REDIS_TIMEOUT + IDENTIFY_DELAY + IDENTIFY_MARGIN + SLACK,
+        "the second waited {waited:?}"
+    );
+}
+
+/// The first shard waits for another process' key until after the local
+/// queue let the second one through, and Redis starts refusing to take the
+/// bucket meanwhile: the second shard still identifies after the first, one
+/// interval later, not at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_process_identifies_in_turn_when_redis_fails_while_they_wait() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut redis) = common::redis(13).await else {
+        return;
+    };
+    let hold = IDENTIFY_DELAY + IDENTIFY_MARGIN;
+    set(&mut redis, &identify_key(0), "another process", Some(hold)).await;
+    let queue = process_with_discords_interval(redis);
+    let (first, mut second) = (queue.enqueue(0), queue.enqueue(1));
+    tokio::time::sleep(IDENTIFY_DELAY / 2).await;
+    let full = Full::new();
+    let first = granted(first).await;
+    let early = second.try_recv();
+    let second = match early {
+        Err(TryRecvError::Empty) => granted(second).await,
+        _ => panic!("the second shard identified first ({early:?})"),
+    };
+    drop(full);
+
+    let apart = second - first;
+    assert!(apart >= IDENTIFY_DELAY, "identified {apart:?} apart");
 }
 
 // ---------------------------------------------------------------------------
