@@ -97,7 +97,9 @@ mod error_chain_tests {
 
     impl Error for Layer {
         fn source(&self) -> Option<&(dyn Error + 'static)> {
-            self.1.as_deref().map(|inner| inner as &(dyn Error + 'static))
+            self.1
+                .as_deref()
+                .map(|inner| inner as &(dyn Error + 'static))
         }
     }
 
