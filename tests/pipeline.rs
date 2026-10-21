@@ -595,9 +595,10 @@ async fn deletes_of_a_previous_session_are_still_applied() {
 }
 
 /// Which jobs of a previous session (queued before READY of the new one) are
-/// still applied to the cache: only removals that nothing replays.
+/// still applied to the cache (`worker::only_removes`), for every event the
+/// cache can receive: only removals that nothing replays.
 #[test]
-fn jobs_of_a_previous_session_apply_only_removals() {
+fn stale_session_decision_table() {
     let mut archived = thread(1005, 1000, 1003);
     archived["thread_metadata"]["archived"] = json!(true);
     let mut member_add = member(20, &[]);
