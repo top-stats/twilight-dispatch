@@ -3,7 +3,9 @@
 //! Every event of one guild is sent to the same worker (see
 //! [`super::payload::Route`]), so cache updates and publishes of a guild happen
 //! in gateway order, and a consumer that reads the cache after receiving an
-//! event sees that event applied. Different guilds are processed in parallel.
+//! event sees that event applied if its cache update succeeded (a skipped or
+//! failed update is not applied, and one that timed out may still be applied
+//! after the event was published). Different guilds are processed in parallel.
 
 use super::{payload, registry::Registry, seq::SeqToken};
 use crate::{
@@ -29,7 +31,10 @@ use twilight_model::{
     id::{marker::UserMarker, Id},
 };
 
-/// Per-worker queue length. A full queue makes the shard runner wait.
+/// Per-worker queue length. A shard whose next event does not fit its
+/// worker's queue is paused (closed resumably, its later events held; see
+/// `runner`) until the queue drains. The worker queues together hold up to
+/// `WORKERS * QUEUE` events (each a raw payload plus its typed event).
 pub const QUEUE: usize = 1024;
 /// How long cache updates are skipped after one failed.
 pub const BREAKER_COOLDOWN: Duration = Duration::from_secs(1);
@@ -37,8 +42,15 @@ pub const BREAKER_COOLDOWN: Duration = Duration::from_secs(1);
 /// One dispatch payload to cache and publish.
 #[derive(Debug)]
 pub struct Job {
+    /// The shard that received the payload.
     pub shard: u32,
+    /// The payload's sequence number (`s`). With `shard` and `session` it
+    /// makes up the AMQP message id (`shard:session:seq`).
     pub seq: Option<u64>,
+    /// The shard's in-flight entry for `seq`: completed once the payload is
+    /// published and failed when it is not, so the saved resume point never
+    /// passes an unpublished event. It also tells a job of a previous session
+    /// apart. `None` for payloads that are not tracked (READY, or no `seq`).
     pub token: Option<SeqToken>,
     /// The gateway session the payload belongs to.
     pub session: Option<Arc<str>>,
@@ -50,6 +62,13 @@ pub struct Job {
 
 /// Where workers publish to (the broker in production, a recorder in tests).
 pub trait Publisher: Send + Sync + 'static {
+    /// Publish `payload` (the outgoing JSON) with the event type as
+    /// `routing_key`, and `message_id` as the message id when there is one.
+    ///
+    /// # Errors
+    ///
+    /// When the payload was not published. The worker then keeps the shard's
+    /// resume point before it, so that a resume replays it.
     fn publish(
         &self,
         routing_key: &str,
@@ -124,10 +143,12 @@ impl Breaker {
         })
     }
 
+    /// Open the breaker: skip updates for [`BREAKER_COOLDOWN`] from now.
     pub fn failure(&self) {
         self.state().open_until = Some(Instant::now() + BREAKER_COOLDOWN);
     }
 
+    /// Close the breaker: every update goes through again.
     pub fn success(&self) {
         self.state().open_until = None;
     }
@@ -170,21 +191,41 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// What every worker shares: the connections, the settings and the breaker.
 pub struct WorkerContext<C, P> {
+    /// The Redis connection for cache updates; each worker uses a clone.
     pub redis: C,
+    /// Where events are published.
     pub publisher: Arc<P>,
+    /// The shards' handles: they tell jobs of a previous session apart and
+    /// record which sequences were published, for the resume point.
     pub registry: Arc<Registry>,
+    /// What the cache stores (the `STATE_*` settings). With `enabled` off
+    /// Redis is never touched.
     pub state: StateConfig,
+    /// The bot's user id: the cache keeps the bot's own member even with
+    /// `STATE_MEMBER` off.
     pub bot_id: Id<UserMarker>,
+    /// How long one cache update may take before the event is published
+    /// without it (`CACHE_TIMEOUT_MS`).
     pub cache_timeout: Duration,
+    /// Where guild joins and leaves are posted (`LOG_GUILD_CHANNEL`).
     pub discord: DiscordLog,
+    /// Skips cache updates while Redis is failing; see [`Breaker`].
     pub breaker: Breaker,
+    /// Rate limit for the warnings about failed or timed-out cache updates.
     pub cache_errors: Throttle,
+    /// Rate limit for the warnings about failed publishes.
     pub publish_errors: Throttle,
 }
 
-/// Start `count` workers. Returns their queues and join handles; the workers
-/// stop once every sender is dropped and their queues are drained.
+/// Start `count` workers (at least one: the runner indexes into the returned
+/// queues). Returns their queues and join handles; the workers stop once
+/// every sender is dropped and their queues are drained.
+///
+/// # Panics
+///
+/// Outside a Tokio runtime, like `tokio::spawn`.
 pub fn spawn<C, P>(
     count: usize,
     ctx: Arc<WorkerContext<C, P>>,
@@ -193,10 +234,9 @@ where
     C: ConnectionLike + Clone + Send + Sync + 'static,
     P: Publisher,
 {
-    (0..count.max(1))
-        .map(|_| {
+    std::iter::repeat_n(ctx, count.max(1))
+        .map(|ctx| {
             let (tx, mut rx) = mpsc::channel::<Job>(QUEUE);
-            let ctx = ctx.clone();
             let handle = tokio::spawn(async move {
                 let mut conn = ctx.redis.clone();
                 while let Some(job) = rx.recv().await {
@@ -208,7 +248,10 @@ where
         .unzip()
 }
 
-/// Cache and publish one job.
+/// Cache and publish one job: apply it to the cache (a job of a previous
+/// session only if [`only_removes`] allows it), log a guild join or leave,
+/// publish it, then complete its sequence token if it was published or fail
+/// it if not.
 pub async fn process<C, P>(ctx: &WorkerContext<C, P>, conn: &mut C, job: Job)
 where
     C: ConnectionLike + Send,
@@ -226,7 +269,8 @@ where
     // Jobs of a previous session still in the queue would undo what READY
     // of the new session reconciled; that session re-sends the current state.
     // Only those that cannot bring anything back are applied (only_removes).
-    let current = match (token, ctx.registry.get(shard)) {
+    let handle = ctx.registry.get(shard);
+    let current = match (token, handle) {
         (Some(token), Some(handle)) => handle.is_current(token),
         _ => true,
     };
@@ -244,7 +288,7 @@ where
     });
     let published = publish(ctx, shard, message_id, &json, outcome.and_then(|o| o.old)).await;
 
-    if let (Some(token), Some(handle)) = (token, ctx.registry.get(shard)) {
+    if let (Some(token), Some(handle)) = (token, handle) {
         if published {
             handle.complete(token);
         } else {
@@ -256,15 +300,15 @@ where
 
 /// Events that are applied even when they belong to a previous session
 /// (with [`cache::update_stale`]). Nothing replays them after a new session
-/// (GUILD_CREATE keeps the messages of channels it lists), and they cannot
-/// bring back anything READY removed: all but MESSAGE_UPDATE only remove
+/// (`GUILD_CREATE` keeps the messages of channels it lists), and they cannot
+/// bring back anything READY removed: all but `MESSAGE_UPDATE` only remove
 /// cached state.
 ///
-/// MESSAGE_UPDATE reads the message and writes it back later, while READY's
+/// `MESSAGE_UPDATE` reads the message and writes it back later, while READY's
 /// reconcile runs in the shard runner, not in this worker
 /// (`Runner::ready_cache` -> `cache::ready` -> `clear_guild`). If that
 /// removed the guild in between, a plain write would bring the message back,
-/// and with STATE_MESSAGE_TTL=0 it would never expire. So a stale edit is
+/// and with `STATE_MESSAGE_TTL=0` it would never expire. So a stale edit is
 /// only written while the message is still cached, in one script. Skipping
 /// it instead would keep the old content (and give the next event a wrong
 /// `old`) until the message expires: with a TTL of 0, for good.
@@ -298,7 +342,7 @@ fn is_connection_error(err: &ApiError) -> bool {
 
 /// The worker's connection, recording whether an update sent anything.
 ///
-/// An update with nothing to write (a member update with STATE_MEMBER off)
+/// An update with nothing to write (a member update with `STATE_MEMBER` off)
 /// succeeds without asking Redis, so it says nothing about whether Redis
 /// answers. Were it a probe that closed the breaker, every worker would wait
 /// for the timeout of a Redis that is still stalled.
@@ -408,20 +452,31 @@ fn guild_name(value: Option<&Value>) -> Option<&str> {
 /// Guild join / leave logs and metrics.
 ///
 /// A join is reported when the cache update succeeded and the guild was not
-/// known before. Without the cache (STATE_ENABLED=false) a GUILD_CREATE is a
-/// join when the bot's `joined_at` is recent. An outage (GUILD_DELETE
-/// unavailable) is not a leave.
+/// cached in full before: it was unknown, or known only from an unavailable
+/// stub (READY or an outage) while the bot's `joined_at` is recent. Without
+/// the cache (`STATE_ENABLED=false`) a `GUILD_CREATE` is a join when the bot's
+/// `joined_at` is recent. An outage (`GUILD_DELETE` unavailable) is not a
+/// leave.
 fn log_guild_changes<C, P>(ctx: &WorkerContext<C, P>, event: &Event, outcome: Option<&Outcome>) {
     match event {
         Event::GuildCreate(guild) => {
             let GuildCreate::Available(guild) = guild.as_ref() else {
                 return;
             };
+            let now_ms = FormattedDateTime::now().unix_millis();
+            let recent = cache::joined_recently(guild.joined_at, now_ms);
             let joined = match outcome {
-                Some(outcome) => !outcome.guild_known,
-                None if !ctx.state.enabled => {
-                    cache::joined_recently(guild.joined_at, FormattedDateTime::now().unix_millis())
+                // READY stubs every guild it lists before that guild's
+                // GUILD_CREATE. A stub has no name, so a guild known only
+                // from one was never cached in full: with a recent
+                // `joined_at` it is a join that no session reported (made
+                // while disconnected, or queued in the previous session and
+                // not applied).
+                Some(outcome) => {
+                    let cached_in_full = guild_name(outcome.previous_guild.as_ref()).is_some();
+                    !outcome.guild_known || (!cached_in_full && recent)
                 }
+                None if !ctx.state.enabled => recent,
                 None => false,
             };
             if joined {
@@ -442,8 +497,11 @@ fn log_guild_changes<C, P>(ctx: &WorkerContext<C, P>, event: &Event, outcome: Op
     }
 }
 
-/// Publish a payload. Returns false only when the broker did not confirm it
-/// (payloads that cannot be published at all are logged and skipped).
+/// Publish a payload. Returns false only when the publisher failed (for the
+/// broker: shutting down, unreachable past the outage budget, a write timeout
+/// or error, or with `AMQP_CONFIRMS` a nack or missing confirm), so the resume
+/// point stays before it. Payloads that cannot be published at all are logged
+/// and count as done.
 async fn publish<C, P>(
     ctx: &WorkerContext<C, P>,
     shard: u32,
@@ -461,7 +519,7 @@ where
             return true;
         }
     };
-    let Some(kind) = envelope.kind().map(ToOwned::to_owned) else {
+    let Some(kind) = envelope.kind() else {
         return true;
     };
     let body = match payload::outgoing(&envelope, old.as_ref()) {
@@ -471,7 +529,7 @@ where
             return true;
         }
     };
-    match ctx.publisher.publish(&kind, body, message_id).await {
+    match ctx.publisher.publish(kind, body, message_id).await {
         Ok(()) => true,
         Err(err) => {
             if let Some(suppressed) = ctx.publish_errors.check() {
@@ -707,5 +765,55 @@ mod tests {
         assert_eq!(guild_name(Some(&value)), Some("g"));
         assert_eq!(guild_name(Some(&serde_json::json!({"id": "1"}))), None);
         assert_eq!(guild_name(None), None);
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use super::*;
+
+    /// A connection on database `db` that answers every command with nil.
+    struct Nil {
+        db: i64,
+    }
+
+    impl ConnectionLike for Nil {
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, redis::Value> {
+            Box::pin(async { Ok(redis::Value::Nil) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a redis::Pipeline,
+            _offset: usize,
+            count: usize,
+        ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+            Box::pin(async move { Ok(vec![redis::Value::Nil; count]) })
+        }
+
+        fn get_db(&self) -> i64 {
+            self.db
+        }
+    }
+
+    /// `Tracked` reports the database of the connection it wraps, and only a
+    /// command it passes on counts as sent.
+    #[tokio::test]
+    async fn tracked_passes_the_database_through_and_records_commands() {
+        let mut inner = Nil { db: 7 };
+        let mut conn = Tracked {
+            conn: &mut inner,
+            sent: false,
+        };
+        assert_eq!(conn.get_db(), 7);
+        assert!(!conn.sent, "asking for the database sends nothing");
+
+        let ping = redis::cmd("PING");
+        let reply = conn.req_packed_command(&ping).await.unwrap();
+        assert!(matches!(reply, redis::Value::Nil));
+        assert!(conn.sent);
     }
 }

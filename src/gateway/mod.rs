@@ -14,7 +14,7 @@ use crate::{
     models::{ApiResult, SessionInfo},
 };
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, hash::BuildHasher, time::Duration};
 use tracing::{info, warn};
 use twilight_gateway::{queue::InMemoryQueue, ConfigBuilder, Session, Shard};
 use twilight_http::Client;
@@ -25,13 +25,25 @@ use twilight_model::gateway::{
 
 /// Shards of this process plus what they were created from.
 pub struct Shards<Q = InMemoryQueue> {
+    /// One shard per id of `range`, in order. None is connected yet: a shard
+    /// connects once it is first polled.
     pub shards: Vec<Shard<Q>>,
+    /// The shards of this process: `SHARDS_START..=SHARDS_END` of
+    /// `SHARDS_TOTAL`, or every shard of Discord's recommended count when
+    /// those are unset.
     pub range: ShardRange,
+    /// The saved sessions the shards resume, by shard id: those of `range`
+    /// that are still resumable, or none with `RESUME=false`.
     pub resumed: HashMap<u32, SessionInfo>,
 }
 
 /// The bot's presence. Bots may set name, state, type and url; a custom
 /// status (type 4) is displayed from `state`.
+///
+/// # Errors
+///
+/// When twilight rejects the payload, which it does only for an empty list of
+/// activities (this one always has one).
 pub fn presence(config: &Config) -> ApiResult<UpdatePresencePayload> {
     let state = config.activity_state.clone().or_else(|| {
         (config.activity_type == ActivityType::Custom).then(|| config.activity_name.clone())
@@ -58,7 +70,7 @@ pub fn presence(config: &Config) -> ApiResult<UpdatePresencePayload> {
         .map_err(|err| format!("invalid presence: {err}").into())
 }
 
-/// Identify concurrency: Discord's value, lowered by SHARDS_CONCURRENCY if set.
+/// Identify concurrency: Discord's value, lowered by `SHARDS_CONCURRENCY` if set.
 ///
 /// Discord allows one identify per 5 s in each bucket `shard % max_concurrency`,
 /// and `InMemoryQueue` releases one shard per 5 s in each bucket `shard % c`.
@@ -81,10 +93,15 @@ pub fn concurrency(discord: u16, configured: Option<u16>) -> u16 {
 
 /// Create this process' shards, resuming saved sessions where possible. Their
 /// identifies only take turns within this process.
-pub async fn create(
+///
+/// # Errors
+///
+/// When Discord's gateway information (`GET /gateway/bot`) cannot be fetched
+/// or decoded, or the presence is invalid (see [`presence`]).
+pub async fn create<S: BuildHasher>(
     config: &Config,
     http: &Client,
-    saved: HashMap<u32, SessionInfo>,
+    saved: HashMap<u32, SessionInfo, S>,
 ) -> ApiResult<Shards> {
     create_with_queue(config, http, saved, |local, _| local).await
 }
@@ -93,10 +110,15 @@ pub async fn create(
 /// (this process' bucket spacing and daily limit, from Discord's session
 /// start limit) and Discord's `max_concurrency`, for example a
 /// [`queue::RedisQueue`] that also takes turns with other processes.
-pub async fn create_with_queue<Q: Clone>(
+///
+/// # Errors
+///
+/// As [`create`]: when Discord's gateway information cannot be fetched or
+/// decoded, or the presence is invalid.
+pub async fn create_with_queue<Q: Clone, S: BuildHasher>(
     config: &Config,
     http: &Client,
-    saved: HashMap<u32, SessionInfo>,
+    saved: HashMap<u32, SessionInfo, S>,
     queue: impl FnOnce(InMemoryQueue, u16) -> Q,
 ) -> ApiResult<Shards<Q>> {
     let info = http.gateway().authed().await?.model().await?;
@@ -165,6 +187,10 @@ pub async fn create_with_queue<Q: Clone>(
     let base = base.build();
 
     let sessions = resumed.clone();
+    #[allow(
+        clippy::range_plus_one,
+        reason = "create_iterator takes an ExactSizeIterator, which RangeInclusive<u32> is not"
+    )]
     let shards = twilight_gateway::create_iterator(
         range.start..range.end + 1,
         range.total,
