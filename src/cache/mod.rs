@@ -197,7 +197,7 @@ async fn clear_guild<C: ConnectionLike + Send>(
         }
         // twilight never produces id 0; a `channel:0` would only be deleted,
         // without looking up its messages.
-        match keys::channel_id_of(&child).and_then(Id::new_checked) {
+        match keys::channel_id_of(&child).and_then(Id::<ChannelMarker>::new_checked) {
             Some(channel_id) if keep.contains(&channel_id.get()) => {}
             // `guild_keys:<guild>` itself is deleted below, so the stored key
             // is enough.
