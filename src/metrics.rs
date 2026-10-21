@@ -890,4 +890,68 @@ mod tests {
 
         server.abort();
     }
+
+    /// What is logged while it is the thread's default subscriber.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn only_broken_requests_are_logged() {
+        // A `tokio::test` runtime runs the server's tasks on this thread, so
+        // they log to this subscriber.
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(run_server(listener));
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let send = |request: &'static [u8]| async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            stream.write_all(request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            // Until the server closes the connection.
+            let _ = stream.read_to_end(&mut Vec::new()).await;
+        };
+        let error = "Metrics connection error";
+
+        // A scraper or probe that gives up halfway through a request (a
+        // timeout, a restart) would otherwise add a warning every time.
+        send(b"GET /metrics HTTP/1.1\r\nHost: x").await;
+        assert!(!logs.text().contains(error), "{}", logs.text());
+
+        send(b"\x16\x03\x01garbage\r\n\r\n").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !logs.text().contains(error) {
+            assert!(Instant::now() < deadline, "a broken request is logged");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        server.abort();
+    }
 }
