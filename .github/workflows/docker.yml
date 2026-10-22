@@ -221,6 +221,11 @@ jobs:
           name: lcov
           path: lcov.info
 
+      # Line coverage of src/ may not drop below this (it was 97.7% when the
+      # gate was added); raise it as coverage grows.
+      - name: Coverage gate
+        run: cargo llvm-cov report --ignore-filename-regex "$IGNORE_FILES" --summary-only --fail-under-lines 97
+
   build-and-push:
     needs: [fmt, clippy, test]
     # Only pushes publish an image; pull requests stop after the tests.
