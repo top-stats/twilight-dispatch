@@ -60,8 +60,8 @@ use twilight_model::{
 /// How many bytes of payloads a shard holds in memory while a worker queue is
 /// full before it stops reading ([`RunnerContext::max_held_bytes`] in
 /// production): 128 MiB. Closing the connection to stop reading costs a
-/// RESUME, and resuming while Discord sends the GUILD_CREATEs of a new
-/// session can fail, which forces a new session and every GUILD_CREATE again.
+/// RESUME, and resuming while Discord sends the `GUILD_CREATE`s of a new
+/// session can fail, which forces a new session and every `GUILD_CREATE` again.
 pub const MAX_HELD_BYTES: usize = 128 * 1024 * 1024;
 
 /// Close codes after which Discord does not allow reconnecting.
