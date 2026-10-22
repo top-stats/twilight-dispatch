@@ -16,6 +16,13 @@
 //! of its own, which keeps every transaction the size of one guild. A failure
 //! part way leaves the remaining stale guilds to the shard's next READY, which
 //! finds them the same way.
+//!
+//! A `GUILD_CREATE` of a cached guild (Discord sends one for every guild after
+//! a new session) replaces what is cached under the guild, except the messages
+//! of the channels it still lists and, with `STATE_MEMBER`, the members: it
+//! lists only some members of a large guild. [`MEMBER_RESYNC_GRACE_MS`] says
+//! when the others expire. Removing a guild (`GUILD_DELETE`, READY no longer
+//! listing it) removes its members.
 
 pub mod batch;
 pub mod jobs;
@@ -27,7 +34,7 @@ use crate::{
     config::StateConfig,
     constants::{
         channel_key, emoji_key, guild_key, member_key, message_key, presence_key, role_key,
-        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, EXPIRY_ZSET, GUILD_KEY,
+        thread_key, voice_key, BOT_USER_KEY, EMOJI_KEY, EXPIRY_ZSET, GUILD_KEY, MEMBER_KEY,
     },
     models::ApiResult,
 };
@@ -173,22 +180,40 @@ async fn clear_channel<C: ConnectionLike + Send>(
     Ok(())
 }
 
+/// What [`clear_guild`] does with the member keys of the guild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberKeys {
+    /// Delete them with everything else: the guild is gone.
+    Delete,
+    /// Leave them cached, with their values and expiry deadlines, for a
+    /// `GUILD_CREATE` re-sync ([`keep_members`]).
+    Keep,
+}
+
 /// Plan the removal of a guild and everything cached under it. Returns the
-/// cached guild.
+/// cached guild and the stored keys of the members it kept.
 ///
 /// Channels in `keep` are about to be written again (`GUILD_CREATE`), so
-/// their cached messages survive.
+/// their cached messages survive. With [`MemberKeys::Keep`] the members
+/// survive too, but `guild_keys:<guild>` is still deleted as a whole: the
+/// caller indexes the kept members again in the same batch.
 async fn clear_guild<C: ConnectionLike + Send>(
     conn: &mut C,
     batch: &mut Batch,
     guild_id: Id<GuildMarker>,
     keep: &HashSet<u64>,
-) -> ApiResult<Option<Value>> {
+    member_keys: MemberKeys,
+) -> ApiResult<(Option<Value>, Vec<String>)> {
     let key = guild_key(guild_id);
     let index = keys::guild_index(guild_id);
     let previous = get(conn, &key).await?;
+    let mut kept_members = Vec::new();
 
     for child in members(conn, &index).await? {
+        if member_keys == MemberKeys::Keep && keys::has_prefix(&child, MEMBER_KEY) {
+            kept_members.push(child);
+            continue;
+        }
         if let Some(thread_id) = keys::thread_id_of(&child) {
             if !keep.contains(&thread_id) {
                 clear_channel(conn, batch, &child, thread_id).await?;
@@ -209,6 +234,19 @@ async fn clear_guild<C: ConnectionLike + Send>(
     batch.del_raw(keys::thread_index(guild_id));
     batch.del(&key);
 
+    Ok((previous, kept_members))
+}
+
+/// Plan the removal of a guild that is gone (`GUILD_DELETE` without
+/// `unavailable`, or READY no longer lists it) and of everything cached under
+/// it, members included. Returns the cached guild.
+async fn remove_guild<C: ConnectionLike + Send>(
+    conn: &mut C,
+    batch: &mut Batch,
+    guild_id: Id<GuildMarker>,
+) -> ApiResult<Option<Value>> {
+    let keep = HashSet::new();
+    let (previous, _) = clear_guild(conn, batch, guild_id, &keep, MemberKeys::Delete).await?;
     Ok(previous)
 }
 
@@ -258,6 +296,25 @@ pub fn joined_recently(joined_at: Option<twilight_model::util::Timestamp>, now_m
     joined_at.is_some_and(|at| now_ms - at.as_micros() / 1000 < RECENT_JOIN_MS)
 }
 
+/// How long a member that a `GUILD_CREATE` re-sync does not list stays
+/// cached with `STATE_MEMBER_TTL=0`, in milliseconds: 24 hours.
+///
+/// Discord sends `GUILD_CREATE` again for every guild after a new session,
+/// and it lists only some members of a large guild: none that are offline
+/// above `LARGE_THRESHOLD` members, and only the bot and the members in voice
+/// channels over 75k members. With `STATE_MEMBER` the members cached before
+/// stay cached and indexed; those it does not list get this deadline in
+/// [`EXPIRY_ZSET`], unless they have one already (another re-sync does not
+/// postpone it). A `GUILD_CREATE` that lists every member removes the others
+/// at once instead. Writing a member again (`GUILD_MEMBERS_CHUNK`,
+/// `GUILD_MEMBER_ADD`, `GUILD_MEMBER_UPDATE`) drops its deadline. The grace
+/// outlives the bot's hourly re-chunk of every guild, so the members still in
+/// the guild are confirmed before it ends, while those who left while the bot
+/// was disconnected (their `GUILD_MEMBER_REMOVE` was missed) are removed by
+/// [`jobs::expire_due`] when it does. With a TTL the kept members keep the
+/// deadline they had, and one without a deadline gets the TTL.
+pub const MEMBER_RESYNC_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+
 fn set_member(
     batch: &mut Batch,
     ctx: &UpdateContext<'_>,
@@ -266,12 +323,24 @@ fn set_member(
 ) -> ApiResult<()> {
     let key = member_key(guild_id, member.user.id);
     batch.set(&key, &CachedMember { guild_id, member })?;
-    if Some(member.user.id) == ctx.bot_id {
-        batch.persist(&key);
-    } else {
-        batch.expire(&key, ctx.state.member_ttl, ctx.now_ms);
-    }
+    set_member_expiry(batch, ctx, &key, member.user.id);
     Ok(())
+}
+
+/// Plan the expiry of a member that was just written: `STATE_MEMBER_TTL`
+/// from now. With a TTL of 0, and for the bot's own member, it gets none, and
+/// a deadline set before (a re-sync's grace, see [`keep_members`]) is dropped.
+fn set_member_expiry(
+    batch: &mut Batch,
+    ctx: &UpdateContext<'_>,
+    key: &str,
+    user_id: Id<UserMarker>,
+) {
+    if ctx.state.member_ttl == 0 || Some(user_id) == ctx.bot_id {
+        batch.persist(key);
+    } else {
+        batch.expire(key, ctx.state.member_ttl, ctx.now_ms);
+    }
 }
 
 fn wants_member(ctx: &UpdateContext<'_>, user_id: Id<UserMarker>) -> bool {
@@ -496,10 +565,18 @@ pub async fn update<C: ConnectionLike + Send>(
                     .chain(&guild.threads)
                     .map(|channel| channel.id.get())
                     .collect();
-                let previous = clear_guild(conn, &mut batch, guild.id, &keep).await?;
+                // A re-sync lists only some members of a large guild.
+                let member_keys = if state.member {
+                    MemberKeys::Keep
+                } else {
+                    MemberKeys::Delete
+                };
+                let (previous, kept_members) =
+                    clear_guild(conn, &mut batch, guild.id, &keep, member_keys).await?;
                 outcome.guild_known = previous.is_some();
                 outcome.old = old_if(ctx, previous.as_ref());
                 outcome.previous_guild = previous;
+                keep_members(&mut batch, ctx, guild, &kept_members);
                 write_guild(&mut batch, ctx, guild)?;
             }
             GuildCreate::Unavailable(guild) => {
@@ -525,7 +602,7 @@ pub async fn update<C: ConnectionLike + Send>(
                 )?;
                 outcome.previous_guild = previous;
             } else {
-                let previous = clear_guild(conn, &mut batch, data.id, &HashSet::new()).await?;
+                let previous = remove_guild(conn, &mut batch, data.id).await?;
                 outcome.old = old_if(ctx, previous.as_ref());
                 outcome.previous_guild = previous;
             }
@@ -633,11 +710,7 @@ pub async fn update<C: ConnectionLike + Send>(
                 }
                 let merged = overlay(previous, update, &["deaf", "mute", "flags", "joined_at"]);
                 batch.set(&key, &merged)?;
-                if Some(data.user.id) == ctx.bot_id {
-                    batch.persist(&key);
-                } else {
-                    batch.expire(&key, state.member_ttl, ctx.now_ms);
-                }
+                set_member_expiry(&mut batch, ctx, &key, data.user.id);
             }
         }
         Event::MemberChunk(data) => {
@@ -840,6 +913,53 @@ pub async fn update_stale<C: ConnectionLike + Send>(
     Ok(outcome)
 }
 
+/// Keep the members that [`clear_guild`] left cached for a `GUILD_CREATE`
+/// re-sync (`kept`, stored keys): index them under the guild again, and give
+/// those `guild` does not list a deadline unless they have one already: with
+/// `STATE_MEMBER_TTL=0` the grace ([`MEMBER_RESYNC_GRACE_MS`]), with a TTL
+/// the TTL. So with a TTL they keep the deadline they had.
+///
+/// When `guild` lists every member (as many as its `member_count`, which
+/// Discord does below `LARGE_THRESHOLD` members), the ones it does not list
+/// left while no session received their `GUILD_MEMBER_REMOVE`: they are
+/// removed at once, as a re-sync always did.
+///
+/// A key that the expiry job removed after [`clear_guild`] read the index is
+/// indexed again here, without a value: it gets a deadline too, so the job
+/// removes those entries later. Called before [`write_guild`] takes the
+/// members out of `guild`; the ones it lists are written again there.
+fn keep_members(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &Guild, kept: &[String]) {
+    if kept.is_empty() {
+        return;
+    }
+    let ttl = if ctx.state.member_ttl == 0 {
+        MEMBER_RESYNC_GRACE_MS
+    } else {
+        ctx.state.member_ttl
+    };
+    // The bot's own member never expires, listed or not.
+    let listed: HashSet<String> = guild
+        .members
+        .iter()
+        .map(|member| member.user.id)
+        .chain(ctx.bot_id)
+        .map(|user_id| member_key(guild.id, user_id))
+        .collect();
+    // Every member listed: the members it does not list have left.
+    let listed_len = u64::try_from(guild.members.len()).unwrap_or(u64::MAX);
+    let complete = guild.member_count.is_some_and(|count| listed_len >= count);
+    for key in kept {
+        if listed.contains(key) {
+            batch.reindex(key);
+        } else if complete {
+            batch.del(key);
+        } else {
+            batch.reindex(key);
+            batch.expire_if_unset(key, ttl, ctx.now_ms);
+        }
+    }
+}
+
 /// Plan all keys of an available `GUILD_CREATE`. The lists that are stored
 /// under their own keys are taken out of `guild`, which leaves exactly the
 /// guild blob behind (with empty lists, as consumers expect).
@@ -961,7 +1081,7 @@ async fn ready<C: ConnectionLike + Send>(conn: &mut C, data: &Ready) -> ApiResul
         let stale = keys::stale_guilds(cached, &listed, shard.number(), shard.total());
         for guild_id in stale.into_iter().filter_map(Id::new_checked) {
             let mut batch = Batch::new();
-            clear_guild(conn, &mut batch, guild_id, &HashSet::new()).await?;
+            remove_guild(conn, &mut batch, guild_id).await?;
             batch.commit(conn).await?;
         }
     }

@@ -28,6 +28,8 @@ pub struct Batch {
     writes: Vec<(String, String)>,
     index: BTreeMap<String, Vec<String>>,
     expiries: Vec<(String, i64)>,
+    /// Deadlines only for keys that have none yet (`ZADD NX`).
+    expiries_if_unset: Vec<(String, i64)>,
 }
 
 impl Batch {
@@ -45,6 +47,7 @@ impl Batch {
             && self.writes.is_empty()
             && self.index.is_empty()
             && self.expiries.is_empty()
+            && self.expiries_if_unset.is_empty()
     }
 
     /// Store `value` as JSON under a logical key and index it.
@@ -66,6 +69,17 @@ impl Batch {
             self.index.entry(set).or_default().push(member);
         }
         self.writes.push((plan.stored, json));
+    }
+
+    /// Index a logical key again without writing its value.
+    ///
+    /// For a key that stays cached while an index set that lists it is
+    /// deleted in the same batch ([`Batch::del_raw`]): index entries are
+    /// added after every delete.
+    pub fn reindex(&mut self, key: &str) {
+        for (set, member) in plan(key).indexes {
+            self.index.entry(set).or_default().push(member);
+        }
     }
 
     /// Delete a logical key, its index entries and its expiry.
@@ -92,6 +106,18 @@ impl Batch {
         }
     }
 
+    /// Like [`Batch::expire`], but a key that already has a deadline keeps
+    /// it (`ZADD NX`).
+    ///
+    /// That is a deadline set before the batch or by [`Batch::expire`] in it.
+    /// A [`Batch::persist`] in the same batch runs first, so the key then
+    /// gets this deadline. A TTL of 0 adds nothing.
+    pub fn expire_if_unset(&mut self, key: &str, ttl_ms: u64, now_ms: i64) {
+        if let Some(deadline) = deadline(ttl_ms, now_ms) {
+            self.expiries_if_unset.push((stored_key(key), deadline));
+        }
+    }
+
     /// Remove any pending expiry of a logical key.
     pub fn persist(&mut self, key: &str) {
         self.unexpire.push(stored_key(key));
@@ -102,7 +128,8 @@ impl Batch {
     ///
     /// Within one batch every delete and `persist` runs before every write and
     /// expiry, whatever the call order: a `set` followed by a `del` of the same
-    /// key leaves it written, and an `expire` wins over a `persist`.
+    /// key leaves it written, and an `expire` wins over a `persist` and over
+    /// an `expire_if_unset`.
     pub fn commands(&self) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         self.for_each_command(|name, args| {
@@ -178,19 +205,27 @@ impl Batch {
                 emit("SADD", &args);
             }
         }
-        for chunk in self.expiries.chunks(CHUNK) {
-            let deadlines: Vec<String> = chunk
-                .iter()
-                .map(|(_, deadline)| deadline.to_string())
-                .collect();
-            let mut args: Vec<&str> = Vec::with_capacity(1 + 2 * chunk.len());
-            args.push(EXPIRY_ZSET);
-            for ((key, _), deadline) in chunk.iter().zip(&deadlines) {
-                args.push(deadline);
-                args.push(key);
-            }
-            emit("ZADD", &args);
+        zadd(&mut emit, &[], &self.expiries);
+        zadd(&mut emit, &["NX"], &self.expiries_if_unset);
+    }
+}
+
+/// Emit the `ZADD` commands, with `flags`, that add `expiries` (stored key,
+/// deadline) to [`EXPIRY_ZSET`], [`CHUNK`] at a time.
+fn zadd(mut emit: impl FnMut(&str, &[&str]), flags: &[&str], expiries: &[(String, i64)]) {
+    for chunk in expiries.chunks(CHUNK) {
+        let deadlines: Vec<String> = chunk
+            .iter()
+            .map(|(_, deadline)| deadline.to_string())
+            .collect();
+        let mut args: Vec<&str> = Vec::with_capacity(1 + flags.len() + 2 * chunk.len());
+        args.push(EXPIRY_ZSET);
+        args.extend_from_slice(flags);
+        for ((key, _), deadline) in chunk.iter().zip(&deadlines) {
+            args.push(deadline);
+            args.push(key);
         }
+        emit("ZADD", &args);
     }
 }
 
@@ -298,5 +333,84 @@ mod tests {
         let mset: Vec<_> = commands.iter().filter(|c| c[0] == "MSET").collect();
         assert_eq!(mset.len(), 3);
         assert!(commands.iter().all(|c| c.len() <= CHUNK * 2 + 1));
+    }
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Kept keys are indexed again under their stored key (a guild channel's
+    /// has no guild segment), after the index set of the guild is deleted.
+    #[test]
+    fn reindex_only_adds_index_entries_after_the_deletes() {
+        let mut batch = Batch::new();
+        batch.reindex("member:1:3");
+        batch.reindex("channel:1:2");
+        batch.del_raw("guild_keys:1");
+        assert!(!batch.is_empty());
+        assert_eq!(
+            batch.commands(),
+            vec![
+                strs(&["DEL", "guild_keys:1"]),
+                strs(&["SADD", "channel_keys", "channel:2"]),
+                strs(&["SADD", "guild_keys:1", "member:1:3", "channel:2"]),
+                strs(&["SADD", "member_keys", "member:1:3"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn expire_if_unset_adds_nx_deadlines_and_skips_zero_ttl() {
+        let mut batch = Batch::new();
+        batch.expire_if_unset("member:1:3", 60_000, 1_000);
+        batch.expire_if_unset("member:1:4", 0, 1_000);
+        assert!(!batch.is_empty());
+        assert_eq!(
+            batch.commands(),
+            vec![strs(&["ZADD", EXPIRY_ZSET, "NX", "61000", "member:1:3"])]
+        );
+
+        let mut never = Batch::new();
+        never.expire_if_unset("member:1:4", 0, 1_000);
+        assert!(never.is_empty());
+    }
+
+    /// A persist of the same batch runs before it, and a plain expiry is
+    /// sent first, so that one wins.
+    #[test]
+    fn expire_if_unset_runs_after_persist_and_expire() {
+        let mut batch = Batch::new();
+        batch.expire_if_unset("member:1:3", 60_000, 1_000);
+        batch.expire("member:1:3", 1, 1_000);
+        batch.persist("member:1:3");
+        assert_eq!(
+            batch.commands(),
+            vec![
+                strs(&["ZREM", EXPIRY_ZSET, "member:1:3"]),
+                strs(&["ZADD", EXPIRY_ZSET, "1001", "member:1:3"]),
+                strs(&["ZADD", EXPIRY_ZSET, "NX", "61000", "member:1:3"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn expire_if_unset_is_chunked() {
+        let mut batch = Batch::new();
+        for i in 0..=CHUNK {
+            batch.expire_if_unset(&format!("member:1:{i}"), 1, 0);
+        }
+        let commands = batch.commands();
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().all(|c| c[0] == "ZADD" && c[2] == "NX"));
+        assert_eq!(commands[0].len(), 3 + 2 * CHUNK);
+        assert_eq!(
+            commands[1],
+            strs(&["ZADD", EXPIRY_ZSET, "NX", "1", "member:1:1000"])
+        );
     }
 }

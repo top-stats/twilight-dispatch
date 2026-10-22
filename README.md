@@ -82,6 +82,27 @@ Configuration is read from environment variables (or `.env`); see
   copy that thread events keep current; `channel:` keys never hold threads.
   The guild blob's `threads` is the list from the guild's last GUILD_CREATE,
   kept for compatibility as in earlier versions: thread events do not update it.
+- After every new session (a fresh identify, not a resume) Discord sends each
+  guild's GUILD_CREATE again, and it lists only some members of a large guild:
+  none that are offline above `LARGE_THRESHOLD` members, and only the bot and
+  the members in voice channels over 75k members. This re-sync replaces what is
+  cached for the guild (channels, threads, roles, emojis, presences, voice
+  states) but, with `STATE_MEMBER`, keeps the cached members, still indexed in
+  `guild_keys:<guild>` and `member_keys`. With `STATE_MEMBER_TTL=0` the members
+  it does not list get a deadline 24 hours later in `expiry_zset`
+  (`cache::MEMBER_RESYNC_GRACE_MS`), and a member that already has one keeps
+  it, so another re-sync does not postpone it. Anything that writes a member
+  again drops its deadline: a GUILD_MEMBERS_CHUNK (the bot requests every
+  guild's members hourly), GUILD_MEMBER_ADD or GUILD_MEMBER_UPDATE. So members
+  still in the guild stay cached, and members who left while the bot was
+  disconnected (whose GUILD_MEMBER_REMOVE was missed) are removed when the
+  grace ends. A GUILD_CREATE that lists every member (as many as its
+  `member_count`, as for guilds below `LARGE_THRESHOLD`) removes the members it
+  does not list at once. With a member TTL the kept members keep the deadline
+  they had, and one without a deadline (cached while the TTL was 0) gets the
+  TTL.
+  Leaving a guild (GUILD_DELETE without `unavailable`) and READY no longer
+  listing it still remove all of its members at once.
 - With several processes (different `SHARDS_START`/`SHARDS_END`), every
   process consumes `gateway.send`, runs commands for its own shards and
   forwards the others to the `gateway.send.shards` direct exchange (routing key:

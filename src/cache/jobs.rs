@@ -5,6 +5,12 @@
 //! [`EXPIRY_KEYS`] and read the whole hash every second, which is O(n) on
 //! Redis' single thread; [`migrate_legacy_expiry`] moves those entries over.
 //!
+//! Members get a deadline from `STATE_MEMBER_TTL`, or with a TTL of 0 from a
+//! `GUILD_CREATE` re-sync that does not list them
+//! ([`super::MEMBER_RESYNC_GRACE_MS`]); messages from `STATE_MESSAGE_TTL`.
+//! [`expire_due`] removes a due key together with its index entries: for a
+//! member, `member_keys` and `guild_keys:<guild>`.
+//!
 //! The service runs these jobs whatever `STATE_ENABLED` says: an instance
 //! with the cache disabled still expires keys left in [`EXPIRY_ZSET`] (for
 //! example by an earlier run with the cache on) and still migrates
