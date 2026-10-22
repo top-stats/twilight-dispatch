@@ -137,8 +137,9 @@ CI (`.github/workflows/docker.yml`) runs the same checks on every push and
 pull request on GitHub-hosted runners, as separate jobs (format; clippy and
 rustdoc; tests), with Redis and LavinMQ as service containers. A coverage job
 runs the tests under `cargo llvm-cov`, adds the per-file line coverage of
-`src/` to the run's summary, lists the lines no test runs in its log and
-uploads `lcov.info` as an artifact. The image is only built and published
+`src/` to the run's summary, lists the lines no test runs in its log,
+uploads `lcov.info` as an artifact and fails when the line coverage of `src/`
+drops below 97%. The image is only built and published
 (self-hosted runner) for pushes to `main` and tags, after the format, clippy
 and test jobs passed. Actions are pinned to commits and kept current by
 Dependabot (`.github/dependabot.yml`), which also proposes crate updates
