@@ -32,9 +32,11 @@ use twilight_model::{
 };
 
 /// Per-worker queue length. A shard whose next event does not fit its
-/// worker's queue is paused (closed resumably, its later events held; see
-/// `runner`) until the queue drains. The worker queues together hold up to
-/// `WORKERS * QUEUE` events (each a raw payload plus its typed event).
+/// worker's queue holds its later events in memory, in order, and keeps
+/// reading; only past `runner::MAX_HELD_BYTES` of them is it paused (closed
+/// resumably; see `runner`) until the queue drains. The worker queues
+/// together hold up to `WORKERS * QUEUE` events (each a raw payload plus its
+/// typed event).
 pub const QUEUE: usize = 1024;
 /// How long cache updates are skipped after one failed.
 pub const BREAKER_COOLDOWN: Duration = Duration::from_secs(1);

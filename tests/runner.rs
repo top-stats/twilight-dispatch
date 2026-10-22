@@ -6,9 +6,12 @@
 //! and a real Redis (set TEST_REDIS_URL).
 //!
 //! Pinned here:
-//! - backpressure: a full worker queue closes the shard resumably (4000), the
-//!   runner waits for room and the shard RESUMEs once from the last sequence
-//!   it received; every dispatch is published exactly once, in order;
+//! - backpressure: below `max_held_bytes` a full worker queue holds the
+//!   shard's events in order while it keeps reading, with no reconnect;
+//!   past it (0 here unless a test says otherwise) the shard is closed
+//!   resumably (4000), the runner waits for room and the shard RESUMEs once
+//!   from the last sequence it received; every dispatch is published exactly
+//!   once, in order;
 //! - the registry snapshot (`refresh()`): session, resume URL, status, close
 //!   code, fatal flag and the resume point after READY;
 //! - shutdown: a resumable close that still dispatches what arrives while
@@ -217,6 +220,9 @@ struct Opts {
     /// A saved session to resume, as `app::start` restores it.
     restore: Option<SessionInfo>,
     discord: DiscordLog,
+    /// `RunnerContext::max_held_bytes`: 0 stops reading at the first held
+    /// event, which the backpressure tests below pin.
+    max_held_bytes: usize,
 }
 
 impl Default for Opts {
@@ -228,6 +234,7 @@ impl Default for Opts {
             delay: None,
             restore: None,
             discord: DiscordLog::disabled(),
+            max_held_bytes: 0,
         }
     }
 }
@@ -306,6 +313,7 @@ where
         discord: opts.discord,
         bot_id: common::bot_id(),
         cache_timeout: Duration::from_secs(5),
+        max_held_bytes: opts.max_held_bytes,
     });
     let (shutdown, shutdown_rx) = watch::channel(false);
     let runner = tokio::spawn(runner::run(shard, handle.clone(), runner_ctx, shutdown_rx));
@@ -702,6 +710,52 @@ async fn relay(
 
 // ---------------------------------------------------------------------------
 // Backpressure
+
+/// Below `max_held_bytes` a full queue does not close the shard: it keeps
+/// reading, holds the events in order and queues them as room frees up, so
+/// nothing is lost, published twice or resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_queue_holds_events_without_closing_the_shard() {
+    let _metrics = METRICS.read().await;
+    let Some(redis) = common::redis(IDLE_DB).await else {
+        return;
+    };
+    let fake = FakeDiscord::start().await;
+    let shard = 38;
+    let base = received(shard, "TYPING_START");
+    let opts = Opts {
+        open: false,
+        max_held_bytes: usize::MAX,
+        ..Opts::default()
+    };
+    let mut running = start(&fake.gateway.url(), shard, redis, opts);
+
+    let mut conn = identified(&fake, shard, "A", QUIET).await;
+    running.recorder.wait_entered(1).await;
+    let last = FULL + 10;
+    send_typing(&conn, 2..=last).await;
+
+    // Every event is read while the queue is full, and the shard stays
+    // connected.
+    eventually("the shard to read every event", || {
+        (received(shard, "TYPING_START") - base == last - 1).then_some(())
+    })
+    .await;
+    assert_eq!(
+        conn.try_next_frame(Duration::from_millis(300)).await,
+        None,
+        "closed the shard"
+    );
+    assert_eq!(running.snapshot().status, "Connected");
+    assert_eq!(running.recorder.count(), 0);
+
+    running.recorder.open();
+    let published = running.recorder.wait_published(last as usize).await;
+    assert_ids(&published, &running.ids("A", 1..=last));
+    assert_eq!(fake.gateway.connections(), 1, "no reconnect");
+    running.stop().await;
+    assert_eq!(conn.expect_close().await, Some(4000));
+}
 
 /// The pause closes the shard resumably, opens no connection while the
 /// workers are stuck, and costs exactly one RESUME from the last received

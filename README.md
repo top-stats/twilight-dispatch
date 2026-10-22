@@ -63,7 +63,7 @@ Configuration is read from environment variables (or `.env`); see
   Measured on a dev machine (LavinMQ 2.10 with its default disk sync, 1 KiB
   events): about 200 events/s from one worker, 2.5k/s from 32 and 10k/s from
   128 (about 60k/s from 32 before confirms). Raise it (up to 1024) when shards
-  log `Event queue is full; pausing the shard until it drains`. Each worker
+  log `Event queue is full; holding events until it drains`. Each worker
   buffers up to 1024 events, so memory for queued events grows with `WORKERS`
   (about a million payloads at 1024). It does not help one busy guild: a
   guild's events always use the same worker, to stay in order, so a guild is

@@ -71,15 +71,11 @@ impl Batch {
         self.writes.push((plan.stored, json));
     }
 
-    /// Index a logical key again without writing its value.
-    ///
-    /// For a key that stays cached while an index set that lists it is
-    /// deleted in the same batch ([`Batch::del_raw`]): index entries are
-    /// added after every delete.
-    pub fn reindex(&mut self, key: &str) {
-        for (set, member) in plan(key).indexes {
-            self.index.entry(set).or_default().push(member);
-        }
+    /// Remove `member` from the index set `set` (both as stored) without
+    /// deleting anything, for an index that is not deleted as a whole.
+    pub fn unindex_raw(&mut self, set: &str, member: &str) {
+        let members = self.unindex.entry(set.to_owned()).or_default();
+        members.push(member.to_owned());
     }
 
     /// Delete a logical key, its index entries and its expiry.
@@ -344,23 +340,16 @@ mod resync_tests {
         v.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    /// Kept keys are indexed again under their stored key (a guild channel's
-    /// has no guild segment), after the index set of the guild is deleted.
+    /// A stored key is removed from one index set, and nothing else is.
     #[test]
-    fn reindex_only_adds_index_entries_after_the_deletes() {
+    fn unindex_raw_only_removes_the_index_entry() {
         let mut batch = Batch::new();
-        batch.reindex("member:1:3");
-        batch.reindex("channel:1:2");
-        batch.del_raw("guild_keys:1");
+        batch.unindex_raw("guild_keys:1", "channel:2");
+        batch.unindex_raw("guild_keys:1", "role:1:3");
         assert!(!batch.is_empty());
         assert_eq!(
             batch.commands(),
-            vec![
-                strs(&["DEL", "guild_keys:1"]),
-                strs(&["SADD", "channel_keys", "channel:2"]),
-                strs(&["SADD", "guild_keys:1", "member:1:3", "channel:2"]),
-                strs(&["SADD", "member_keys", "member:1:3"]),
-            ]
+            vec![strs(&["SREM", "guild_keys:1", "channel:2", "role:1:3"])]
         );
     }
 

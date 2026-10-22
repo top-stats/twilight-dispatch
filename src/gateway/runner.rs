@@ -8,10 +8,13 @@
 //! - READY's cache update, which must land before the guilds that follow it
 //!   so they are not mistaken for new joins; it is bounded by the smaller of
 //!   `CACHE_TIMEOUT_MS` and [`READY_TIMEOUT`];
-//! - backpressure: when a worker queue is full the shard is first closed
-//!   resumably (so no heartbeat is owed), then the runner waits for room for
-//!   as long as that takes (this wait has no time bound) and lets the shard
-//!   reconnect; Discord replays what was not received.
+//! - backpressure, as a last resort: when a worker queue is full the runner
+//!   holds the shard's later events in memory, in order, and keeps reading
+//!   (so twilight keeps heartbeating) while it queues them as room frees up.
+//!   Only once more than [`RunnerContext::max_held_bytes`] are held is the
+//!   shard closed resumably (so no heartbeat is owed), then the runner waits
+//!   for room for as long as that takes (this wait has no time bound) and
+//!   lets the shard reconnect; Discord replays what was not received.
 
 use super::{
     payload::{self, Envelope, Route},
@@ -54,6 +57,13 @@ use twilight_model::{
     id::{marker::UserMarker, Id},
 };
 
+/// How many bytes of payloads a shard holds in memory while a worker queue is
+/// full before it stops reading ([`RunnerContext::max_held_bytes`] in
+/// production): 128 MiB. Closing the connection to stop reading costs a
+/// RESUME, and resuming while Discord sends the GUILD_CREATEs of a new
+/// session can fail, which forces a new session and every GUILD_CREATE again.
+pub const MAX_HELD_BYTES: usize = 128 * 1024 * 1024;
+
 /// Close codes after which Discord does not allow reconnecting.
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes>
 pub const FATAL_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
@@ -85,6 +95,10 @@ pub struct RunnerContext<C> {
     /// The time limit of a cache update (`CACHE_TIMEOUT_MS`); READY's is
     /// also capped at [`READY_TIMEOUT`].
     pub cache_timeout: Duration,
+    /// How many bytes of payloads a shard may hold while a worker queue is
+    /// full before it stops reading ([`MAX_HELD_BYTES`] in production; 0
+    /// stops reading at the first held event).
+    pub max_held_bytes: usize,
 }
 
 /// Whether the cache (or the guild join/leave log) needs the typed event.
@@ -274,9 +288,16 @@ struct Runner<C, Q> {
     session: Option<Arc<str>>,
     /// Jobs waiting for room in a full worker queue, in order.
     held: VecDeque<(usize, Job)>,
-    /// Since when jobs are held because a worker queue was full; the shard is
-    /// closed resumably then, unless it was disconnected already.
+    /// The payload bytes of the `held` jobs.
+    held_bytes: usize,
+    /// Since when jobs are held because a worker queue was full. Past
+    /// [`RunnerContext::max_held_bytes`] the shard is closed resumably,
+    /// unless it was disconnected already.
     paused_at: Option<Instant>,
+    /// Whether the start of the current hold was logged, so its end is too.
+    hold_logged: bool,
+    /// Throttles the warnings about full worker queues.
+    hold_warnings: Throttle,
     /// While shutting down: when [`Runner::close`] has to be done.
     close_deadline: Option<tokio::time::Instant>,
     /// The shutdown signal, for the one wait inside handling a message
@@ -314,7 +335,10 @@ pub async fn run<C, Q>(
         last_status: "Disconnected",
         session,
         held: VecDeque::new(),
+        held_bytes: 0,
         paused_at: None,
+        hold_logged: false,
+        hold_warnings: Throttle::default(),
         close_deadline: None,
         shutdown: shutdown.clone(),
         reconnect_counted: false,
@@ -326,7 +350,7 @@ pub async fn run<C, Q>(
     loop {
         // After the backpressure close went out no heartbeat is owed, so it
         // is safe to wait for the workers before reading again.
-        if runner.paused_at.is_some() {
+        if runner.held_over_limit() {
             if runner.is_disconnected() {
                 // But not past a shutdown, which would then wait until `app`
                 // aborts the runner: `flush_held` keeps what it did not queue
@@ -352,11 +376,20 @@ pub async fn run<C, Q>(
             }
         }
 
+        // Below the limit the shard keeps reading while held jobs wait for
+        // room in the queue of the oldest one.
+        let waiting = if runner.held_over_limit() {
+            None
+        } else {
+            let oldest = runner.held.front();
+            oldest.map(|&(worker, _)| runner.ctx.workers[worker].clone())
+        };
         tokio::select! {
             () = shutdown_requested(&mut shutdown) => {
                 runner.close().await;
                 return;
             }
+            permit = room_in(waiting) => runner.queue_oldest_held(permit),
             item = runner.shard.next() => {
                 if !runner.on_item(item).await {
                     runner.flush_held().await;
@@ -364,6 +397,15 @@ pub async fn run<C, Q>(
                 }
             }
         }
+    }
+}
+
+/// Resolves with room in `queue` (`None` once its worker is gone), and never
+/// without a queue to wait for.
+async fn room_in(queue: Option<mpsc::Sender<Job>>) -> Option<mpsc::OwnedPermit<Job>> {
+    match queue {
+        Some(queue) => queue.reserve_owned().await.ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -746,29 +788,26 @@ where
     }
 
     /// Hand a job to its worker without waiting. When the queue is full the
-    /// job (and everything after it) is held and the shard is closed
+    /// job (and everything after it) is held, in order, and queued as room
+    /// frees up. Past [`RunnerContext::max_held_bytes`] the shard is closed
     /// resumably, so it stops receiving until the workers caught up.
     fn enqueue(&mut self, worker: usize, job: Job) {
         if !self.held.is_empty() {
-            self.held.push_back((worker, job));
+            self.hold(worker, job);
             return;
         }
         match self.ctx.workers[worker].try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(job)) => {
-                self.held.push_back((worker, job));
-                if self.paused_at.is_none() {
-                    self.paused_at = Some(Instant::now());
-                    // A disconnected shard owes no heartbeat; a close queued
-                    // now would only kill its next connection.
-                    if !self.is_disconnected() {
-                        warn!(
-                            "[Shard {}] Event queue is full; pausing the shard until it drains",
-                            self.id
-                        );
-                        self.shard.close(CloseFrame::RESUME);
-                    }
+                self.paused_at = Some(Instant::now());
+                if let Some(suppressed) = self.hold_warnings.check() {
+                    self.hold_logged = true;
+                    warn!(
+                        "[Shard {}] Event queue is full; holding events until it drains ({} similar suppressed)",
+                        self.id, suppressed
+                    );
                 }
+                self.hold(worker, job);
             }
             Err(TrySendError::Closed(_)) => {
                 warn!(
@@ -777,6 +816,49 @@ where
                 );
             }
         }
+    }
+
+    /// Hold a job behind the ones already held. Once more than
+    /// [`RunnerContext::max_held_bytes`] are held the shard is closed
+    /// resumably.
+    fn hold(&mut self, worker: usize, job: Job) {
+        let was_over = self.held_over_limit();
+        self.held_bytes = self.held_bytes.saturating_add(job.json.len());
+        self.held.push_back((worker, job));
+        // A disconnected shard owes no heartbeat; a close queued now would
+        // only kill its next connection.
+        if !was_over && self.held_over_limit() && !self.is_disconnected() {
+            warn!(
+                "[Shard {}] {} bytes of events held; pausing the shard until the queue drains",
+                self.id, self.held_bytes
+            );
+            self.shard.close(CloseFrame::RESUME);
+        }
+    }
+
+    /// Whether more is held than [`RunnerContext::max_held_bytes`] allows, so
+    /// the shard has to stop reading.
+    fn held_over_limit(&self) -> bool {
+        !self.held.is_empty() && self.held_bytes >= self.ctx.max_held_bytes
+    }
+
+    /// Queue the oldest held job with `permit`, room in its worker's queue
+    /// (`None`: the worker is gone and the job is dropped), then as many of
+    /// the others as fit.
+    fn queue_oldest_held(&mut self, permit: Option<mpsc::OwnedPermit<Job>>) {
+        if let Some((worker, job)) = self.held.pop_front() {
+            self.held_bytes = self.held_bytes.saturating_sub(job.json.len());
+            if let Some(permit) = permit {
+                // It hands back a clone of the worker's sender.
+                let _ = permit.send(job);
+            } else {
+                warn!(
+                    "[Shard {}] Worker {} is gone, dropping event",
+                    self.id, worker
+                );
+            }
+        }
+        self.try_flush_held();
     }
 
     /// Whether the shard has no connection, so no heartbeat is owed.
@@ -791,9 +873,12 @@ where
     /// queue. Returns true once nothing is held any more (the pause is over).
     fn try_flush_held(&mut self) -> bool {
         while let Some((worker, job)) = self.held.pop_front() {
+            let bytes = job.json.len();
             match self.ctx.workers[worker].try_send(job) {
                 // A gone worker's job is dropped: no queue would ever take it.
-                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Ok(()) | Err(TrySendError::Closed(_)) => {
+                    self.held_bytes = self.held_bytes.saturating_sub(bytes);
+                }
                 Err(TrySendError::Full(job)) => {
                     self.held.push_front((worker, job));
                     return false;
@@ -815,6 +900,7 @@ where
             let Some((_, job)) = self.held.pop_front() else {
                 break;
             };
+            self.held_bytes = self.held_bytes.saturating_sub(job.json.len());
             if let Ok(permit) = permit {
                 permit.send(job);
             } else {
@@ -827,14 +913,18 @@ where
         self.end_pause();
     }
 
-    /// End the backpressure pause, if there is one, and log how long it took.
+    /// End the hold, if there is one, and log how long it took when its start
+    /// was logged.
     fn end_pause(&mut self) {
+        self.held_bytes = 0;
         if let Some(since) = self.paused_at.take() {
-            let paused_for = since.elapsed();
-            info!(
-                "[Shard {}] Event queue drained after {:?}; resuming",
-                self.id, paused_for
-            );
+            if std::mem::take(&mut self.hold_logged) {
+                info!(
+                    "[Shard {}] Event queue drained after {:?}; resuming",
+                    self.id,
+                    since.elapsed()
+                );
+            }
         }
     }
 
@@ -1197,12 +1287,16 @@ mod runner_tests {
                 discord: DiscordLog::disabled(),
                 bot_id: Id::new(1),
                 cache_timeout: Duration::from_secs(1),
+                max_held_bytes: 0,
             }),
             id: 0,
             last_status: "Disconnected",
             session: None,
             held: VecDeque::new(),
+            held_bytes: 0,
             paused_at: None,
+            hold_logged: false,
+            hold_warnings: Throttle::default(),
             close_deadline: None,
             shutdown: watch::channel(false).1,
             reconnect_counted: false,

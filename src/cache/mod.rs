@@ -195,8 +195,8 @@ enum MemberKeys {
 ///
 /// Channels in `keep` are about to be written again (`GUILD_CREATE`), so
 /// their cached messages survive. With [`MemberKeys::Keep`] the members
-/// survive too, but `guild_keys:<guild>` is still deleted as a whole: the
-/// caller indexes the kept members again in the same batch.
+/// survive too, and stay indexed: `guild_keys:<guild>` is not deleted as a
+/// whole but loses only the keys that are removed.
 async fn clear_guild<C: ConnectionLike + Send>(
     conn: &mut C,
     batch: &mut Batch,
@@ -214,23 +214,37 @@ async fn clear_guild<C: ConnectionLike + Send>(
             kept_members.push(child);
             continue;
         }
-        if let Some(thread_id) = keys::thread_id_of(&child) {
-            if !keep.contains(&thread_id) {
+        let cleared = if let Some(thread_id) = keys::thread_id_of(&child) {
+            if keep.contains(&thread_id) {
+                false
+            } else {
                 clear_channel(conn, batch, &child, thread_id).await?;
+                true
             }
-            continue;
-        }
-        // twilight never produces id 0; a `channel:0` would only be deleted,
-        // without looking up its messages.
-        match keys::channel_id_of(&child).and_then(Id::<ChannelMarker>::new_checked) {
-            Some(channel_id) if keep.contains(&channel_id.get()) => {}
-            // `guild_keys:<guild>` itself is deleted below, so the stored key
-            // is enough.
-            Some(channel_id) => clear_channel(conn, batch, &child, channel_id.get()).await?,
-            None => batch.del(&child),
+        } else {
+            // twilight never produces id 0; a `channel:0` would only be
+            // deleted, without looking up its messages.
+            match keys::channel_id_of(&child).and_then(Id::<ChannelMarker>::new_checked) {
+                Some(channel_id) if keep.contains(&channel_id.get()) => false,
+                Some(channel_id) => {
+                    clear_channel(conn, batch, &child, channel_id.get()).await?;
+                    true
+                }
+                None => {
+                    batch.del(&child);
+                    true
+                }
+            }
+        };
+        // A stored channel key has no guild segment, so deleting it does not
+        // take it out of `guild_keys:<guild>`.
+        if cleared && member_keys == MemberKeys::Keep {
+            batch.unindex_raw(&index, &child);
         }
     }
-    batch.del_raw(index);
+    if member_keys == MemberKeys::Delete {
+        batch.del_raw(index);
+    }
     batch.del_raw(keys::thread_index(guild_id));
     batch.del(&key);
 
@@ -913,21 +927,21 @@ pub async fn update_stale<C: ConnectionLike + Send>(
     Ok(outcome)
 }
 
-/// Keep the members that [`clear_guild`] left cached for a `GUILD_CREATE`
-/// re-sync (`kept`, stored keys): index them under the guild again, and give
-/// those `guild` does not list a deadline unless they have one already: with
-/// `STATE_MEMBER_TTL=0` the grace ([`MEMBER_RESYNC_GRACE_MS`]), with a TTL
-/// the TTL. So with a TTL they keep the deadline they had.
+/// Keep the members that [`clear_guild`] left cached and indexed for a
+/// `GUILD_CREATE` re-sync (`kept`, stored keys): give those `guild` does not
+/// list a deadline unless they have one already: with `STATE_MEMBER_TTL=0`
+/// the grace ([`MEMBER_RESYNC_GRACE_MS`]), with a TTL the TTL. So with a TTL
+/// they keep the deadline they had.
 ///
 /// When `guild` lists every member (as many as its `member_count`, which
 /// Discord does below `LARGE_THRESHOLD` members), the ones it does not list
 /// left while no session received their `GUILD_MEMBER_REMOVE`: they are
 /// removed at once, as a re-sync always did.
 ///
-/// A key that the expiry job removed after [`clear_guild`] read the index is
-/// indexed again here, without a value: it gets a deadline too, so the job
-/// removes those entries later. Called before [`write_guild`] takes the
-/// members out of `guild`; the ones it lists are written again there.
+/// A key that the expiry job removed after [`clear_guild`] read the index
+/// only gets a deadline here, which the job drops when it is due. Called
+/// before [`write_guild`] takes the members out of `guild`; the ones it lists
+/// are written again there.
 fn keep_members(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &Guild, kept: &[String]) {
     if kept.is_empty() {
         return;
@@ -948,13 +962,10 @@ fn keep_members(batch: &mut Batch, ctx: &UpdateContext<'_>, guild: &Guild, kept:
     // Every member listed: the members it does not list have left.
     let listed_len = u64::try_from(guild.members.len()).unwrap_or(u64::MAX);
     let complete = guild.member_count.is_some_and(|count| listed_len >= count);
-    for key in kept {
-        if listed.contains(key) {
-            batch.reindex(key);
-        } else if complete {
+    for key in kept.iter().filter(|key| !listed.contains(*key)) {
+        if complete {
             batch.del(key);
         } else {
-            batch.reindex(key);
             batch.expire_if_unset(key, ttl, ctx.now_ms);
         }
     }

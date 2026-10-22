@@ -176,6 +176,7 @@ fn start(
         discord: DiscordLog::disabled(),
         bot_id: common::bot_id(),
         cache_timeout,
+        max_held_bytes: runner::MAX_HELD_BYTES,
     });
     let (shutdown, shutdown_rx) = watch::channel(false);
     let runner = tokio::spawn(runner::run(shard, handle.clone(), runner_ctx, shutdown_rx));
