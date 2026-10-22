@@ -312,10 +312,8 @@ async fn removing_a_guild_sends_no_srem_of_the_set_it_deletes() {
 
     let mut channels = recording.unindexed();
     channels.retain(|removed| removed.contains(" channel:"));
-    assert_eq!(
-        channels,
-        ["channel_keys channel:1004", "guild_keys:1000 channel:1004"]
-    );
+    let from_guild = "guild_keys:1000 channel:1004";
+    assert_eq!(channels, ["channel_keys channel:1004", from_guild]);
     assert!(!exists(&mut conn, "channel:1004").await);
     assert_eq!(members(&mut conn, "channel_keys").await, ["channel:1003"]);
     let mut children = members(&mut conn, "guild_keys:1000").await;
