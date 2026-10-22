@@ -5,7 +5,7 @@
 //! `Config::from_lookup` and `Config::obsolete_variables`: no services.
 
 use std::{collections::HashMap, error::Error as _, time::Duration};
-use twilight_dispatch::config::{self, Config, ConfigError, StateConfig};
+use twilight_dispatch::config::{self, Config, ConfigError, MemberConfig, StateConfig};
 use twilight_model::gateway::presence::{ActivityType, Status};
 
 /// The variables a deployment must set (intents 513: guilds and guild
@@ -60,6 +60,8 @@ const OPTIONAL: &[&str] = &[
     "SHARD_SILENCE_SECS",
     "DISCORD_API_PROXY",
     "DISCORD_GATEWAY_URL",
+    "REQUEST_MEMBERS",
+    "MEMBER_REFRESH_HOURS",
 ];
 
 /// The configuration with exactly `vars` set (a later value wins).
@@ -126,6 +128,11 @@ fn unset_variables_take_their_documented_defaults() {
     assert_eq!(config.shard_silence, Duration::from_secs(180));
     assert_eq!(config.discord_api_proxy, None);
     assert_eq!(config.discord_gateway_url, None);
+    let members = MemberConfig {
+        request: false,
+        refresh_hours: 24,
+    };
+    assert_eq!(config.members, members);
 }
 
 /// Blank values (empty or whitespace, as `NAME=` in a Compose file gives)
@@ -186,6 +193,17 @@ fn errors_name_the_variable_the_value_and_the_reason() {
     assert_eq!(
         without("REDIS_HOST").unwrap_err().to_string(),
         "missing environment variable REDIS_HOST"
+    );
+
+    // Members can only be requested with the GUILD_MEMBERS intent (2).
+    let err = with(&[("REQUEST_MEMBERS", "true")]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        concat!(
+            r#"invalid environment variable REQUEST_MEMBERS="true": "#,
+            "needs the GUILD_MEMBERS intent (2) in INTENTS (513): ",
+            "Discord sends a guild's whole member list only to a bot with it"
+        )
     );
 }
 

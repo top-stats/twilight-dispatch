@@ -36,7 +36,7 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinHandle};
 use twilight_dispatch::{
-    config::StateConfig,
+    config::{MemberConfig, StateConfig},
     discord_log::DiscordLog,
     gateway::{
         registry::{Registry, ShardHandle},
@@ -177,6 +177,7 @@ fn start(
         bot_id: common::bot_id(),
         cache_timeout,
         max_held_bytes: runner::MAX_HELD_BYTES,
+        members: MemberConfig::default(),
     });
     let (shutdown, shutdown_rx) = watch::channel(false);
     let runner = tokio::spawn(runner::run(shard, handle.clone(), runner_ctx, shutdown_rx));

@@ -15,15 +15,22 @@
 //!   shard closed resumably (so no heartbeat is owed), then the runner waits
 //!   for room for as long as that takes (this wait has no time bound) and
 //!   lets the shard reconnect; Discord replays what was not received.
+//!
+//! With `REQUEST_MEMBERS` the runner also requests the members of its
+//! guilds: it hands every dispatch to the shard's [`MemberRequester`], sends
+//! the request that is due with the shard's command API (only while the
+//! shard is connected, holds no events back and has a command permit to
+//! spare) and wakes up when the next one is (see [`super::members`]).
 
 use super::{
+    members::{self, MemberRequester},
     payload::{self, Envelope, Route},
     registry::{status_label, ShardHandle},
     worker::Job,
 };
 use crate::{
     cache::{self, UpdateContext},
-    config::StateConfig,
+    config::{MemberConfig, StateConfig},
     constants::{CONNECT_COLOR, DISCONNECT_COLOR, READY_COLOR, RESUME_COLOR},
     discord_log::DiscordLog,
     metrics::{GATEWAY_EVENTS, GATEWAY_PARSE_ERRORS, SHARD_EVENTS},
@@ -47,7 +54,7 @@ use tracing::{error, info, warn};
 use twilight_gateway::{
     error::{ReceiveMessageError, ReceiveMessageErrorType},
     queue::Queue,
-    CloseFrame, Message, Shard, ShardState,
+    CloseFrame, CommandRatelimiter, Message, Shard, ShardState,
 };
 use twilight_model::{
     gateway::{
@@ -99,6 +106,9 @@ pub struct RunnerContext<C> {
     /// full before it stops reading ([`MAX_HELD_BYTES`] in production; 0
     /// stops reading at the first held event).
     pub max_held_bytes: usize,
+    /// Whether the shards request the members of their guilds, and how
+    /// often they refresh them (`REQUEST_MEMBERS`, `MEMBER_REFRESH_HOURS`).
+    pub members: MemberConfig,
 }
 
 /// Whether the cache (or the guild join/leave log) needs the typed event.
@@ -312,6 +322,8 @@ struct Runner<C, Q> {
     parse_errors: Throttle,
     /// Throttles the warnings about messages twilight or [`prepare`] rejected.
     receive_errors: Throttle,
+    /// The shard's guild member requests; `None` without `REQUEST_MEMBERS`.
+    members: Option<MemberRequester>,
 }
 
 /// Run a shard until it is fatally closed or `shutdown` flips to true. On
@@ -327,6 +339,11 @@ pub async fn run<C, Q>(
 {
     let id = shard.id().number();
     let session = handle.snapshot().session_id.map(Arc::from);
+    let requests = if ctx.members.request {
+        Some(MemberRequester::new(id, ctx.members.refresh(), members::now_ms()))
+    } else {
+        None
+    };
     let mut runner = Runner {
         shard,
         handle,
@@ -345,7 +362,9 @@ pub async fn run<C, Q>(
         connection_open: false,
         parse_errors: Throttle::default(),
         receive_errors: Throttle::default(),
+        members: requests,
     };
+    runner.seed_members().await;
 
     loop {
         // After the backpressure close went out no heartbeat is owed, so it
@@ -376,6 +395,9 @@ pub async fn run<C, Q>(
             }
         }
 
+        // Send the member request that is due, and learn when one is next.
+        let wake = runner.drive_members();
+
         // Below the limit the shard keeps reading while held jobs wait for
         // room in the queue of the oldest one.
         let waiting = if runner.held_over_limit() {
@@ -396,7 +418,16 @@ pub async fn run<C, Q>(
                     return;
                 }
             }
+            () = wake_at(wake) => {}
         }
+    }
+}
+
+/// Resolves at `at`, and never without a time.
+async fn wake_at(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -662,6 +693,9 @@ where
                         );
                     }
                 }
+                if let Some(requests) = self.members.as_mut() {
+                    requests.observe(&kind, event.as_ref(), &json, members::now_ms());
+                }
 
                 match kind.as_str() {
                     "READY" => {
@@ -702,6 +736,61 @@ where
                 self.enqueue(worker, job);
             }
         }
+    }
+
+    /// Start the member requests from the guilds the cache has for this
+    /// shard: a restart that resumes the session gets no READY or
+    /// `GUILD_CREATE` to learn them from, so the periodic refresh would
+    /// otherwise miss them until the next new session.
+    async fn seed_members(&mut self) {
+        if self.members.is_none() || !self.ctx.state.enabled {
+            return;
+        }
+        let mut redis = self.ctx.redis.clone();
+        let total = self.shard.id().total();
+        let read = cache::shard_guilds(&mut redis, self.id, total);
+        let limit = self.ctx.cache_timeout.min(READY_TIMEOUT);
+        match tokio::time::timeout(limit, read).await {
+            Ok(Ok(guilds)) => {
+                if let Some(requests) = self.members.as_mut() {
+                    let guilds = guilds.into_iter().filter_map(Id::new_checked);
+                    requests.seed(guilds, members::now_ms());
+                }
+            }
+            Ok(Err(err)) => warn!(
+                "[Shard {}] Could not read the cached guilds for member requests: {}",
+                self.id, err
+            ),
+            Err(_) => warn!(
+                "[Shard {}] Reading the cached guilds for member requests timed out",
+                self.id
+            ),
+        }
+    }
+
+    /// Send the member request that is due, if any, and return when the
+    /// member requests next need a look ([`MemberRequester::next_wake`]). A
+    /// request goes out only while the shard is connected, holds no events
+    /// back (its chunks would only add to them) and has a permit of its
+    /// command ratelimiter to spare: twilight then sends it at once, so its
+    /// timeout measures Discord's answer rather than the wait for a permit.
+    /// Without a permit the requests look again once the next is released.
+    fn drive_members(&mut self) -> Option<tokio::time::Instant> {
+        let requests = self.members.as_mut()?;
+        let now = members::now_ms();
+        let limiter = self.shard.ratelimiter();
+        let permit = limiter.is_none_or(|limiter| limiter.available() > 0);
+        let active = self.shard.state() == ShardState::Active;
+        let ready = active && permit && self.held.is_empty();
+        if let Some(request) = requests.poll(now, ready) {
+            self.shard.command(&request.command());
+        }
+        let due = requests.next_wake().map(|at| at.saturating_sub(now));
+        let due = due.map(Duration::from_millis);
+        let release = limiter.filter(|_| !permit);
+        let release = release.map(CommandRatelimiter::next_available);
+        let wait = [due, release].into_iter().flatten().min()?;
+        tokio::time::Instant::now().checked_add(wait)
     }
 
     /// Count the reconnect Discord asked for when it asks. twilight answers
@@ -1288,6 +1377,7 @@ mod runner_tests {
                 bot_id: Id::new(1),
                 cache_timeout: Duration::from_secs(1),
                 max_held_bytes: 0,
+                members: MemberConfig::default(),
             }),
             id: 0,
             last_status: "Disconnected",
@@ -1303,6 +1393,7 @@ mod runner_tests {
             connection_open: false,
             parse_errors: Throttle::default(),
             receive_errors: Throttle::default(),
+            members: None,
         }
     }
 

@@ -92,17 +92,51 @@ Configuration is read from environment variables (or `.env`); see
   it does not list get a deadline 24 hours later in `expiry_zset`
   (`cache::MEMBER_RESYNC_GRACE_MS`), and a member that already has one keeps
   it, so another re-sync does not postpone it. Anything that writes a member
-  again drops its deadline: a GUILD_MEMBERS_CHUNK (the bot requests every
-  guild's members hourly), GUILD_MEMBER_ADD or GUILD_MEMBER_UPDATE. So members
-  still in the guild stay cached, and members who left while the bot was
-  disconnected (whose GUILD_MEMBER_REMOVE was missed) are removed when the
-  grace ends. A GUILD_CREATE that lists every member (as many as its
+  again drops its deadline: a GUILD_MEMBERS_CHUNK (with `REQUEST_MEMBERS` the
+  shards request such a guild's members soon after its GUILD_CREATE),
+  GUILD_MEMBER_ADD or GUILD_MEMBER_UPDATE. So members still in the guild stay
+  cached, and members who left while the bot was disconnected (whose
+  GUILD_MEMBER_REMOVE was missed) are removed when the grace ends. A
+  GUILD_CREATE that lists every member (as many as its
   `member_count`, as for guilds below `LARGE_THRESHOLD`) removes the members it
   does not list at once. With a member TTL the kept members keep the deadline
   they had, and one without a deadline (cached while the TTL was 0) gets the
   TTL.
   Leaving a guild (GUILD_DELETE without `unavailable`) and READY no longer
   listing it still remove all of its members at once.
+- With `REQUEST_MEMBERS=true` (it needs the `GUILD_MEMBERS` intent) every shard
+  requests the whole member list of its guilds itself (gateway opcode 8, with
+  `query` "", `limit` 0, no presences and a nonce `<shard>.<number>`), one
+  guild at a time: the next request goes out only once the last chunk of the
+  one in flight arrived, Discord answered it with RATE_LIMITED, or no chunk
+  came for 30 s. A guild is requested when its GUILD_CREATE lists fewer
+  members than its `member_count` (a join, or a large guild after a new
+  session; READY alone requests nothing), and every guild of the shard again
+  once per `MEMBER_REFRESH_HOURS` (24 by default, 0 turns it off), each at its
+  own offset in that period (from the guild id, in Unix time), so the
+  refreshes are spread evenly and keep their times across restarts. Discord
+  allows one request for a guild's whole member list per 30 s: a guild is not
+  requested again within 30 s of its last completed request, and one that is
+  rate limited anyway is requested again after `retry_after` plus 1 s. A
+  request without a chunk for 30 s is retried once at the back of the queue,
+  then given up until the guild's next refresh. A guild that cannot answer
+  (listed by READY and still without its GUILD_CREATE, or in an outage) is
+  not requested: its refresh is skipped and a request waiting for it is
+  dropped, and the GUILD_CREATE that brings it back requests it if it leaves
+  members out. Requests go out only while the shard is connected, holds no
+  events back (a full worker queue) and has one of its 120 commands per 60 s
+  to spare, so that twilight sends a request at once and its 30 s count from
+  then. The queue survives reconnects (a request whose chunks stop with the
+  connection times out and is retried) and is dropped on shutdown. A shard
+  starts from the guilds the cache has for it (with `STATE_ENABLED`; a
+  restart that resumes the saved session brings no READY or GUILD_CREATE)
+  and follows READY, GUILD_CREATE and GUILD_DELETE. The chunks are cached
+  and published, and RATE_LIMITED is published, as before, including those
+  answering another client's requests (another nonce), which the shard does
+  not count as its own. `gateway_member_requests{result}` counts requests
+  `sent`, `done`, `rate_limited`, `timeout` and `dropped`. Turn off any other
+  client's requests for the bot when turning this on, or Discord rate limits
+  the two against each other.
 - With several processes (different `SHARDS_START`/`SHARDS_END`), every
   process consumes `gateway.send`, runs commands for its own shards and
   forwards the others to the `gateway.send.shards` direct exchange (routing key:

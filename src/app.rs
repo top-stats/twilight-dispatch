@@ -218,6 +218,7 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         bot_id: user.id,
         cache_timeout: config.cache_timeout,
         max_held_bytes: runner::MAX_HELD_BYTES,
+        members: config.members,
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut runners = JoinSet::new();

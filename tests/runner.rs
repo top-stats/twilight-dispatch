@@ -59,7 +59,7 @@ use tokio::{
     task::JoinHandle,
 };
 use twilight_dispatch::{
-    config::StateConfig,
+    config::{MemberConfig, StateConfig},
     constants::{CONNECT_COLOR, DISCONNECT_COLOR, READY_COLOR, RESUME_COLOR},
     discord_log::DiscordLog,
     gateway::{
@@ -314,6 +314,7 @@ where
         bot_id: common::bot_id(),
         cache_timeout: Duration::from_secs(5),
         max_held_bytes: opts.max_held_bytes,
+        members: MemberConfig::default(),
     });
     let (shutdown, shutdown_rx) = watch::channel(false);
     let runner = tokio::spawn(runner::run(shard, handle.clone(), runner_ctx, shutdown_rx));

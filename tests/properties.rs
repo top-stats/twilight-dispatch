@@ -2055,6 +2055,8 @@ const VARIABLES: &[&str] = &[
     "SHARD_SILENCE_SECS",
     "DISCORD_API_PROXY",
     "DISCORD_GATEWAY_URL",
+    "REQUEST_MEMBERS",
+    "MEMBER_REFRESH_HOURS",
 ];
 
 /// Variables whose absence is reported as `Missing`.

@@ -39,6 +39,10 @@ Config {
         voice: true,
         old: false,
     },
+    members: MemberConfig {
+        request: false,
+        refresh_hours: 24,
+    },
     amqp_url: "amqp://guest:guest@127.0.0.1:5672/%2F?heartbeat=30",
     redis_url: "redis://127.0.0.1:6379/0",
     prometheus_host: "0.0.0.0",

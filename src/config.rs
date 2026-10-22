@@ -68,6 +68,9 @@ pub struct Config {
     pub log_guild_channel: u64,
     /// What the Redis state cache stores (the `STATE_*` variables).
     pub state: StateConfig,
+    /// Whether and how often the shards request the members of their guilds
+    /// (`REQUEST_MEMBERS`, `MEMBER_REFRESH_HOURS`).
+    pub members: MemberConfig,
     /// Broker URL: `AMQP_URL`, or one built from `RABBIT_HOST` (required
     /// then), `RABBIT_PORT` (5672), `RABBIT_USERNAME` and `RABBIT_PASSWORD`
     /// (`guest`) and `RABBIT_VHOST` (`/`), with `heartbeat=30`.
@@ -232,6 +235,27 @@ pub struct StateConfig {
     pub old: bool,
 }
 
+/// Guild member requests (`REQUEST_MEMBERS`, `MEMBER_REFRESH_HOURS`): each
+/// shard asks Discord for the whole member list of its guilds (gateway opcode
+/// 8), one guild at a time (see `gateway::members`). In one from
+/// [`Config::from_lookup`] `INTENTS` has `GUILD_MEMBERS` when `request` is on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemberConfig {
+    /// Whether the shards request members (`REQUEST_MEMBERS`, default
+    /// `false`).
+    pub request: bool,
+    /// Every guild of a shard is requested again once per this many hours
+    /// (`MEMBER_REFRESH_HOURS`, default 24); 0 means never.
+    pub refresh_hours: u64,
+}
+
+impl MemberConfig {
+    /// The refresh period, `refresh_hours` as a duration (zero: never).
+    pub fn refresh(self) -> Duration {
+        Duration::from_secs(self.refresh_hours.saturating_mul(3600))
+    }
+}
+
 /// The shards one process runs: `start..=end` of `total`. A range from
 /// [`Config::from_lookup`] is never empty: `start <= end < total`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,8 +301,8 @@ pub enum ConfigError {
     Invalid {
         /// The variable.
         name: &'static str,
-        /// The value as set, except that the checks of a parsed number report
-        /// that number (for `SHARDS_END`, the effective last shard) and that
+        /// The value as set, except that the checks of a parsed number or flag
+        /// report it (for `SHARDS_END`, the effective last shard) and that
         /// the credentials of a rejected `DISCORD_API_PROXY` or
         /// `DISCORD_GATEWAY_URL` are replaced by `***`.
         value: String,
@@ -333,6 +357,7 @@ impl Config {
         let intents = env.intents()?;
         let large_threshold = env.large_threshold()?;
         let state = env.state()?;
+        let members = env.members(intents)?;
         let amqp_url = env.amqp_url()?;
         let redis_url = env.redis_url()?;
 
@@ -383,6 +408,7 @@ impl Config {
             log_channel: env.optional("LOG_CHANNEL")?.unwrap_or(0),
             log_guild_channel: env.optional("LOG_GUILD_CHANNEL")?.unwrap_or(0),
             state,
+            members,
             amqp_url,
             redis_url,
             prometheus_host,
@@ -534,6 +560,30 @@ impl Env<'_> {
             emoji: enabled && self.optional("STATE_EMOJI")?.unwrap_or(false),
             voice: enabled && self.optional("STATE_VOICE")?.unwrap_or(false),
             old: enabled && self.optional("STATE_OLD")?.unwrap_or(false),
+        })
+    }
+
+    /// `REQUEST_MEMBERS` (default off) and `MEMBER_REFRESH_HOURS` (default
+    /// 24). Discord sends a guild's whole member list only to a bot with the
+    /// `GUILD_MEMBERS` intent, so requesting members needs it in `intents`.
+    fn members(&self, intents: Intents) -> Result<MemberConfig, ConfigError> {
+        let request: bool = self.optional("REQUEST_MEMBERS")?.unwrap_or(false);
+        let refresh_hours: u64 = self.optional("MEMBER_REFRESH_HOURS")?.unwrap_or(24);
+        if request && !intents.contains(Intents::GUILD_MEMBERS) {
+            return Err(ConfigError::Invalid {
+                name: "REQUEST_MEMBERS",
+                value: request.to_string(),
+                reason: format!(
+                    "needs the GUILD_MEMBERS intent ({}) in INTENTS ({}): Discord sends a \
+                     guild's whole member list only to a bot with it",
+                    Intents::GUILD_MEMBERS.bits(),
+                    intents.bits()
+                ),
+            });
+        }
+        Ok(MemberConfig {
+            request,
+            refresh_hours,
         })
     }
 
@@ -1265,6 +1315,51 @@ pub(crate) mod tests {
                 old: false,
             }
         );
+    }
+
+    /// Member requests are off by default and refresh every guild daily once
+    /// on; asking for a guild's whole member list needs the GUILD_MEMBERS
+    /// intent, so without it they are a configuration error.
+    #[test]
+    fn member_requests_need_the_guild_members_intent() {
+        let defaults = MemberConfig {
+            request: false,
+            refresh_hours: 24,
+        };
+        assert_eq!(load(&example_env()).unwrap().members, defaults);
+        assert_eq!(defaults.refresh(), Duration::from_secs(24 * 3600));
+
+        let on = with(&[("REQUEST_MEMBERS", "true")]).unwrap().members;
+        assert!(on.request);
+        assert_eq!(on.refresh_hours, 24);
+        let mut env = example_env();
+        env.insert("REQUEST_MEMBERS", "true".into());
+        env.insert("MEMBER_REFRESH_HOURS", "0".into());
+        let never = load(&env).unwrap().members;
+        assert!(never.request);
+        assert_eq!(never.refresh(), Duration::ZERO);
+
+        // 513 is GUILDS and GUILD_MESSAGES; 2 is GUILD_MEMBERS alone.
+        let without = with(&[("REQUEST_MEMBERS", "true"), ("INTENTS", "513")]);
+        match &without {
+            Err(ConfigError::Invalid { name, reason, .. }) => {
+                assert_eq!(*name, "REQUEST_MEMBERS");
+                assert!(reason.contains("GUILD_MEMBERS"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let off = with(&[("REQUEST_MEMBERS", "false"), ("INTENTS", "513")]);
+        assert!(!off.unwrap().members.request);
+        let only = with(&[("REQUEST_MEMBERS", "true"), ("INTENTS", "2")]);
+        assert!(only.unwrap().members.request);
+
+        assert_invalid("REQUEST_MEMBERS", &[("REQUEST_MEMBERS", "maybe")]);
+        assert_invalid("MEMBER_REFRESH_HOURS", &[("MEMBER_REFRESH_HOURS", "-1")]);
+        let forever = MemberConfig {
+            request: true,
+            refresh_hours: u64::MAX,
+        };
+        assert_eq!(forever.refresh(), Duration::from_secs(u64::MAX));
     }
 
     #[test]

@@ -56,6 +56,14 @@ expression: families
     "type": "GAUGE"
   },
   {
+    "help": "Guild member requests (opcode 8) by outcome (sent, done, rate limited, timeout, dropped)",
+    "labels": [
+      "result"
+    ],
+    "name": "gateway_member_requests",
+    "type": "COUNTER"
+  },
+  {
     "help": "Dispatch payloads that could not be parsed for the cache",
     "labels": [
       "type"

@@ -78,7 +78,7 @@ impl Route {
 }
 
 /// splitmix64 finalizer: spreads every input bit over the output.
-const fn mix(mut x: u64) -> u64 {
+pub(crate) const fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;

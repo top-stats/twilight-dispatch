@@ -3,8 +3,8 @@
 //! Metric names of earlier versions are unchanged. New: `gateway_commands`,
 //! `gateway_parse_errors`, `state_update_errors`, `amqp_publish_failures`,
 //! `amqp_reconnects`, `amqp_connected`, `gateway_shard_fatal`,
-//! `gateway_shard_silence_seconds`, `state_threads`. Every metric's name,
-//! type, help and labels are pinned by
+//! `gateway_shard_silence_seconds`, `state_threads`, `gateway_member_requests`.
+//! Every metric's name, type, help and labels are pinned by
 //! `tests/snapshots/contract__prometheus_metric_names.snap`.
 
 use crate::{
@@ -346,6 +346,12 @@ gauge_vec!(
     "Seconds since a shard last received anything",
     &["shard"]
 );
+counter_vec!(
+    MEMBER_REQUESTS,
+    "gateway_member_requests",
+    "Guild member requests (opcode 8) by outcome (sent, done, rate limited, timeout, dropped)",
+    &["result"]
+);
 
 /// Every metric above. One left out is only registered on its first use; a
 /// unit test checks that none is.
@@ -373,6 +379,7 @@ static ALL: &[&dyn Register] = &[
     &AMQP_CONNECTED,
     &SHARD_FATAL,
     &SHARD_SILENCE,
+    &MEMBER_REQUESTS,
 ];
 
 /// Each state gauge and the cache type it counts (the size of the

@@ -148,6 +148,24 @@ pub async fn members<C: ConnectionLike + Send>(conn: &mut C, set: &str) -> ApiRe
     Ok(redis::cmd("SMEMBERS").arg(set).query_async(conn).await?)
 }
 
+/// The ids of the cached guilds of shard `shard` of `shard_total`.
+///
+/// # Errors
+///
+/// Fails when the Redis command fails.
+pub async fn shard_guilds<C: ConnectionLike + Send>(
+    conn: &mut C,
+    shard: u32,
+    shard_total: u32,
+) -> ApiResult<Vec<u64>> {
+    let cached = members(conn, &keys::type_index(GUILD_KEY)).await?;
+    Ok(cached
+        .into_iter()
+        .filter_map(|key| keys::guild_id_of(&key))
+        .filter(|id| keys::shard_for_guild(*id, shard_total) == shard)
+        .collect())
+}
+
 /// Whether a logical key is cached.
 ///
 /// # Errors
