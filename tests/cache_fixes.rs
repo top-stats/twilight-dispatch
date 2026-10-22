@@ -296,8 +296,10 @@ async fn removing_a_guild_sends_no_srem_of_the_set_it_deletes() {
         assert!(!exists(&mut conn, MESSAGE).await, "{kind}");
     }
 
-    // A GUILD_CREATE that no longer lists a cached channel removes it the
-    // same way, and indexes the channels it lists again.
+    // A GUILD_CREATE that no longer lists a cached channel removes it from
+    // `channel_keys` and, since a re-sync with STATE_MEMBER keeps
+    // `guild_keys:<guild>`, from the guild's index; the channels it lists are
+    // indexed again.
     flush(&mut conn).await;
     seed(&mut conn, "GUILD_CREATE", guild(GUILD, "g")).await;
     let mut resync = guild(GUILD, "g");
@@ -310,7 +312,10 @@ async fn removing_a_guild_sends_no_srem_of_the_set_it_deletes() {
 
     let mut channels = recording.unindexed();
     channels.retain(|removed| removed.contains(" channel:"));
-    assert_eq!(channels, ["channel_keys channel:1004"]);
+    assert_eq!(
+        channels,
+        ["channel_keys channel:1004", "guild_keys:1000 channel:1004"]
+    );
     assert!(!exists(&mut conn, "channel:1004").await);
     assert_eq!(members(&mut conn, "channel_keys").await, ["channel:1003"]);
     let mut children = members(&mut conn, "guild_keys:1000").await;
