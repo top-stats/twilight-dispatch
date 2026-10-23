@@ -2,24 +2,30 @@
 
 //! Guild member requests (`REQUEST_MEMBERS`) of a running shard, through
 //! `gateway::runner::run` against the fake Discord gateway of
-//! `tests/support/fake_discord.rs`. No services are needed: the publisher
-//! records what the workers publish, and with the cache off nothing uses
-//! Redis.
+//! `tests/support/fake_discord.rs`. The publisher records what the workers
+//! publish, and with the cache off nothing uses Redis; only
+//! `a_resumed_shard_requests_every_cached_guild` needs it (`TEST_REDIS_URL`,
+//! database 1), for the cache the shard starts from, and is skipped without
+//! it.
 //!
 //! Pinned here:
-//! - READY and a GUILD_CREATE that lists every member request nothing;
-//! - a GUILD_CREATE that leaves members out makes the shard send one op 8
-//!   (every member, no presences, a nonce of at most 32 bytes);
+//! - READY requests nothing;
+//! - every GUILD_CREATE makes the shard send one op 8 (every member, no
+//!   presences, a nonce of at most 32 bytes), whether it lists every member
+//!   or leaves some out, and so does a later join;
 //! - one request at a time: the next guild once the last chunk with the
 //!   nonce of the one in flight arrived, not another client's;
 //! - a RATE_LIMITED for the request in flight is retried with a new nonce
 //!   after `retry_after` and the margin;
+//! - a shard that resumes its saved session (no READY or GUILD_CREATE)
+//!   requests every guild the cache has for it, and none of another shard;
 //! - chunks and RATE_LIMITED are published as before, and
 //!   `gateway_member_requests` counts the requests;
 //! - without `REQUEST_MEMBERS` nothing is requested.
 //!
-//! Only `a_guild_that_leaves_members_out_is_requested` makes requests, so
-//! the deltas of the process-wide counter it reads are its own.
+//! The tests that make requests hold `SERIAL`, so the deltas of the
+//! process-wide counter that `every_guild_create_requests_its_guild` reads
+//! are its own.
 
 mod common;
 #[path = "support/fake_discord.rs"]
@@ -46,10 +52,13 @@ use twilight_dispatch::{
     models::ApiResult,
     util::Throttle,
 };
-use twilight_gateway::{queue::InMemoryQueue, ConfigBuilder, Intents, Shard, ShardId};
+use twilight_gateway::{queue::InMemoryQueue, ConfigBuilder, Intents, Session, Shard, ShardId};
 
 /// Shards of this many; every test runs its own shard id.
 const TOTAL: u32 = 4;
+/// The saved session a restarted shard resumes, and its sequence.
+const SAVED: &str = "saved";
+const SAVED_SEQ: u64 = 5;
 /// A day: no heartbeat is due during a test, so the gateway only sees the
 /// frames a test expects.
 const QUIET: u64 = 86_400_000;
@@ -59,6 +68,9 @@ const POLL: Duration = Duration::from_millis(5);
 /// How long a test waits to see that the shard sends nothing.
 const SILENCE: Duration = Duration::from_millis(300);
 const CHUNK: &str = "GUILD_MEMBERS_CHUNK";
+
+/// Held by the tests that make requests (see the module docs).
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A Redis that never answers; with the cache off nothing asks it.
 #[derive(Clone)]
@@ -152,26 +164,53 @@ impl Running {
     }
 }
 
-/// Run shard `id` against the gateway at `url` the way `app::start` does,
-/// with the cache off and these member requests.
-fn start(url: &str, id: u32, members: MemberConfig) -> Running {
+/// Shard `id` of `TOTAL` connecting to the gateway at `url`. With a
+/// `resume_url` it resumes the saved session (`SAVED` at `SAVED_SEQ`) there,
+/// as after a restart.
+fn new_shard(url: &str, id: u32, resume_url: Option<String>) -> Shard<InMemoryQueue> {
     // main() installs it; twilight's TLS connector panics without one.
     let _ = rustls::crypto::ring::default_provider().install_default();
     // A max_concurrency of 0 grants every IDENTIFY at once.
     let queue = InMemoryQueue::new(0, 1000, Duration::from_secs(86_400), 1000);
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS;
-    let config = ConfigBuilder::new("member-token".to_owned(), intents)
+    let mut config = ConfigBuilder::new("member-token".to_owned(), intents)
         .proxy_url(url.to_owned())
-        .queue(queue)
-        .build();
-    let shard = Shard::with_config(ShardId::new(id, TOTAL), config);
-    let handle = Arc::new(ShardHandle::new(id, Some(shard.sender()), None));
+        .queue(queue);
+    if let Some(resume_url) = resume_url {
+        config = config
+            .session(Session::new(SAVED_SEQ, SAVED.to_owned()))
+            .resume_url(resume_url);
+    }
+    Shard::with_config(ShardId::new(id, TOTAL), config.build())
+}
+
+/// Run shard `id` against the gateway at `url` the way `app::start` does,
+/// with the cache off and these member requests.
+fn start(url: &str, id: u32, members: MemberConfig) -> Running {
+    let shard = new_shard(url, id, None);
+    run_shard(shard, NoRedis, StateConfig::default(), members)
+}
+
+/// Run `shard` the way `app::start` does, with the cache `state` in `redis`
+/// and these member requests.
+fn run_shard<C>(
+    shard: Shard<InMemoryQueue>,
+    redis: C,
+    state: StateConfig,
+    members: MemberConfig,
+) -> Running
+where
+    C: ConnectionLike + Clone + Send + Sync + 'static,
+{
+    let id = shard.id().number();
+    let resumed = shard.session().map(Session::sequence);
+    let handle = Arc::new(ShardHandle::new(id, Some(shard.sender()), resumed));
     let published = Arc::new(Published::default());
     let worker_ctx = Arc::new(WorkerContext {
-        redis: NoRedis,
+        redis: redis.clone(),
         publisher: published.clone(),
         registry: Arc::new(Registry::new([handle.clone()])),
-        state: StateConfig::default(),
+        state: state.clone(),
         bot_id: common::bot_id(),
         cache_timeout: Duration::from_secs(5),
         discord: DiscordLog::disabled(),
@@ -181,9 +220,9 @@ fn start(url: &str, id: u32, members: MemberConfig) -> Running {
     });
     let (workers, _) = worker::spawn(1, worker_ctx);
     let runner_ctx = Arc::new(RunnerContext {
-        state: StateConfig::default(),
+        state,
         workers,
-        redis: NoRedis,
+        redis,
         discord: DiscordLog::disabled(),
         bot_id: common::bot_id(),
         cache_timeout: Duration::from_secs(5),
@@ -225,16 +264,24 @@ fn chunk(guild: u64, index: u32, count: u32, nonce: &str) -> Value {
     })
 }
 
-/// The next frame, which must request every member of `guild` without
-/// presences (op 8); its nonce.
-async fn expect_request(conn: &mut GatewayConnection, guild: u64) -> String {
+/// The next frame, which must request every member of a guild without
+/// presences (op 8): the guild and the nonce.
+async fn next_request(conn: &mut GatewayConnection) -> (u64, String) {
     let d = conn.expect_op(8).await["d"].clone();
-    assert_eq!(d["guild_id"], guild.to_string(), "{d}");
     assert_eq!(d["query"], "", "{d}");
     assert_eq!(d["limit"], 0, "{d}");
     assert_eq!(d["presences"], json!(false), "{d}");
+    let guild = d["guild_id"].as_str().and_then(|id| id.parse().ok());
     let nonce = d["nonce"].as_str().expect("a nonce").to_owned();
     assert!(nonce.len() <= 32, "{nonce}");
+    (guild.expect("a guild id"), nonce)
+}
+
+/// The next frame, which must request every member of `guild` without
+/// presences (op 8); its nonce.
+async fn expect_request(conn: &mut GatewayConnection, guild: u64) -> String {
+    let (requested, nonce) = next_request(conn).await;
+    assert_eq!(requested, guild, "requested another guild");
     nonce
 }
 
@@ -243,11 +290,13 @@ fn requests(result: &str) -> u64 {
     MEMBER_REQUESTS.with_label_values(&[result]).get()
 }
 
-/// A GUILD_CREATE that leaves members out makes the shard request them with
-/// one op 8, one guild at a time; the last chunk with its nonce completes
-/// the request, and a RATE_LIMITED for it is retried after `retry_after`.
+/// Every GUILD_CREATE makes the shard request its guild with one op 8,
+/// whether it lists every member or leaves some out, one guild at a time;
+/// the last chunk with its nonce completes the request, a RATE_LIMITED for
+/// it is retried after `retry_after`, and a later join is requested too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_guild_that_leaves_members_out_is_requested() {
+async fn every_guild_create_requests_its_guild() {
+    let _serial = SERIAL.lock().await;
     let fake = FakeDiscord::start().await;
     let shard = 1;
     let base = ["sent", "done", "rate_limited"].map(requests);
@@ -256,58 +305,111 @@ async fn a_guild_that_leaves_members_out_is_requested() {
         refresh_hours: 0,
     };
     let running = start(&fake.gateway.url(), shard, members);
-    let mut conn = identified(&fake, shard, &[1000, 2000, 3000]).await;
+    let mut conn = identified(&fake, shard, &[1000, 2000]).await;
 
-    // READY, and a GUILD_CREATE that lists every member, request nothing.
+    // READY requests nothing; a GUILD_CREATE that lists every member (as
+    // many as its member_count) is requested.
+    assert_eq!(conn.try_next_frame(SILENCE).await, None);
     let complete = common::guild(1000, "complete");
     conn.dispatch("GUILD_CREATE", 2, &complete).await;
-    assert_eq!(conn.try_next_frame(SILENCE).await, None);
-
+    let first = expect_request(&mut conn, 1000).await;
+    // One that leaves members out waits for the request in flight.
     let partial = partial_guild(2000, 500);
     conn.dispatch("GUILD_CREATE", 3, &partial).await;
-    let first = expect_request(&mut conn, 2000).await;
-    // Another one waits for the request in flight.
-    let next = partial_guild(3000, 300);
-    conn.dispatch("GUILD_CREATE", 4, &next).await;
     assert_eq!(conn.try_next_frame(SILENCE).await, None);
 
     // The last chunk of another client's request (another nonce) does not
     // complete it; its own last chunk does.
-    let own = chunk(2000, 0, 2, &first);
-    conn.dispatch(CHUNK, 5, &own).await;
-    let other = chunk(2000, 1, 2, "bot.1");
-    conn.dispatch(CHUNK, 6, &other).await;
+    let own = chunk(1000, 0, 2, &first);
+    conn.dispatch(CHUNK, 4, &own).await;
+    let other = chunk(1000, 1, 2, "bot.1");
+    conn.dispatch(CHUNK, 5, &other).await;
     assert_eq!(conn.try_next_frame(SILENCE).await, None);
-    let last = chunk(2000, 1, 2, &first);
-    conn.dispatch(CHUNK, 7, &last).await;
-    let limited = expect_request(&mut conn, 3000).await;
+    let last = chunk(1000, 1, 2, &first);
+    conn.dispatch(CHUNK, 6, &last).await;
+    let limited = expect_request(&mut conn, 2000).await;
     assert_ne!(limited, first);
 
     // Rate limited: requested again after retry_after and the margin.
     let retry_after = Duration::from_millis(300);
     let rate_limited = json!({
         "opcode": 8, "retry_after": retry_after.as_secs_f64(),
-        "meta": {"guild_id": "3000", "nonce": limited},
+        "meta": {"guild_id": "2000", "nonce": limited},
     });
     let at = Instant::now();
-    conn.dispatch("RATE_LIMITED", 8, &rate_limited).await;
-    let retry = expect_request(&mut conn, 3000).await;
+    conn.dispatch("RATE_LIMITED", 7, &rate_limited).await;
+    let retry = expect_request(&mut conn, 2000).await;
     let waited = at.elapsed();
     let least = retry_after + RATE_LIMIT_MARGIN - Duration::from_millis(100);
     assert!(waited >= least, "retried after {waited:?}");
     assert_ne!(retry, limited);
-    let only = chunk(3000, 0, 1, &retry);
-    conn.dispatch(CHUNK, 9, &only).await;
+    let only = chunk(2000, 0, 1, &retry);
+    conn.dispatch(CHUNK, 8, &only).await;
+    assert_eq!(conn.try_next_frame(SILENCE).await, None, "nothing left");
+
+    // A join, which READY did not list, is requested too.
+    let joined = common::guild(3000, "joined");
+    conn.dispatch("GUILD_CREATE", 9, &joined).await;
+    let join = expect_request(&mut conn, 3000).await;
+    let answer = chunk(3000, 0, 1, &join);
+    conn.dispatch(CHUNK, 10, &answer).await;
     assert_eq!(conn.try_next_frame(SILENCE).await, None, "nothing left");
 
     // Chunks and RATE_LIMITED are published as before, the other client's
     // chunk too.
-    let chunks = running.published.wait(CHUNK, 4).await;
+    let chunks = running.published.wait(CHUNK, 5).await;
     assert_eq!(chunks[1]["nonce"], "bot.1");
     let published = running.published.wait("RATE_LIMITED", 1).await;
     assert_eq!(published, [rate_limited]);
     let counted = ["sent", "done", "rate_limited"].map(requests);
-    assert_eq!(counted, [base[0] + 3, base[1] + 2, base[2] + 1]);
+    assert_eq!(counted, [base[0] + 4, base[1] + 3, base[2] + 1]);
+    running.stop().await;
+}
+
+/// A restart that resumes the saved session brings no READY or
+/// GUILD_CREATE: once resumed, the shard requests every guild the cache has
+/// for it, one at a time, and none of another shard's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_shard_requests_every_cached_guild() {
+    let Some(mut redis) = common::redis(1).await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let state = StateConfig {
+        enabled: true,
+        ..StateConfig::default()
+    };
+    // Guilds 1000 and 2000 are shard 0's of 4; 5 << 22 is shard 1's.
+    let elsewhere = 5 << 22;
+    for guild in [1000, 2000, elsewhere] {
+        let d = common::guild(guild, "cached");
+        common::apply(&mut redis, &state, "GUILD_CREATE", d).await;
+    }
+    let fake = FakeDiscord::start().await;
+    let shard = 0;
+    let members = MemberConfig {
+        request: true,
+        refresh_hours: 0,
+    };
+    let resume = Some(fake.gateway.resume_url());
+    let restarted = new_shard(&fake.gateway.url(), shard, resume);
+    let running = run_shard(restarted, redis, state, members);
+
+    let mut conn = fake.gateway.accept().await;
+    assert!(conn.is_resume(), "connected to {} instead", conn.path);
+    conn.hello(QUIET).await;
+    assert_eq!(conn.expect_resume().await["session_id"], SAVED);
+    conn.resumed(SAVED_SEQ + 1).await;
+    let mut requested = Vec::new();
+    for seq in [SAVED_SEQ + 2, SAVED_SEQ + 3] {
+        let (guild, nonce) = next_request(&mut conn).await;
+        requested.push(guild);
+        let answer = chunk(guild, 0, 1, &nonce);
+        conn.dispatch(CHUNK, seq, &answer).await;
+    }
+    requested.sort_unstable();
+    assert_eq!(requested, [1000, 2000]);
+    assert_eq!(conn.try_next_frame(SILENCE).await, None, "nothing left");
     running.stop().await;
 }
 

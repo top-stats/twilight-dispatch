@@ -40,7 +40,7 @@ Config {
         old: false,
     },
     members: MemberConfig {
-        request: false,
+        request: true,
         refresh_hours: 24,
     },
     amqp_url: "amqp://guest:guest@127.0.0.1:5672/%2F?heartbeat=30",

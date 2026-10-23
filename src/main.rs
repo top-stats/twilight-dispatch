@@ -99,6 +99,9 @@ fn serve() -> ExitCode {
     for name in Config::obsolete_variables(&|name| std::env::var(name).ok()) {
         warn!("{} is no longer used and can be removed", name);
     }
+    if let Some(warning) = Config::member_request_warning(&|name| std::env::var(name).ok()) {
+        warn!("{}", warning);
+    }
 
     let result = runtime.block_on(app::run(config));
     // Don't wait for abandoned blocking work (DNS lookups) when exiting.

@@ -47,7 +47,8 @@ pub struct Config {
     /// Gateway intents sent in the identify (`INTENTS`, required, as bits).
     pub intents: Intents,
     /// Member count from which Discord sends a guild without its offline
-    /// members (`LARGE_THRESHOLD`, 50 to 250, default 250).
+    /// members (`LARGE_THRESHOLD`, 50 to 250, default 250). Only what a
+    /// `GUILD_CREATE` lists: member requests ask for every guild's members.
     pub large_threshold: u64,
     /// Presence status (`STATUS`, default `online`).
     pub status: Status,
@@ -236,13 +237,16 @@ pub struct StateConfig {
 }
 
 /// Guild member requests (`REQUEST_MEMBERS`, `MEMBER_REFRESH_HOURS`): each
-/// shard asks Discord for the whole member list of its guilds (gateway opcode
-/// 8), one guild at a time (see `gateway::members`). In one from
-/// [`Config::from_lookup`] `INTENTS` has `GUILD_MEMBERS` when `request` is on.
+/// shard asks Discord for the whole member list of every one of its guilds
+/// (gateway opcode 8), one guild at a time: all of them at every start, a
+/// guild again at each `GUILD_CREATE`, and every guild once per refresh
+/// period (see `gateway::members`). In one from [`Config::from_lookup`]
+/// `INTENTS` has `GUILD_MEMBERS` when `request` is on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MemberConfig {
-    /// Whether the shards request members (`REQUEST_MEMBERS`, default
-    /// `false`).
+    /// Whether the shards request members (`REQUEST_MEMBERS`; unset, on when
+    /// `INTENTS` has `GUILD_MEMBERS` and off otherwise, which
+    /// [`Config::member_request_warning`] reports).
     pub request: bool,
     /// Every guild of a shard is requested again once per this many hours
     /// (`MEMBER_REFRESH_HOURS`, default 24); 0 means never.
@@ -454,6 +458,30 @@ impl Config {
             .filter(|name| lookup(name).is_some_and(|v| !v.trim().is_empty()))
             .collect()
     }
+
+    /// Why the shards do not request members, when `lookup` leaves
+    /// `REQUEST_MEMBERS` unset (which means on with the `GUILD_MEMBERS`
+    /// intent) and `INTENTS` lacks that intent, for the log at startup.
+    /// `None` when `REQUEST_MEMBERS` is set, `INTENTS` has the intent, or
+    /// `INTENTS` cannot be read (an error [`Config::from_lookup`] reports).
+    pub fn member_request_warning(lookup: Lookup<'_>) -> Option<String> {
+        let env = Env(lookup);
+        if env.string("REQUEST_MEMBERS").is_some() {
+            return None;
+        }
+        let intents = env.intents().ok()?;
+        if intents.contains(Intents::GUILD_MEMBERS) {
+            return None;
+        }
+        Some(format!(
+            "REQUEST_MEMBERS is unset and INTENTS ({}) lacks the GUILD_MEMBERS intent ({}), so \
+             the shards do not request guild members: Discord sends a guild's whole member \
+             list only to a bot with it. Add the intent to INTENTS to request them, or set \
+             REQUEST_MEMBERS=false to keep them off without this warning",
+            intents.bits(),
+            Intents::GUILD_MEMBERS.bits()
+        ))
+    }
 }
 
 /// Reported at startup when set, so deployments learn they can drop them.
@@ -563,16 +591,19 @@ impl Env<'_> {
         })
     }
 
-    /// `REQUEST_MEMBERS` (default off) and `MEMBER_REFRESH_HOURS` (default
-    /// 24). Discord sends a guild's whole member list only to a bot with the
-    /// `GUILD_MEMBERS` intent, so requesting members needs it in `intents`.
+    /// `REQUEST_MEMBERS` (default: on when `intents` has `GUILD_MEMBERS`,
+    /// off without it) and `MEMBER_REFRESH_HOURS` (default 24). Discord
+    /// sends a guild's whole member list only to a bot with the
+    /// `GUILD_MEMBERS` intent, so `REQUEST_MEMBERS=true` needs it in
+    /// `intents`.
     fn members(&self, intents: Intents) -> Result<MemberConfig, ConfigError> {
-        let request: bool = self.optional("REQUEST_MEMBERS")?.unwrap_or(false);
+        let request: Option<bool> = self.optional("REQUEST_MEMBERS")?;
         let refresh_hours: u64 = self.optional("MEMBER_REFRESH_HOURS")?.unwrap_or(24);
-        if request && !intents.contains(Intents::GUILD_MEMBERS) {
+        let has_intent = intents.contains(Intents::GUILD_MEMBERS);
+        if request == Some(true) && !has_intent {
             return Err(ConfigError::Invalid {
                 name: "REQUEST_MEMBERS",
-                value: request.to_string(),
+                value: "true".to_owned(),
                 reason: format!(
                     "needs the GUILD_MEMBERS intent ({}) in INTENTS ({}): Discord sends a \
                      guild's whole member list only to a bot with it",
@@ -582,7 +613,7 @@ impl Env<'_> {
             });
         }
         Ok(MemberConfig {
-            request,
+            request: request.unwrap_or(has_intent),
             refresh_hours,
         })
     }
@@ -1317,21 +1348,39 @@ pub(crate) mod tests {
         );
     }
 
-    /// Member requests are off by default and refresh every guild daily once
-    /// on; asking for a guild's whole member list needs the GUILD_MEMBERS
-    /// intent, so without it they are a configuration error.
+    /// Member requests are on by default when INTENTS has GUILD_MEMBERS (the
+    /// example's 32767 has it), off without it, and refresh every guild
+    /// daily; REQUEST_MEMBERS=false turns them off, and asking for them
+    /// without the intent (Discord sends a guild's whole member list only
+    /// with it) is a configuration error.
     #[test]
-    fn member_requests_need_the_guild_members_intent() {
+    fn member_requests_follow_the_guild_members_intent() {
         let defaults = MemberConfig {
-            request: false,
+            request: true,
             refresh_hours: 24,
         };
         assert_eq!(load(&example_env()).unwrap().members, defaults);
         assert_eq!(defaults.refresh(), Duration::from_secs(24 * 3600));
+        // 513 is GUILDS and GUILD_MESSAGES; 2 is GUILD_MEMBERS alone.
+        let without = with(&[("INTENTS", "513")]).unwrap().members;
+        assert_eq!(
+            without,
+            MemberConfig {
+                request: false,
+                ..defaults
+            }
+        );
+        let only = with(&[("INTENTS", "2")]).unwrap().members;
+        assert!(only.request);
+        // Blank is unset.
+        let blank = with(&[("REQUEST_MEMBERS", " ")]).unwrap().members;
+        assert!(blank.request);
 
+        let off = with(&[("REQUEST_MEMBERS", "false")]).unwrap().members;
+        assert!(!off.request);
+        assert_eq!(off.refresh_hours, 24);
         let on = with(&[("REQUEST_MEMBERS", "true")]).unwrap().members;
-        assert!(on.request);
-        assert_eq!(on.refresh_hours, 24);
+        assert_eq!(on, defaults);
         let mut env = example_env();
         env.insert("REQUEST_MEMBERS", "true".into());
         env.insert("MEMBER_REFRESH_HOURS", "0".into());
@@ -1339,7 +1388,6 @@ pub(crate) mod tests {
         assert!(never.request);
         assert_eq!(never.refresh(), Duration::ZERO);
 
-        // 513 is GUILDS and GUILD_MESSAGES; 2 is GUILD_MEMBERS alone.
         let without = with(&[("REQUEST_MEMBERS", "true"), ("INTENTS", "513")]);
         match &without {
             Err(ConfigError::Invalid { name, reason, .. }) => {

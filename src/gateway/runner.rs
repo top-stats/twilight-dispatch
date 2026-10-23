@@ -16,11 +16,17 @@
 //!   for room for as long as that takes (this wait has no time bound) and
 //!   lets the shard reconnect; Discord replays what was not received.
 //!
-//! With `REQUEST_MEMBERS` the runner also requests the members of its
-//! guilds: it hands every dispatch to the shard's [`MemberRequester`], sends
-//! the request that is due with the shard's command API (only while the
-//! shard is connected, holds no events back and has a command permit to
-//! spare) and wakes up when the next one is (see [`super::members`]).
+//! With member requests on (`REQUEST_MEMBERS`, by default with the
+//! `GUILD_MEMBERS` intent) the runner also requests the members of every one
+//! of its guilds: when it starts, before the shard connects, it queues the
+//! guilds the cache has for the shard (reading them up to three times, a
+//! second apart), so that each start requests them all, also when the shard
+//! resumes its session (no READY or `GUILD_CREATE` then); it hands every
+//! dispatch to the shard's [`MemberRequester`], which queues every available
+//! `GUILD_CREATE`'s guild; it sends the request that is due with the shard's
+//! command API (only while the shard is connected, holds no events back and
+//! has a command permit to spare) and wakes up when the next one is (see
+//! [`super::members`]).
 
 use super::{
     members::{self, MemberRequester},
@@ -83,6 +89,12 @@ pub const FATAL_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Upper bound for READY's inline cache update, well below the ~41 s heartbeat.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many times a shard reads the guilds the cache has for it, for its
+/// member requests, before it connects without them.
+const SEED_ATTEMPTS: u32 = 3;
+/// How long a shard waits after a failed read of its cached guilds before it
+/// reads them again.
+const SEED_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// How many characters of a message twilight rejected are logged.
 const MAX_LOGGED_PAYLOAD: usize = 512;
 
@@ -322,7 +334,8 @@ struct Runner<C, Q> {
     parse_errors: Throttle,
     /// Throttles the warnings about messages twilight or [`prepare`] rejected.
     receive_errors: Throttle,
-    /// The shard's guild member requests; `None` without `REQUEST_MEMBERS`.
+    /// The shard's guild member requests; `None` when members are not
+    /// requested ([`MemberConfig::request`]).
     members: Option<MemberRequester>,
 }
 
@@ -738,34 +751,60 @@ where
         }
     }
 
-    /// Start the member requests from the guilds the cache has for this
-    /// shard: a restart that resumes the session gets no READY or
-    /// `GUILD_CREATE` to learn them from, so the periodic refresh would
-    /// otherwise miss them until the next new session.
+    /// Queue a member request for every guild the cache has for this shard
+    /// ([`MemberRequester::seed`]), so that every start requests them all: a
+    /// shard that resumes its session gets no READY or `GUILD_CREATE` to
+    /// request them by. After a new session READY drops those it does not
+    /// list and holds the others back until their `GUILD_CREATE`. The cache
+    /// is read before the shard first connects, so no heartbeat is owed
+    /// meanwhile, up to [`SEED_ATTEMPTS`] times [`SEED_RETRY_DELAY`] apart,
+    /// and a shutdown stops the reads. Without the cache, or when every read
+    /// failed, a resumed shard requests a guild only at its next
+    /// `GUILD_CREATE`.
     async fn seed_members(&mut self) {
         if self.members.is_none() || !self.ctx.state.enabled {
             return;
         }
-        let mut redis = self.ctx.redis.clone();
-        let total = self.shard.id().total();
-        let read = cache::shard_guilds(&mut redis, self.id, total);
-        let limit = self.ctx.cache_timeout.min(READY_TIMEOUT);
-        match tokio::time::timeout(limit, read).await {
-            Ok(Ok(guilds)) => {
-                if let Some(requests) = self.members.as_mut() {
-                    let guilds = guilds.into_iter().filter_map(Id::new_checked);
-                    requests.seed(guilds, members::now_ms());
-                }
-            }
-            Ok(Err(err)) => warn!(
-                "[Shard {}] Could not read the cached guilds for member requests: {}",
-                self.id, err
-            ),
-            Err(_) => warn!(
-                "[Shard {}] Reading the cached guilds for member requests timed out",
-                self.id
-            ),
+        let mut shutdown = self.shutdown.clone();
+        let guilds = tokio::select! {
+            guilds = self.cached_guilds() => guilds,
+            () = shutdown_requested(&mut shutdown) => None,
+        };
+        if let (Some(requests), Some(guilds)) = (self.members.as_mut(), guilds) {
+            let guilds = guilds.into_iter().filter_map(Id::new_checked);
+            requests.seed(guilds, members::now_ms());
         }
+    }
+
+    /// The ids of the guilds the cache has for this shard, read up to
+    /// [`SEED_ATTEMPTS`] times [`SEED_RETRY_DELAY`] apart, each read within
+    /// the smaller of `CACHE_TIMEOUT_MS` and [`READY_TIMEOUT`]; `None` when
+    /// every read failed.
+    async fn cached_guilds(&mut self) -> Option<Vec<u64>> {
+        let total = self.shard.id().total();
+        let limit = self.ctx.cache_timeout.min(READY_TIMEOUT);
+        let mut redis = self.ctx.redis.clone();
+        for attempt in 1..=SEED_ATTEMPTS {
+            let read = cache::shard_guilds(&mut redis, self.id, total);
+            let failure = match tokio::time::timeout(limit, read).await {
+                Ok(Ok(guilds)) => return Some(guilds),
+                Ok(Err(err)) => err.to_string(),
+                Err(_) => format!("timed out after {limit:?}"),
+            };
+            if attempt < SEED_ATTEMPTS {
+                warn!(
+                    "[Shard {}] Could not read the cached guilds for member requests (attempt {} of {}), reading them again in {:?}: {}",
+                    self.id, attempt, SEED_ATTEMPTS, SEED_RETRY_DELAY, failure
+                );
+                tokio::time::sleep(SEED_RETRY_DELAY).await;
+            } else {
+                warn!(
+                    "[Shard {}] Could not read the cached guilds for member requests in {} attempts, so this start requests only the guilds of a READY or GUILD_CREATE: {}",
+                    self.id, SEED_ATTEMPTS, failure
+                );
+            }
+        }
+        None
     }
 
     /// Send the member request that is due, if any, and return when the
@@ -1322,16 +1361,34 @@ mod runner_tests {
     use crate::models::SessionInfo;
     use twilight_gateway::{queue::InMemoryQueue, Intents, ShardId};
 
-    /// A Redis that never answers; nothing here gets as far as using it.
-    #[derive(Clone)]
-    struct NoRedis;
+    /// A Redis that never answers, or (`down`) fails every command at once;
+    /// only the reads of the cached guilds for member requests get as far as
+    /// using it.
+    #[derive(Clone, Default)]
+    struct NoRedis {
+        down: bool,
+    }
+
+    impl NoRedis {
+        /// What every command gets: no answer, or an error when `down`.
+        fn reply<'a, T: Send + 'a>(&self) -> redis::RedisFuture<'a, T> {
+            let down = self.down;
+            Box::pin(async move {
+                if down {
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+    }
 
     impl ConnectionLike for NoRedis {
         fn req_packed_command<'a>(
             &'a mut self,
             _cmd: &'a redis::Cmd,
         ) -> redis::RedisFuture<'a, redis::Value> {
-            Box::pin(std::future::pending())
+            self.reply()
         }
 
         fn req_packed_commands<'a>(
@@ -1340,7 +1397,7 @@ mod runner_tests {
             _offset: usize,
             _count: usize,
         ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
-            Box::pin(std::future::pending())
+            self.reply()
         }
 
         fn get_db(&self) -> i64 {
@@ -1372,7 +1429,7 @@ mod runner_tests {
             ctx: Arc::new(RunnerContext {
                 state: StateConfig::default(),
                 workers,
-                redis: NoRedis,
+                redis: NoRedis::default(),
                 discord: DiscordLog::disabled(),
                 bot_id: Id::new(1),
                 cache_timeout: Duration::from_secs(1),
@@ -1517,6 +1574,62 @@ mod runner_tests {
                 resume_url: Some("wss://old".to_owned()),
             })
         );
+    }
+
+    /// A runner like `runner`'s that requests members and reads the guilds
+    /// they start from in the cache of `redis`, each read within 10 ms.
+    fn seeding(redis: NoRedis) -> Runner<NoRedis, InMemoryQueue> {
+        let mut r = runner(Vec::new());
+        r.ctx = Arc::new(RunnerContext {
+            state: StateConfig {
+                enabled: true,
+                ..StateConfig::default()
+            },
+            workers: Vec::new(),
+            redis,
+            discord: DiscordLog::disabled(),
+            bot_id: Id::new(1),
+            cache_timeout: Duration::from_millis(10),
+            max_held_bytes: 0,
+            members: MemberConfig::default(),
+        });
+        r.members = Some(MemberRequester::new(0, Duration::ZERO, 0));
+        r
+    }
+
+    /// A read of the cached guilds that fails is tried again a second later,
+    /// three times in all; then the shard starts with nothing to request.
+    #[tokio::test]
+    async fn failed_reads_of_the_cached_guilds_are_tried_again() {
+        let mut r = seeding(NoRedis { down: true });
+        let (_stop, shutdown) = watch::channel(false);
+        r.shutdown = shutdown;
+        let started = Instant::now();
+        r.seed_members().await;
+        let took = started.elapsed();
+        assert!(took >= SEED_RETRY_DELAY * (SEED_ATTEMPTS - 1), "{took:?}");
+        let requests = r.members.as_mut().expect("member requests");
+        assert_eq!(requests.poll(0, true), None, "nothing seeded");
+    }
+
+    /// A read that times out is tried again too, and a shutdown stops the
+    /// reads at once, also while they wait to try again.
+    #[tokio::test]
+    async fn a_shutdown_stops_the_reads_of_the_cached_guilds() {
+        let mut r = seeding(NoRedis::default());
+        let (stop, shutdown) = watch::channel(false);
+        r.shutdown = shutdown;
+        let stopping = async {
+            // The first read timed out by then, after 10 ms.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.send_replace(true);
+        };
+        let started = Instant::now();
+        tokio::join!(r.seed_members(), stopping);
+        let took = started.elapsed();
+        assert!(took < SEED_RETRY_DELAY, "{took:?}");
+        let requests = r.members.as_mut().expect("member requests");
+        assert_eq!(requests.poll(0, true), None, "nothing seeded");
     }
 }
 

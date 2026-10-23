@@ -1,8 +1,10 @@
 //! What a deployment gets for the variables it leaves unset, and what it is
 //! told about the ones it gets wrong: the defaults, the error for each
-//! required variable, the text operators see in the logs, obsolete variables
-//! and the credentials a rejected Discord endpoint must not leak. Only
-//! `Config::from_lookup` and `Config::obsolete_variables`: no services.
+//! required variable, the text operators see in the logs, obsolete variables,
+//! member requests left off for want of the intent, and the credentials a
+//! rejected Discord endpoint must not leak. Only `Config::from_lookup`,
+//! `Config::obsolete_variables` and `Config::member_request_warning`: no
+//! services.
 
 use std::{collections::HashMap, error::Error as _, time::Duration};
 use twilight_dispatch::config::{self, Config, ConfigError, MemberConfig, StateConfig};
@@ -128,11 +130,96 @@ fn unset_variables_take_their_documented_defaults() {
     assert_eq!(config.shard_silence, Duration::from_secs(180));
     assert_eq!(config.discord_api_proxy, None);
     assert_eq!(config.discord_gateway_url, None);
+    // Off only for want of the GUILD_MEMBERS intent, which 513 lacks (see
+    // `member_requests_default_to_the_guild_members_intent`).
     let members = MemberConfig {
         request: false,
         refresh_hours: 24,
     };
     assert_eq!(config.members, members);
+}
+
+/// `REQUEST_MEMBERS` unset means on with the GUILD_MEMBERS intent (2) and
+/// off without it; set, it wins: `false` turns requests off, and `true`
+/// without the intent is an error (see
+/// `errors_name_the_variable_the_value_and_the_reason`).
+#[test]
+fn member_requests_default_to_the_guild_members_intent() {
+    let members = |changes: &[(&'static str, &'static str)]| with(changes).unwrap().members;
+    let on = MemberConfig {
+        request: true,
+        refresh_hours: 24,
+    };
+    let off = MemberConfig {
+        request: false,
+        ..on
+    };
+    // 515: GUILDS, GUILD_MEMBERS and GUILD_MESSAGES; 2: GUILD_MEMBERS alone.
+    assert_eq!(members(&[("INTENTS", "515")]), on);
+    assert_eq!(members(&[("INTENTS", "2")]), on);
+    assert_eq!(members(&[]), off);
+    let blank = members(&[("INTENTS", "515"), ("REQUEST_MEMBERS", "")]);
+    assert_eq!(blank, on);
+    let explicit = members(&[("INTENTS", "515"), ("REQUEST_MEMBERS", "true")]);
+    assert_eq!(explicit, on);
+    let disabled = members(&[("INTENTS", "515"), ("REQUEST_MEMBERS", "false")]);
+    assert_eq!(disabled, off);
+    assert_eq!(members(&[("REQUEST_MEMBERS", "false")]), off);
+
+    let err = with(&[("REQUEST_MEMBERS", "true")]).unwrap_err();
+    let reason = concat!(
+        "needs the GUILD_MEMBERS intent (2) in INTENTS (513): ",
+        "Discord sends a guild's whole member list only to a bot with it"
+    );
+    let expected = ConfigError::Invalid {
+        name: "REQUEST_MEMBERS",
+        value: "true".to_owned(),
+        reason: reason.to_owned(),
+    };
+    assert_eq!(err, expected);
+}
+
+/// The warning a start with exactly `vars` set logs about member requests.
+fn member_warning(vars: &[(&str, &str)]) -> Option<String> {
+    let env: HashMap<&str, &str> = vars.iter().copied().collect();
+    Config::member_request_warning(&|name: &str| env.get(name).copied().map(str::to_owned))
+}
+
+/// Member requests that are off only because `INTENTS` lacks GUILD_MEMBERS
+/// (and `REQUEST_MEMBERS` is unset) are reported at startup, with what to do
+/// about it. Nothing is reported when the intent is there, when
+/// `REQUEST_MEMBERS` is set (`false` turns them off on purpose, `true`
+/// without the intent fails the start), or when `INTENTS` itself is wrong
+/// (`Config::from_lookup` reports that).
+#[test]
+fn members_left_off_for_want_of_the_intent_are_reported() {
+    let expected = concat!(
+        "REQUEST_MEMBERS is unset and INTENTS (513) lacks the GUILD_MEMBERS intent (2), so ",
+        "the shards do not request guild members: Discord sends a guild's whole member ",
+        "list only to a bot with it. Add the intent to INTENTS to request them, or set ",
+        "REQUEST_MEMBERS=false to keep them off without this warning"
+    );
+    assert_eq!(member_warning(MINIMAL).as_deref(), Some(expected));
+    let warning_with = |changes: &[(&'static str, &'static str)]| {
+        let mut vars = MINIMAL.to_vec();
+        vars.extend_from_slice(changes);
+        member_warning(&vars)
+    };
+    // Blank is unset.
+    let blank = warning_with(&[("REQUEST_MEMBERS", " ")]);
+    assert_eq!(blank.as_deref(), Some(expected));
+    let quiet: [&[(&'static str, &'static str)]; 6] = [
+        &[("INTENTS", "515")],
+        &[("INTENTS", "2")],
+        &[("REQUEST_MEMBERS", "false")],
+        &[("REQUEST_MEMBERS", "true")],
+        &[("INTENTS", "1099511627777")],
+        &[("INTENTS", "x")],
+    ];
+    for changes in quiet {
+        assert_eq!(warning_with(changes), None, "{changes:?}");
+    }
+    assert_eq!(member_warning(&[]), None, "INTENTS unset");
 }
 
 /// Blank values (empty or whitespace, as `NAME=` in a Compose file gives)

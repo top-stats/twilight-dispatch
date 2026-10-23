@@ -1,30 +1,47 @@
 //! Guild member requests (gateway opcode 8, Request Guild Members) that the
-//! shards make themselves with `REQUEST_MEMBERS`.
+//! shards make themselves (`REQUEST_MEMBERS`, on by default with the
+//! `GUILD_MEMBERS` intent).
 //!
 //! [`MemberRequester`] holds one shard's requests and does no I/O. The shard
-//! runner hands it every dispatch ([`MemberRequester::observe`]), sends the
-//! request [`MemberRequester::poll`] returns with the shard's command API, and
-//! polls again by [`MemberRequester::next_wake`] at the latest. Times are
+//! runner seeds it with the guilds the cache has for the shard when it starts
+//! ([`MemberRequester::seed`]), hands it every dispatch
+//! ([`MemberRequester::observe`]), sends the request
+//! [`MemberRequester::poll`] returns with the shard's command API, and polls
+//! again by [`MemberRequester::next_wake`] at the latest. Times are
 //! milliseconds since the Unix epoch ([`now_ms`]).
 //!
+//! - Every guild of the shard is requested, whatever its `GUILD_CREATE`
+//!   lists (so `LARGE_THRESHOLD` plays no part): each once at every start of
+//!   the process, again at each of its later `GUILD_CREATE`s, and once per
+//!   refresh period, each guild at its own offset in the period (from its
+//!   id), so the refreshes are spread evenly over it.
+//! - At the start the seeded guilds are queued, since a shard that resumes
+//!   its saved session gets no READY or `GUILD_CREATE` (without the cache
+//!   there is nothing to seed, and such a shard requests a guild only at its
+//!   next `GUILD_CREATE`). After a new session READY drops the seeded guilds
+//!   it does not list and holds the others back until their `GUILD_CREATE`.
+//!   READY itself requests nothing, and forgets the request in flight, which
+//!   the session before it can no longer answer. Every available
+//!   `GUILD_CREATE` queues its guild (a new session's, a join's, the end of
+//!   an outage's), or, when the guild is in flight, gives that request fresh
+//!   attempts, as it may have gone out while the guild could not answer. The
+//!   shard's guilds are the seeded ones, READY's and those of every
+//!   `GUILD_CREATE`, less those a READY does not list or a `GUILD_DELETE`
+//!   without `unavailable` removes.
 //! - One request at a time: the next guild is requested only once the
 //!   request in flight completed (its chunk with the last `chunk_index`
 //!   arrived, or `chunk_count` of its chunks did), was rate limited, or timed
 //!   out ([`CHUNK_TIMEOUT`] without a chunk). A request that timed out is
 //!   retried once at the back of the queue, then the guild is given up until
-//!   its next refresh.
-//! - Requested are a guild whose `GUILD_CREATE` lists fewer members than its
-//!   `member_count` (a join, or a large guild after a new session), and every
-//!   guild of the shard once per refresh period, each at its own offset in
-//!   the period (from its id), so the requests are spread evenly over it. The
-//!   shard's guilds are READY's and those of every `GUILD_CREATE`, less those
-//!   a `GUILD_DELETE` without `unavailable` removes. READY itself requests
-//!   nothing: the `GUILD_CREATE`s after it do.
+//!   something requests it again (its next `GUILD_CREATE` or refresh). So a
+//!   seeded guild that Discord does not answer (one in an outage the shard
+//!   was not told about) holds the shard's requests up for twice
+//!   [`CHUNK_TIMEOUT`] in all, and never for good.
 //! - A guild that cannot answer is not requested: one READY listed until its
 //!   `GUILD_CREATE` came, and one in an outage (a `GUILD_DELETE` with
 //!   `unavailable`) until it is back. Its refresh is skipped and a request
 //!   waiting for it is dropped; the `GUILD_CREATE` that brings it back
-//!   requests it when it leaves members out.
+//!   requests it.
 //! - Discord allows one request for a guild's whole member list per
 //!   [`GUILD_REQUEST_INTERVAL`] and answers another with `RATE_LIMITED`
 //!   instead of chunks. A guild is not requested within that interval of its
@@ -35,17 +52,15 @@
 //!   carry its nonce (or, without a nonce, name its guild). Those answering
 //!   other clients' requests change nothing here; the runner caches and
 //!   publishes every one as before.
-//! - A guild waits in one place at most (queued, held back or in flight).
-//!   What is kept is bounded by the shard's guilds, and the completions by
-//!   the last [`GUILD_REQUEST_INTERVAL`].
+//! - A guild waits in one place at most (queued, held back or in flight), so
+//!   one queued at the start whose `GUILD_CREATE` comes while it waits is
+//!   requested once. What is kept is bounded by the shard's guilds, and the
+//!   completions by the last [`GUILD_REQUEST_INTERVAL`].
 
 use super::payload::mix;
 use crate::{metrics::MEMBER_REQUESTS, util::Throttle};
 
-use serde::{
-    de::{DeserializeOwned, IgnoredAny},
-    Deserialize,
-};
+use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     num::NonZeroU64,
@@ -75,8 +90,9 @@ const GUILD_REQUEST_INTERVAL_MS: u64 = 30_000;
 pub const RATE_LIMIT_MARGIN: Duration = Duration::from_millis(RATE_LIMIT_MARGIN_MS);
 const RATE_LIMIT_MARGIN_MS: u64 = 1_000;
 
-/// Requests for a guild that time out before it is given up until its next
-/// refresh: one that timed out is retried once.
+/// Requests for a guild that time out before it is given up until something
+/// requests it again (its next `GUILD_CREATE` or refresh): one that timed out
+/// is retried once.
 pub const MAX_ATTEMPTS: u8 = 2;
 
 /// At most one completed request is logged per this long and shard.
@@ -120,14 +136,6 @@ fn next_refresh(period: Option<NonZeroU64>, guild: Id<GuildMarker>, now: u64) ->
     }
     let periods = ((now - offset) / period).saturating_add(1);
     Some(offset.saturating_add(periods.saturating_mul(period.get())))
-}
-
-/// Whether a guild's `GUILD_CREATE` leaves members out: it lists fewer
-/// (`listed`) than its `member_count` (Discord leaves out offline members
-/// above `LARGE_THRESHOLD`, and nearly all above 75k members).
-fn leaves_members_out(listed: usize, member_count: Option<u64>) -> bool {
-    let listed = u64::try_from(listed).unwrap_or(u64::MAX);
-    member_count.is_some_and(|count| listed < count)
 }
 
 /// A request to send: the whole member list of `guild`, answered with
@@ -240,14 +248,11 @@ struct ReadyMeta {
 }
 
 /// What the requests need of a guild in a READY, or of a `GUILD_CREATE`, the
-/// runner could not parse (its members are only counted).
+/// runner could not parse: its id, and whether it is unavailable.
 #[derive(Deserialize)]
 struct GuildMeta {
     id: Id<GuildMarker>,
     unavailable: Option<bool>,
-    member_count: Option<u64>,
-    #[serde(default)]
-    members: Vec<IgnoredAny>,
 }
 
 /// What paces the requests in a `GUILD_MEMBERS_CHUNK` (its members are
@@ -356,13 +361,18 @@ impl MemberRequester {
         }
     }
 
-    /// Make `guilds` the shard's, each refreshed at its time, without
-    /// requesting any now: the guilds cached before a restart that resumed
-    /// the session, which brings no READY or `GUILD_CREATE` to learn them
-    /// from.
+    /// Make `guilds` the shard's, each refreshed at its time, and queue a
+    /// request for each, in their order: the guilds the cache has for the
+    /// shard when the process starts, all of which a start requests. A shard
+    /// that resumes its session gets no READY or `GUILD_CREATE` to request
+    /// them by; after a new session READY drops those it does not list and
+    /// holds the others back until their `GUILD_CREATE`, which requests each
+    /// once (it finds it still queued, or queues it again when it was dropped
+    /// while it could not answer).
     pub fn seed(&mut self, guilds: impl IntoIterator<Item = Id<GuildMarker>>, now: u64) {
         for guild in guilds {
             self.add(guild, now);
+            self.enqueue(guild, 0, now);
         }
     }
 
@@ -381,10 +391,7 @@ impl MemberRequester {
                 self.ready(ready.guilds.iter().map(|guild| guild.id), now);
             }
             Some(Event::GuildCreate(guild)) => match guild.as_ref() {
-                GuildCreate::Available(guild) => {
-                    let partial = leaves_members_out(guild.members.len(), guild.member_count);
-                    self.guild_create(guild.id, partial, now);
-                }
+                GuildCreate::Available(guild) => self.guild_create(guild.id, now),
                 GuildCreate::Unavailable(guild) => self.outage(guild.id, now),
             },
             Some(Event::GuildDelete(guild)) => {
@@ -499,10 +506,13 @@ impl MemberRequester {
         [deadline, held, refresh].into_iter().flatten().min()
     }
 
-    /// READY lists the shard's guilds: those it does not list are gone, the
-    /// others get their refresh times and cannot answer until their
-    /// `GUILD_CREATE`. Nothing is requested.
+    /// READY lists the shard's guilds: those it does not list are gone (and
+    /// so is their request), the others get their refresh times and cannot
+    /// answer until their `GUILD_CREATE`, which requests them. Nothing is
+    /// requested here, and the request in flight is forgotten: it went out
+    /// in an earlier session, which can no longer answer it.
     fn ready(&mut self, guilds: impl Iterator<Item = Id<GuildMarker>>, now: u64) {
+        self.in_flight = None;
         let listed: HashSet<Id<GuildMarker>> = guilds.collect();
         let gone: Vec<Id<GuildMarker>> = self
             .guilds
@@ -518,14 +528,19 @@ impl MemberRequester {
         }
     }
 
-    /// An available guild's `GUILD_CREATE`: the guild is the shard's and can
-    /// answer, and one that leaves members out (`partial`) is requested.
-    fn guild_create(&mut self, guild: Id<GuildMarker>, partial: bool, now: u64) {
+    /// An available guild's `GUILD_CREATE`: the guild is the shard's, can
+    /// answer and is requested, whatever its `GUILD_CREATE` lists. When it
+    /// is in flight, that request gets fresh attempts instead: it may have
+    /// gone out while the guild could not answer, so a timeout retries it
+    /// rather than give the guild up.
+    fn guild_create(&mut self, guild: Id<GuildMarker>, now: u64) {
         self.add(guild, now);
         self.unavailable.remove(&guild);
-        if partial {
-            self.enqueue(guild, 0, now);
+        let in_flight = self.in_flight.as_mut();
+        if let Some(flight) = in_flight.filter(|flight| flight.guild == guild) {
+            flight.timeouts = 0;
         }
+        self.enqueue(guild, 0, now);
     }
 
     /// `guild` is the shard's but cannot answer until its next
@@ -540,8 +555,7 @@ impl MemberRequester {
         if guild.unavailable == Some(true) {
             self.outage(guild.id, now);
         } else {
-            let partial = leaves_members_out(guild.members.len(), guild.member_count);
-            self.guild_create(guild.id, partial, now);
+            self.guild_create(guild.id, now);
         }
     }
 
@@ -648,7 +662,7 @@ impl MemberRequester {
                 self.count(Outcome::Dropped);
                 if let Some(suppressed) = self.drop_logs.check() {
                     warn!(
-                        "[Shard {}] Giving up on the members of guild {} after {} requests without an answer until its next refresh ({} similar suppressed)",
+                        "[Shard {}] Giving up on the members of guild {} after {} requests without an answer, until it is requested again ({} similar suppressed)",
                         self.shard, flight.guild, timeouts, suppressed
                     );
                 }
@@ -911,7 +925,7 @@ mod tests {
     fn one_request_at_a_time_in_order() {
         let mut r = requester();
         for guild in [1, 2, 3] {
-            r.guild_create(id(guild), true, T0);
+            r.guild_create(id(guild), T0);
         }
         let first = send(&mut r, T0);
         assert_eq!(first.guild, id(1));
@@ -935,7 +949,7 @@ mod tests {
     #[test]
     fn requests_ask_for_every_member_with_a_short_nonce() {
         let mut r = requester();
-        r.guild_create(id(5), true, T0);
+        r.guild_create(id(5), T0);
         let request = send(&mut r, T0);
         assert_eq!(request.nonce, format!("{SHARD}.{T0}"));
         let command = serde_json::to_value(request.command()).unwrap();
@@ -954,20 +968,49 @@ mod tests {
         assert!(longest.nonce.len() <= 32, "{}", longest.nonce);
     }
 
-    /// READY only tells the shard's guilds, and a GUILD_CREATE that lists
-    /// every member needs no request: neither sends one.
+    /// READY only tells the shard's guilds and requests nothing; every
+    /// available GUILD_CREATE after it requests its guild, one READY listed
+    /// as well as a join.
     #[test]
-    fn ready_and_complete_guilds_request_nothing() {
+    fn ready_requests_nothing_and_every_guild_create_does() {
         let mut r = MemberRequester::new(SHARD, Duration::from_secs(3600), T0);
         r.ready([1, 2].into_iter().map(id), T0);
-        r.guild_create(id(1), false, T0);
-        r.guild_create(id(3), false, T0);
         assert_eq!(next(&mut r, T0), None);
+        r.guild_create(id(1), T0);
+        r.guild_create(id(3), T0);
         assert_eq!(r.guilds.len(), 3);
         // Each is refreshed within the hour.
         assert_eq!(r.refreshes.len(), 3);
+        for guild in [1, 3] {
+            let request = send(&mut r, T0);
+            assert_eq!(request.guild, id(guild));
+            answer(&mut r, &request, T0);
+        }
+        // 2 waits for its GUILD_CREATE.
+        assert_eq!(next(&mut r, T0), None);
         let wake = r.next_wake().unwrap();
         assert!((T0 + 1..=T0 + 3600 * SEC).contains(&wake), "{wake}");
+    }
+
+    /// A GUILD_CREATE is requested whatever it lists: one that lists every
+    /// member (as many as its member_count, as Discord sends a guild below
+    /// LARGE_THRESHOLD) just like one that leaves members out, typed or raw.
+    #[test]
+    fn complete_and_partial_guild_creates_are_requested_alike() {
+        let mut r = requester();
+        observe(&mut r, "GUILD_CREATE", &guild(1, 2, 2), true, T0);
+        observe(&mut r, "GUILD_CREATE", &guild(2, 300, 1), true, T0);
+        let whole = json!({"id": "3", "member_count": 1, "members": [{}]});
+        observe(&mut r, "GUILD_CREATE", &whole, false, T0);
+        let bare = json!({"id": "4"});
+        observe(&mut r, "GUILD_CREATE", &bare, false, T0);
+        let mut requested = Vec::new();
+        while let Some(request) = r.poll(T0, true) {
+            requested.push(request.guild.get());
+            answer(&mut r, &request, T0);
+        }
+        assert_eq!(requested, [1, 2, 3, 4]);
+        assert_eq!(counts(&r), [4, 4, 0, 0, 0]);
     }
 
     /// Nothing is sent while the shard cannot send, and only a dispatch
@@ -975,7 +1018,7 @@ mod tests {
     #[test]
     fn nothing_is_sent_until_the_shard_is_ready() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
+        r.guild_create(id(1), T0);
         assert_eq!(r.poll(T0, false), None);
         assert_eq!(r.next_wake(), None);
         assert_eq!(next(&mut r, T0 + SEC), Some(1));
@@ -987,8 +1030,8 @@ mod tests {
     #[test]
     fn a_request_that_times_out_is_retried_once_then_dropped() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
-        r.guild_create(id(2), true, T0);
+        r.guild_create(id(1), T0);
+        r.guild_create(id(2), T0);
         let first = send(&mut r, T0);
         assert_eq!(first.guild, id(1));
         assert_eq!(r.next_wake(), Some(T0 + 30 * SEC));
@@ -1014,7 +1057,7 @@ mod tests {
         assert!(r.pending.is_empty());
         assert_eq!(r.next_wake(), None);
         // Until a GUILD_CREATE requests it again.
-        r.guild_create(id(1), true, T0 + 90 * SEC);
+        r.guild_create(id(1), T0 + 90 * SEC);
         assert_eq!(next(&mut r, T0 + 90 * SEC), Some(1));
     }
 
@@ -1024,8 +1067,8 @@ mod tests {
     #[test]
     fn a_rate_limited_request_is_retried_after_retry_after() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
-        r.guild_create(id(2), true, T0);
+        r.guild_create(id(1), T0);
+        r.guild_create(id(2), T0);
         let first = send(&mut r, T0);
         r.rate_limited(&limited(Some(2.0001), Some(1), Some(&first.nonce)), T0);
         let second = send(&mut r, T0);
@@ -1061,7 +1104,7 @@ mod tests {
     #[test]
     fn rate_limits_of_other_requests_change_nothing() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
+        r.guild_create(id(1), T0);
         let request = send(&mut r, T0);
         let nonce = Some(request.nonce.as_str());
         let mut other_opcode = limited(Some(1.0), Some(1), nonce);
@@ -1093,8 +1136,8 @@ mod tests {
     #[test]
     fn chunks_of_other_requests_are_ignored() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
-        r.guild_create(id(2), true, T0);
+        r.guild_create(id(1), T0);
+        r.guild_create(id(2), T0);
         let request = send(&mut r, T0);
         let nonce = Some(request.nonce.as_str());
         r.chunk(&chunk(1, 0, 1, Some("bot.7")), T0);
@@ -1112,7 +1155,7 @@ mod tests {
     fn the_last_chunk_completes_a_request() {
         let mut r = requester();
         for guild in [1, 2, 3] {
-            r.guild_create(id(guild), true, T0);
+            r.guild_create(id(guild), T0);
         }
         let first = send(&mut r, T0);
         r.chunk(&chunk(1, 2, 3, Some(&first.nonce)), T0);
@@ -1130,11 +1173,11 @@ mod tests {
     #[test]
     fn a_guild_waits_30_s_after_its_last_request() {
         let mut r = requester();
-        r.guild_create(id(1), true, T0);
+        r.guild_create(id(1), T0);
         let request = send(&mut r, T0);
         answer(&mut r, &request, T0 + SEC);
-        r.guild_create(id(1), true, T0 + 5 * SEC);
-        r.guild_create(id(1), true, T0 + 6 * SEC);
+        r.guild_create(id(1), T0 + 5 * SEC);
+        r.guild_create(id(1), T0 + 6 * SEC);
         assert_eq!(r.deferred.len(), 1);
         assert_eq!(r.next_wake(), Some(T0 + 31 * SEC));
         assert_eq!(next(&mut r, T0 + 31 * SEC - 1), None);
@@ -1151,17 +1194,17 @@ mod tests {
     fn a_guild_waits_once() {
         let mut r = requester();
         for _ in 0..3 {
-            r.guild_create(id(1), true, T0);
-            r.guild_create(id(2), true, T0);
+            r.guild_create(id(1), T0);
+            r.guild_create(id(2), T0);
         }
         assert_eq!(r.queue.len(), 2);
         let request = send(&mut r, T0);
         // In flight.
-        r.guild_create(id(1), true, T0);
+        r.guild_create(id(1), T0);
         assert_eq!(r.queue.len(), 1);
         r.rate_limited(&limited(Some(5.0), None, Some(&request.nonce)), T0);
         // Held back.
-        r.guild_create(id(1), true, T0);
+        r.guild_create(id(1), T0);
         assert_eq!(r.queue.len(), 1);
         assert_eq!(r.deferred.len(), 1);
         assert_eq!(r.pending.len(), 2);
@@ -1177,7 +1220,7 @@ mod tests {
         let mut r = MemberRequester::new(SHARD, Duration::from_secs(60), T0);
         r.ready([1, 2, 3, 4].into_iter().map(id), T0);
         for guild in [1, 2, 3] {
-            r.guild_create(id(guild), true, T0);
+            r.guild_create(id(guild), T0);
         }
         let request = send(&mut r, T0);
         r.rate_limited(&limited(Some(5.0), None, Some(&request.nonce)), T0);
@@ -1196,11 +1239,14 @@ mod tests {
         assert_eq!(r.refreshes.len(), 2);
         // Neither had its GUILD_CREATE yet.
         assert_eq!(r.unavailable.len(), 2);
-        // A join, then leaving it; then leaving one that never came up.
-        r.guild_create(id(6), false, T0);
+        // A join, which is requested, then leaving it before its turn; then
+        // leaving one that never came up.
+        r.guild_create(id(6), T0);
         assert_eq!(r.guilds.len(), 3);
+        assert_eq!(r.queue.len(), 1);
         r.remove(id(6));
         assert_eq!((r.guilds.len(), r.refreshes.len()), (2, 2));
+        assert!(r.queue.is_empty() && r.pending.is_empty());
         r.remove(id(5));
         assert_eq!((r.guilds.len(), r.unavailable.len()), (1, 1));
     }
@@ -1213,13 +1259,14 @@ mod tests {
         let mut r = requester();
         observe(&mut r, "READY", &ready(&[1, 2]), true, T0);
         assert_eq!(r.guilds.len(), 2);
-        // Every member listed, an unavailable guild, then members left out.
-        observe(&mut r, "GUILD_CREATE", &guild(1, 2, 2), true, T0);
+        assert_eq!(next(&mut r, T0), None, "READY requests nothing");
+        // An unavailable guild is not requested, an available one is (here
+        // one that lists every member).
         let unavailable = json!({"id": "3", "unavailable": true});
         observe(&mut r, "GUILD_CREATE", &unavailable, true, T0);
         assert_eq!(next(&mut r, T0), None);
         assert_eq!(r.guilds.len(), 3);
-        observe(&mut r, "GUILD_CREATE", &guild(2, 300, 1), true, T0);
+        observe(&mut r, "GUILD_CREATE", &guild(2, 2, 2), true, T0);
         let request = send(&mut r, T0);
         assert_eq!(request.guild, id(2));
 
@@ -1281,7 +1328,7 @@ mod tests {
         let mut r = requester();
         for guild in 1..=100 {
             let now = T0 + guild * SEC;
-            r.guild_create(id(guild), true, now);
+            r.guild_create(id(guild), now);
             let request = send(&mut r, now);
             answer(&mut r, &request, now);
             assert!(r.completed.len() <= 30);
@@ -1310,20 +1357,27 @@ mod tests {
         assert_eq!(next_refresh(None, id(1), 0), None);
     }
 
-    /// With a refresh period every guild is requested once per period, each
-    /// at its own time, while READY (and the GUILD_CREATEs that list every
-    /// member) request none of them at once.
+    /// With a refresh period every guild is requested once at its
+    /// GUILD_CREATE (READY requests none of them), then once per period,
+    /// each at its own time.
     #[test]
     fn every_guild_is_refreshed_once_per_period() {
         let period = 600 * SEC;
         let mut r = MemberRequester::new(SHARD, Duration::from_millis(period), T0);
         let guilds: Vec<Id<GuildMarker>> = (1..=300).map(|n| id(n << 22)).collect();
         r.ready(guilds.iter().copied(), T0);
-        for &guild in &guilds {
-            r.guild_create(guild, false, T0);
-        }
         assert_eq!(next(&mut r, T0), None);
+        for &guild in &guilds {
+            r.guild_create(guild, T0);
+        }
         assert!(r.unavailable.is_empty());
+        let mut created: HashMap<u64, u32> = HashMap::new();
+        while let Some(request) = r.poll(T0, true) {
+            *created.entry(request.guild.get()).or_default() += 1;
+            answer(&mut r, &request, T0);
+        }
+        assert_eq!(created.len(), 300);
+        assert!(created.values().all(|&count| count == 1), "{created:?}");
         for periods in [1, 2] {
             let requested = run_periods(&mut r, period, periods);
             assert_eq!(requested.len(), 300, "period {periods}");
@@ -1331,7 +1385,7 @@ mod tests {
                 assert_eq!(*count, 1, "period {periods}");
             }
         }
-        assert_eq!(r.stats().sent, 600);
+        assert_eq!(r.stats().sent, 900);
     }
 
     /// A guild that cannot answer (listed by READY until its GUILD_CREATE,
@@ -1344,8 +1398,8 @@ mod tests {
         let mut r = MemberRequester::new(SHARD, Duration::from_millis(period), T0);
         r.ready([1, 2, 3].into_iter().map(id), T0);
         assert_eq!(r.unavailable.len(), 3);
-        r.guild_create(id(1), true, T0);
-        r.guild_create(id(2), true, T0);
+        r.guild_create(id(1), T0);
+        r.guild_create(id(2), T0);
         let first = send(&mut r, T0);
         assert_eq!(first.guild, id(1));
         // 2 goes down while it waits; 3 never came up.
@@ -1357,16 +1411,16 @@ mod tests {
         let requested = run_periods(&mut r, period, 1);
         assert_eq!(requested, HashMap::from([(1, 1)]));
         assert_eq!(r.unavailable.len(), 2);
-        // 3 comes up leaving members out: requested.
+        // 3 comes up: requested.
         let end = T0 + period;
-        r.guild_create(id(3), true, end);
+        r.guild_create(id(3), end);
         assert_eq!(next(&mut r, end), Some(3));
         assert_eq!(r.unavailable.len(), 1);
     }
 
     /// A READY or GUILD_CREATE the runner could not parse is read raw: the
-    /// guilds READY lists, and a GUILD_CREATE's availability and how many
-    /// members it lists of its member_count.
+    /// guilds READY lists, and a GUILD_CREATE's guild and whether it is
+    /// available. Every available one is requested, whatever it lists.
     #[test]
     fn unparsed_ready_and_guild_create_are_read_raw() {
         let mut r = requester();
@@ -1379,8 +1433,11 @@ mod tests {
         observe(&mut r, "GUILD_CREATE", &down, false, T0);
         let whole = json!({"id": "9", "member_count": 1, "members": [{}]});
         observe(&mut r, "GUILD_CREATE", &whole, false, T0);
-        assert_eq!(next(&mut r, T0), Some(7));
-        assert_eq!(next(&mut r, T0), None);
+        let first = send(&mut r, T0);
+        assert_eq!(first.guild, id(7));
+        assert_eq!(next(&mut r, T0), None, "one at a time");
+        answer(&mut r, &first, T0);
+        assert_eq!(next(&mut r, T0), Some(9));
         assert_eq!(r.guilds.len(), 3);
         assert!(r.queue.is_empty());
         let unavailable: Vec<u64> = r.unavailable.iter().map(|guild| guild.get()).collect();
@@ -1406,14 +1463,152 @@ mod tests {
 mod seed_tests {
     use super::*;
 
-    /// Seeded guilds (the cache's, after a restart that resumed the session)
-    /// get their refresh time, and none is requested at once.
+    const SEC: u64 = 1_000;
+
+    fn id(guild: u64) -> Id<GuildMarker> {
+        Id::new(guild)
+    }
+
+    /// The request `poll` starts at `now`, which there must be.
+    fn send(r: &mut MemberRequester, now: u64) -> MemberRequest {
+        r.poll(now, true).expect("a request")
+    }
+
+    /// Answer `request` with a single chunk at `now`.
+    fn answer(r: &mut MemberRequester, request: &MemberRequest, now: u64) {
+        let only = ChunkMeta {
+            guild_id: request.guild,
+            chunk_index: 0,
+            chunk_count: 1,
+            nonce: Some(request.nonce.clone()),
+        };
+        r.chunk(&only, now);
+    }
+
+    /// Seeded guilds (the cache's, when the process starts) are all
+    /// requested at once, one at a time in the cache's order, and refreshed
+    /// later: a shard that resumes its session gets no READY or
+    /// GUILD_CREATE that would request them.
     #[test]
-    fn seeded_guilds_get_a_refresh_and_no_request() {
-        let mut requests = MemberRequester::new(0, Duration::from_secs(3600), 0);
-        requests.seed([Id::new(1 << 22), Id::new(2 << 22)], 0);
-        assert_eq!(requests.guilds.len(), 2);
-        assert!(requests.queue.is_empty(), "nothing is queued");
-        assert!(requests.next_wake().is_some(), "their refresh is due later");
+    fn seeded_guilds_are_requested_at_boot() {
+        let mut r = MemberRequester::new(0, Duration::from_secs(3600), 0);
+        let guilds = [1 << 22, 2 << 22, 3 << 22].map(id);
+        r.seed(guilds, 0);
+        assert_eq!((r.guilds.len(), r.refreshes.len()), (3, 3));
+        for guild in guilds {
+            let request = send(&mut r, 0);
+            assert_eq!(request.guild, guild);
+            answer(&mut r, &request, 0);
+        }
+        assert_eq!(r.poll(0, true), None, "each once");
+        let stats = r.stats();
+        assert_eq!((stats.sent, stats.done), (3, 3));
+        // Their refreshes are due later in the hour.
+        let wake = r.next_wake().expect("a refresh");
+        assert!((1..=3_600 * SEC).contains(&wake), "{wake}");
+    }
+
+    /// After a new session READY drops the seeded guilds it does not list
+    /// and holds the others back until their GUILD_CREATE, which requests
+    /// each once: one it finds still queued from the start as well as one
+    /// that was dropped from the queue while it could not answer.
+    #[test]
+    fn seeded_guilds_follow_ready_and_are_requested_once() {
+        let mut r = MemberRequester::new(0, Duration::ZERO, 0);
+        r.seed([1, 2, 3].map(id), 0);
+        // A new session whose READY no longer lists 3 (left meanwhile).
+        r.ready([1, 2].into_iter().map(id), 0);
+        assert!(!r.guilds.contains_key(&id(3)));
+        assert_eq!(r.queue.len(), 2);
+        assert_eq!(r.unavailable.len(), 2);
+        // 1's GUILD_CREATE finds it queued.
+        r.guild_create(id(1), 0);
+        assert_eq!(r.queue.len(), 2);
+        let first = send(&mut r, 0);
+        assert_eq!(first.guild, id(1));
+        answer(&mut r, &first, 0);
+        // 2 cannot answer before its GUILD_CREATE: dropped from the queue,
+        // and queued again once it comes.
+        assert_eq!(r.poll(0, true), None);
+        assert!(r.pending.is_empty());
+        r.guild_create(id(2), SEC);
+        let second = send(&mut r, SEC);
+        assert_eq!(second.guild, id(2));
+        answer(&mut r, &second, SEC);
+        assert_eq!(r.poll(SEC, true), None);
+        let stats = r.stats();
+        assert_eq!((stats.sent, stats.done), (2, 2));
+    }
+
+    /// A seeded guild that Discord does not answer (one in an outage the
+    /// shard was not told about) does not stall the shard: its request times
+    /// out after 30 s, its retry waits behind the other guilds, and the
+    /// second timeout gives it up, after 60 s of waiting in all.
+    #[test]
+    fn a_seeded_guild_that_never_answers_is_given_up() {
+        let mut r = MemberRequester::new(0, Duration::ZERO, 0);
+        r.seed([1, 2].map(id), 0);
+        let silent = send(&mut r, 0);
+        assert_eq!(silent.guild, id(1));
+        assert_eq!(r.next_wake(), Some(30 * SEC));
+        let other = send(&mut r, 30 * SEC);
+        assert_eq!(other.guild, id(2), "the retry waits behind it");
+        answer(&mut r, &other, 31 * SEC);
+        let retry = send(&mut r, 31 * SEC);
+        assert_eq!(retry.guild, id(1));
+        assert_eq!(r.next_wake(), Some(61 * SEC));
+        assert_eq!(r.poll(61 * SEC, true), None);
+        let stats = r.stats();
+        let outcomes = [stats.sent, stats.done, stats.timeout, stats.dropped];
+        assert_eq!(outcomes, [3, 1, 2, 1]);
+        assert!(r.in_flight.is_none() && r.pending.is_empty());
+        assert_eq!(r.next_wake(), None, "nothing left to wait for");
+    }
+
+    /// A request still in flight when READY starts a new session went out
+    /// in the old one, which can no longer answer it: READY forgets it, so
+    /// the guild's GUILD_CREATE requests it at once, here while its retry
+    /// was in flight, and nothing times out or is given up.
+    #[test]
+    fn ready_forgets_the_request_of_the_session_before() {
+        let mut r = MemberRequester::new(0, Duration::ZERO, 0);
+        r.seed([1].map(id), 0);
+        let first = send(&mut r, 0);
+        let retry = send(&mut r, 30 * SEC);
+        assert_eq!(retry.guild, id(1));
+        assert_ne!(retry.nonce, first.nonce);
+        r.ready([1].into_iter().map(id), 40 * SEC);
+        assert!(r.in_flight.is_none());
+        r.guild_create(id(1), 41 * SEC);
+        let request = send(&mut r, 41 * SEC);
+        assert_eq!(request.guild, id(1));
+        assert_ne!(request.nonce, retry.nonce);
+        answer(&mut r, &request, 42 * SEC);
+        assert_eq!(r.poll(90 * SEC, true), None, "requested once");
+        let stats = r.stats();
+        let outcomes = [stats.sent, stats.done, stats.timeout, stats.dropped];
+        assert_eq!(outcomes, [3, 1, 1, 0]);
+    }
+
+    /// A GUILD_CREATE for the guild in flight gives that request fresh
+    /// attempts: it may have gone out while the guild could not answer (in
+    /// an outage the shard was not told about), so its timeout retries it
+    /// rather than give the guild up, here although it was the retry.
+    #[test]
+    fn a_guild_create_gives_the_request_in_flight_fresh_attempts() {
+        let mut r = MemberRequester::new(0, Duration::ZERO, 0);
+        r.seed([1].map(id), 0);
+        let first = send(&mut r, 0);
+        let retry = send(&mut r, 30 * SEC);
+        assert_ne!(retry.nonce, first.nonce);
+        // The outage ends while the retry is in flight.
+        r.guild_create(id(1), 40 * SEC);
+        assert!(r.queue.is_empty(), "it is in flight, not queued");
+        let again = send(&mut r, 60 * SEC);
+        assert_eq!(again.guild, id(1));
+        answer(&mut r, &again, 61 * SEC);
+        let stats = r.stats();
+        let outcomes = [stats.sent, stats.done, stats.timeout, stats.dropped];
+        assert_eq!(outcomes, [3, 1, 2, 0]);
     }
 }

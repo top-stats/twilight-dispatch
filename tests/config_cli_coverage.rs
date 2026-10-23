@@ -399,7 +399,9 @@ fn healthcheck_runs_on_a_single_thread() {
 }
 
 /// A service that cannot reach Redis fails its startup with exit code 1,
-/// after naming the obsolete variables that are set.
+/// after naming the obsolete variables that are set and saying why members
+/// are not requested (`REQUEST_MEMBERS` is unset and `INTENTS` 513 lacks
+/// GUILD_MEMBERS).
 #[test]
 fn startup_failures_exit_1_after_naming_obsolete_variables() {
     let dir = work_dir("startup-failure");
@@ -417,6 +419,8 @@ fn startup_failures_exit_1_after_naming_obsolete_variables() {
         let warning = format!("{name} is no longer used and can be removed");
         assert!(text.contains(&warning), "{text}");
     }
+    let members = "REQUEST_MEMBERS is unset and INTENTS (513) lacks the GUILD_MEMBERS intent (2)";
+    assert_eq!(text.matches(members).count(), 1, "{text}");
 }
 
 /// `docker stop` while the service is still starting (here: waiting for a
