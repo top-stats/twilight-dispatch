@@ -353,7 +353,11 @@ pub async fn run<C, Q>(
     let id = shard.id().number();
     let session = handle.snapshot().session_id.map(Arc::from);
     let requests = if ctx.members.request {
-        Some(MemberRequester::new(id, ctx.members.refresh(), members::now_ms()))
+        Some(MemberRequester::new(
+            id,
+            ctx.members.refresh(),
+            members::now_ms(),
+        ))
     } else {
         None
     };
