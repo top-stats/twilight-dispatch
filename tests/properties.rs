@@ -2968,6 +2968,10 @@ proptest! {
     ) {
         let plan = commands::plan(&body, |shard| owned.contains(&shard), total);
         let expected = match commands::parse(&body) {
+            // A message is for no shard: whichever process consumes it posts it.
+            _ if commands::is_message(&body) => {
+                commands::parse_message(&body).map_or(Plan::Drop, Plan::Post)
+            }
             Err(_) => Plan::Drop,
             Ok(delivery) if delivery.shard >= total => Plan::Drop,
             // Only the process that runs the shard validates the command.
@@ -3000,6 +3004,62 @@ proptest! {
         let value: Value = serde_json::from_slice(&body).unwrap();
         prop_assert_eq!(&value["op"], &json!(if reconnect { 1 } else { 0 }));
         prop_assert_eq!(&value["shard"], &json!(shard));
+    }
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// A message is posted, as it was sent, exactly when its channel id is a
+    /// snowflake and its content and embeds are within Discord's limits; it
+    /// needs embeds or content that is not blank. Its `shard` is not read.
+    #[test]
+    fn messages_within_discords_limits_are_posted_as_sent(
+        channel in prop::sample::select(vec![json!("123"), json!(123), json!("0"), json!("x")]),
+        content in prop::option::of((0usize..2100, prop::sample::select(vec!["x", "é", " "]))),
+        embeds in 0usize..13,
+        title in 0usize..300,
+        shard in prop::option::of(json_value()),
+    ) {
+        let content = content.map(|(len, unit)| unit.repeat(len));
+        let embed = json!({"title": "t".repeat(title)});
+        let mut data = json!({"channel_id": channel, "embeds": vec![embed; embeds]});
+        if let Some(content) = &content {
+            data["content"] = json!(content);
+        }
+        let mut body = json!({"op": 2, "data": data});
+        if let Some(shard) = shard {
+            body["shard"] = shard;
+        }
+        let body = body.to_string();
+        prop_assert!(commands::is_message(body.as_bytes()));
+        let parsed = commands::parse_message(body.as_bytes());
+
+        let text = content.unwrap_or_default();
+        let chars = text.chars().count();
+        let snowflake = channel == json!("123") || channel == json!(123);
+        let embeds_valid = embeds <= 10 && (embeds == 0 || title <= 256);
+        match parsed {
+            Err(InvalidCommand::Malformed(_)) => prop_assert!(!snowflake),
+            Err(InvalidCommand::EmptyMessage) => {
+                prop_assert!(snowflake && text.trim().is_empty() && embeds == 0);
+            }
+            Err(InvalidCommand::ContentTooLong(len)) => {
+                prop_assert!(snowflake && chars > 2000);
+                prop_assert_eq!(len, chars);
+            }
+            Err(InvalidCommand::InvalidEmbeds(_)) => {
+                prop_assert!(snowflake && chars <= 2000 && !embeds_valid);
+            }
+            Err(err) => prop_assert!(false, "{}", err),
+            Ok(message) => {
+                prop_assert!(snowflake && chars <= 2000 && embeds_valid);
+                prop_assert!(!text.trim().is_empty() || embeds > 0);
+                prop_assert_eq!(message.channel_id.get(), 123);
+                prop_assert_eq!(message.content, text);
+                prop_assert_eq!(message.embeds.len(), embeds);
+            }
+        }
     }
 }
 

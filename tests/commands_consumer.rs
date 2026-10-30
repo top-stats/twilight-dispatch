@@ -5,15 +5,20 @@
 //! is cancelled by the broker, when a command cannot be forwarded, and when
 //! the connection is closed during an outage. A slow broker, one that stops
 //! answering or taking writes and one that went away are played by a TCP
-//! proxy ([`Proxy`]).
+//! proxy ([`Proxy`]). Messages (op 2) are posted to a fake Discord REST API
+//! (`tests/support/fake_discord.rs`).
 
 mod common;
+#[path = "support/fake_discord.rs"]
+mod fake_discord;
 
+use fake_discord::FakeDiscord;
 use lapin::{
     options::{BasicPublishOptions, QueueDeclareOptions, QueueDeleteOptions, QueuePurgeOptions},
     types::{AMQPValue, FieldTable},
     BasicProperties, Connection, ConnectionProperties,
 };
+use serde_json::json;
 use std::{
     sync::{Arc, Mutex, Once},
     time::{Duration, Instant},
@@ -35,6 +40,7 @@ use twilight_dispatch::{
     metrics::GATEWAY_COMMANDS,
 };
 use twilight_gateway::{Intents, Shard, ShardId};
+use twilight_http::Client;
 
 /// The tests share `gateway.send` and the command counters of shard 0, so
 /// they run one at a time.
@@ -151,6 +157,12 @@ async fn send_until_sent(url: &str, attempts: u64) -> bool {
     false
 }
 
+/// A REST client for the consumer; these tests post no message with it.
+fn client() -> Arc<Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(Client::builder().token("Bot test".to_owned()).build())
+}
+
 /// A shard that is never polled, so it never connects. Its sender accepts
 /// commands, which is all the consumer needs.
 fn idle_shard(id: u32, total: u32) -> Shard {
@@ -229,7 +241,7 @@ async fn the_consumer_resubscribes_after_gateway_send_is_deleted() {
     purge(&url).await;
     let shard = idle_shard(0, 1);
     let amqp = Amqp::connect(url.clone(), false).await.unwrap();
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1, client()));
     assert!(send_until_sent(&url, 10).await, "consumed before");
     // Nothing is unacknowledged or in flight when the queue goes.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -271,7 +283,7 @@ async fn the_consumer_recovers_once_gateway_send_can_be_declared() {
     let shard = idle_shard(0, 1);
     let amqp = Amqp::connect(url.clone(), false).await.unwrap();
     redeclare(&url, true).await;
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1, client()));
     tokio::time::sleep(Duration::from_secs(2)).await;
     let published = amqp
         .publish("TYPING_START", b"{}", BasicProperties::default())
@@ -464,7 +476,7 @@ async fn a_process_with_many_shards_subscribes_through_a_slow_broker() {
     let first = Arc::new(ShardHandle::new(0, Some(shard.sender()), None));
     let handles = Arc::new(Registry::new(std::iter::once(first).chain(others)));
     let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), handles, SHARDS));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), handles, SHARDS, client()));
 
     let consumed = send_until_sent(&url, 30).await;
     let warnings = warnings_since(logged);
@@ -495,7 +507,7 @@ async fn a_subscribe_that_times_out_is_retried_on_a_new_link() {
 
     // The declarations of the subscribe reach the broker, its answers do not.
     proxy.hold(false, true);
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1, client()));
     let timed_out = "Timed out subscribing to gateway commands";
     let warnings = warnings_with(logged, timed_out, Duration::from_secs(30)).await;
     proxy.hold(false, false);
@@ -523,7 +535,7 @@ async fn the_consumer_returns_when_closed_during_an_outage() {
     let proxy = Proxy::start(&url).await;
     let shard = idle_shard(0, 1);
     let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1, client()));
     assert!(send_until_sent(&url, 10).await, "the consumer runs");
 
     proxy.go_away();
@@ -574,7 +586,7 @@ async fn a_command_that_cannot_be_forwarded_is_requeued() {
     let shard = idle_shard(0, 2);
     let amqp = Amqp::connect(proxy.url.clone(), false).await.unwrap();
     let link = generation(&amqp);
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 2));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 2, client()));
     assert!(send_until_sent(&url, 10).await, "the consumer runs");
     // Every acknowledgement is written before the broker takes nothing more.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -613,4 +625,95 @@ async fn a_command_that_cannot_be_forwarded_is_requeued() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     consumer.abort();
     amqp.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Messages (op 2)
+
+/// A REST client of the fake Discord API, as the service builds one with
+/// DISCORD_API_PROXY.
+fn fake_client(fake: &FakeDiscord) -> Arc<Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let proxy = fake.api.proxy().replace("http://", "");
+    let client = Client::builder()
+        .token("Bot test".to_owned())
+        .proxy(proxy, true)
+        .build();
+    Arc::new(client)
+}
+
+/// The messages posted so far with this outcome (`posted` or `failed`).
+fn messages(result: &str) -> u64 {
+    GATEWAY_COMMANDS.with_label_values(&["", result]).get()
+}
+
+/// The deliveries waiting in gateway.send: neither consumed nor waiting for
+/// an acknowledgement.
+async fn waiting(url: &str) -> u32 {
+    let connection = connect(url).await;
+    let channel = connection.create_channel().await.unwrap();
+    let queue = channel
+        .queue_declare(
+            QUEUE_SEND.into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    let _ = connection.close(200, "done".into()).await;
+    queue.message_count()
+}
+
+/// A message is posted by the process that consumes it, whatever its shard
+/// says, once and with every mention suppressed. One that Discord refuses
+/// is counted as failed and acknowledged all the same: once the connection
+/// is closed, nothing is back in gateway.send to be posted again.
+#[tokio::test]
+async fn messages_are_posted_once_without_mentions() {
+    let Some(url) = common::amqp_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    purge(&url).await;
+    let fake = FakeDiscord::start().await;
+    fake.api.set_channel_status(43, 403);
+    let shard = idle_shard(0, 1);
+    let amqp = Amqp::connect(url.clone(), false).await.unwrap();
+    let rest = fake_client(&fake);
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry(&shard), 1, rest));
+    assert!(send_until_sent(&url, 10).await, "the consumer runs");
+
+    let (posted, failed) = (messages("posted"), messages("failed"));
+    let embeds = json!([{"title": "Thanks", "description": "<@&1> @here"}]);
+    let data = json!({"channel_id": "42", "content": "Hi @everyone", "embeds": embeds});
+    let welcome = json!({"op": 2, "shard": 7, "data": data});
+    send_command(&url, welcome.to_string().as_bytes()).await;
+    let refused = json!({"op": 2, "data": {"channel_id": 43, "content": "Hi"}});
+    send_command(&url, refused.to_string().as_bytes()).await;
+
+    let posts = fake.api.wait_posts(42, 1).await;
+    assert_eq!(posts[0]["content"], "Hi @everyone");
+    assert_eq!(posts[0]["embeds"][0]["title"], "Thanks");
+    assert_eq!(posts[0]["embeds"][0]["type"], "rich");
+    assert_eq!(posts[0]["allowed_mentions"], json!({"parse": []}));
+    fake.api.wait_posts(43, 1).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while messages("posted") + messages("failed") < posted + failed + 2 {
+        assert!(Instant::now() < deadline, "the posts were never counted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(messages("posted"), posted + 1);
+    assert_eq!(messages("failed"), failed + 1);
+
+    consumer.abort();
+    amqp.close().await;
+    // The broker requeues what was not acknowledged when the connection
+    // closes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(waiting(&url).await, 0, "a message was not acknowledged");
+    assert_eq!(fake.api.posts(42).len(), 1);
+    assert_eq!(fake.api.posts(43).len(), 1);
 }

@@ -745,6 +745,20 @@ async fn gateway_commands_reach_the_shard_and_invalid_ones_never_do() {
         .await;
     assert_eq!(conn.expect_op(3).await, presence);
 
+    // A message (op 2) is posted through the REST API with the bot's token,
+    // and pings no one.
+    let message = json!({"op": 2, "data": {"channel_id": "4242", "content": "Hi @everyone"}});
+    s.broker.command(message.to_string().as_bytes()).await;
+    let posts = fake.api.wait_posts(4242, 1).await;
+    assert_eq!(posts[0]["content"], "Hi @everyone");
+    assert_eq!(posts[0]["allowed_mentions"], json!({"parse": []}));
+    let requests = fake.api.requests();
+    let post = requests
+        .iter()
+        .find(|r| r.path == "/channels/4242/messages")
+        .unwrap();
+    assert_eq!(post.authorization.as_deref(), Some("Bot e2e-token"));
+
     app.stop().await.expect("clean shutdown");
     s.broker.close().await;
 }

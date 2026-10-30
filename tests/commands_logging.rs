@@ -1,7 +1,7 @@
 //! What the log lines say about failures: dropped gateway commands are
 //! warned about at most once per 5 s and name what was wrong, and errors are
-//! logged with the chain of their causes (a failed Discord log post, an
-//! `ApiError`). Needs no services.
+//! logged with the chain of their causes (a failed Discord log post, a
+//! message that could not be posted, an `ApiError`). Needs no services.
 
 use std::{
     error::Error,
@@ -10,8 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 use twilight_dispatch::{
-    commands::{plan, InvalidCommand, Plan},
+    commands::{parse_message, plan, post, InvalidCommand, Plan},
     discord_log::{log_embed, DiscordLog},
+    metrics::GATEWAY_COMMANDS,
     models::ApiError,
     util::ErrorChain,
 };
@@ -102,6 +103,23 @@ fn dropped_commands_are_warned_about_once_per_window() {
     }
 }
 
+/// Invalid messages (op 2) are warned about like invalid commands, at most
+/// once per 5 s and with what was wrong, on a throttle of their own. No other
+/// test of this binary drops messages, so the throttle starts fresh.
+#[test]
+fn dropped_messages_are_warned_about_once_per_window() {
+    let logged = capture_warnings();
+    let blank = br#"{"op":2,"data":{"channel_id":"1","content":" "}}"#;
+    for _ in 0..100 {
+        assert_eq!(plan(blank, |_| true, 1), Plan::Drop);
+    }
+    let warnings = warnings_since(logged);
+    let lines = warnings.matches("Dropping message delivery: ").count();
+    assert!((1..=2).contains(&lines), "{lines} lines:\n{warnings}");
+    let reason = "message has neither content nor embeds (0 similar suppressed)";
+    assert!(warnings.contains(reason), "{warnings}");
+}
+
 /// The reason of a rejected command is an error of its own, and an opcode
 /// that may not be sent is named as a number, not as an `Option`.
 #[test]
@@ -161,6 +179,51 @@ async fn failed_discord_log_posts_are_logged_with_their_cause() {
         tokio::time::sleep(Duration::from_millis(20)).await;
         warnings = warnings_since(logged);
     }
+    assert!(warnings.contains(&line), "no {line:?} in:\n{warnings}");
+}
+
+fn failed_posts() -> u64 {
+    GATEWAY_COMMANDS.with_label_values(&["", "failed"]).get()
+}
+
+/// A message that cannot be posted (here Discord cannot be reached) is
+/// counted as failed and not retried. The failure is logged with its cause,
+/// at most once per 5 s. No other test of this binary posts messages, so the
+/// throttle starts fresh.
+#[tokio::test]
+async fn failed_posts_are_counted_and_warned_about_once_per_window() {
+    let logged = capture_warnings();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Nothing listens there once the listener is dropped.
+    let refused = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let client = Client::builder()
+        .token("Bot test".to_owned())
+        .proxy(refused.to_string(), true)
+        .ratelimiter(None)
+        .build();
+
+    // The same request, to know what twilight reports for it.
+    let Err(err) = client.create_message(Id::new(42)).content("hi").await else {
+        panic!("a request to a closed port succeeded");
+    };
+    let chain = ErrorChain(&err).to_string();
+
+    let message = parse_message(br#"{"op":2,"data":{"channel_id":"42","content":"hi"}}"#);
+    let message = message.unwrap();
+    let failed = failed_posts();
+    post(&client, &message).await;
+    post(&client, &message).await;
+    assert_eq!(failed_posts(), failed + 2);
+
+    let warnings = warnings_since(logged);
+    let lines = warnings
+        .matches("Failed to post a message to channel 42: ")
+        .count();
+    assert_eq!(lines, 1, "{warnings}");
+    let line = format!("channel 42: {chain} (0 similar suppressed)");
     assert!(warnings.contains(&line), "no {line:?} in:\n{warnings}");
 }
 
