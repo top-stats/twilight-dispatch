@@ -2946,6 +2946,8 @@ proptest! {
                         prop_assert_eq!(Some(len), compact.as_ref().map(String::len));
                     }
                     Err(InvalidCommand::Malformed(err)) => prop_assert!(false, "{}", err),
+                    // The message checks never apply to a gateway command.
+                    Err(other) => prop_assert!(false, "a send failed as a message: {:?}", other),
                 }
                 // Completeness: an allowed command within the limit is sent.
                 if allowed && compact.as_ref().is_some_and(|c| c.len() <= MAX_PAYLOAD_BYTES) {
