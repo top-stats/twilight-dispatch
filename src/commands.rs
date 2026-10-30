@@ -1,6 +1,7 @@
 //! Gateway commands received from the broker (`gateway.send`): their
 //! validation, and the consumer that runs them on this process' shards or
-//! forwards them to the process running theirs.
+//! forwards them to the process running theirs. The consumer also posts
+//! messages to channels through Discord's REST API.
 //!
 //! Anything sent to the gateway that Discord rejects closes the shard's
 //! connection (4001 unknown opcode, 4002 decode error, 4005 already
@@ -8,13 +9,21 @@
 //! command reaches a shard. The payload itself is not: a command whose `d`
 //! Discord cannot decode still closes the connection with 4002, and the shard
 //! resumes.
+//!
+//! A message (`op` 2, see [`parse_message`]) is for no shard: whichever
+//! process consumes it posts it, through the one REST request a delivery can
+//! make (create message, `POST /channels/{id}/messages`), with every mention
+//! suppressed. Its content and embeds are checked against Discord's limits
+//! first, with twilight-validate (the checks twilight-http makes). A message
+//! that Discord rejects anyway, or whose request fails, is logged and
+//! dropped, never retried: Discord may have posted it all the same.
 
 use crate::{
     amqp::{declare_consume, Amqp},
     constants::{QUEUE_SEND, SHARD_EXCHANGE},
     gateway::registry::Registry,
     metrics::GATEWAY_COMMANDS,
-    util::Throttle,
+    util::{ErrorChain, Throttle},
 };
 
 use futures_util::StreamExt;
@@ -23,11 +32,23 @@ use lapin::{
     types::FieldTable,
     BasicProperties, Channel, Consumer,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{sync::Arc, time::Duration};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::sync::Semaphore;
 use twilight_gateway::CloseFrame;
+use twilight_http::Client;
+use twilight_model::{
+    channel::message::{
+        embed::{EmbedAuthor, EmbedField, EmbedFooter, EmbedImage, EmbedThumbnail},
+        AllowedMentions, Embed,
+    },
+    id::{marker::ChannelMarker, Id},
+    util::Timestamp,
+};
+use twilight_validate::message::{self as limits, MESSAGE_CONTENT_LENGTH_MAX};
 
 /// Discord rejects gateway payloads larger than this.
 /// <https://discord.com/developers/docs/events/gateway#sending-events>
@@ -40,7 +61,13 @@ pub const MAX_PAYLOAD_BYTES: usize = 4096;
 /// 31 Request Soundboard Sounds, 43 Request Channel Info.
 pub const ALLOWED_OPCODES: [u64; 5] = [3, 4, 8, 31, 43];
 
-/// What a delivery asks for: its `op`, a JSON number.
+/// The `op` of a delivery that posts a message to a channel (see
+/// [`parse_message`]). It is not a [`DeliveryOpcode`]: a message is for no
+/// shard.
+pub const CREATE_MESSAGE: u64 = 2;
+
+/// What a delivery for a shard asks for: its `op`, a JSON number. A delivery
+/// whose `op` is [`CREATE_MESSAGE`] is a message instead.
 #[derive(Clone, Copy, Debug, Deserialize_repr, Eq, PartialEq, Serialize_repr)]
 #[repr(u8)]
 pub enum DeliveryOpcode {
@@ -50,9 +77,10 @@ pub enum DeliveryOpcode {
     Reconnect = 1,
 }
 
-/// A delivery on `gateway.send`, as producers publish it:
+/// A delivery on `gateway.send` for a shard, as producers publish it:
 /// `{"op": 0, "shard": 3, "data": {"op": 3, "d": {...}}}` to send a command,
-/// `{"op": 1, "shard": 3}` to reconnect a shard.
+/// `{"op": 1, "shard": 3}` to reconnect a shard. A message (`op` 2) is not
+/// one: see [`parse_message`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeliveryInfo {
     /// What to do.
@@ -93,6 +121,17 @@ pub enum InvalidCommand {
     /// `data` is longer than [`MAX_PAYLOAD_BYTES`] as compact JSON; holds its
     /// length in bytes.
     TooLarge(usize),
+    /// A message without embeds whose content is missing, empty or only
+    /// whitespace.
+    EmptyMessage,
+    /// A message whose content is longer than Discord allows (2000
+    /// characters); holds its length in characters.
+    ContentTooLong(usize),
+    /// A message whose embeds Discord would reject: more than 10, or over the
+    /// limits of an embed (title 256 characters, description 4096, 25 fields,
+    /// field name 256 and value 1024, footer 2048, author name 256, 6000 in
+    /// all) or a color above `0xFFFFFF`; holds twilight-validate's reason.
+    InvalidEmbeds(String),
 }
 
 impl std::fmt::Display for InvalidCommand {
@@ -109,6 +148,14 @@ impl std::fmt::Display for InvalidCommand {
                     "payload is {len} bytes, Discord's limit is {MAX_PAYLOAD_BYTES}"
                 )
             }
+            Self::EmptyMessage => f.write_str("message has neither content nor embeds"),
+            Self::ContentTooLong(chars) => {
+                write!(
+                    f,
+                    "content is {chars} characters, the limit is {MESSAGE_CONTENT_LENGTH_MAX}"
+                )
+            }
+            Self::InvalidEmbeds(reason) => write!(f, "embeds over Discord's limits: {reason}"),
         }
     }
 }
@@ -155,6 +202,161 @@ pub fn validate(delivery: &DeliveryInfo) -> Result<ShardCommand, InvalidCommand>
     }
 }
 
+/// A delivery's `op` alone, read before the rest: a message has no shard, so
+/// it is not a `DeliveryInfo`.
+#[derive(Deserialize)]
+struct DeliveryOp {
+    /// The delivery's `op`.
+    op: u64,
+}
+
+/// Whether a delivery is a message: its `op` is [`CREATE_MESSAGE`], whatever
+/// else it holds.
+pub fn is_message(body: &[u8]) -> bool {
+    let delivery = serde_json::from_slice::<DeliveryOp>(body);
+    delivery.is_ok_and(|delivery| delivery.op == CREATE_MESSAGE)
+}
+
+/// A message delivery: `{"op": 2, "data": {...}}`. Its other fields, such as
+/// a `shard`, are not read.
+#[derive(Deserialize)]
+struct MessageDelivery {
+    /// The message.
+    data: MessageData,
+}
+
+/// The `data` of a message delivery. Other fields (`tts`, `components`...)
+/// are rejected: they are not supported.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageData {
+    /// The channel to post in: a snowflake, as a string or a number.
+    channel_id: Id<ChannelMarker>,
+    /// The text; `None` (missing or `null`) is the same as empty.
+    content: Option<String>,
+    /// Discord embed objects; `None` (missing or `null`) is the same as none.
+    embeds: Option<Vec<MessageEmbed>>,
+}
+
+/// An embed of a message, as Discord documents its embed object. Fields that
+/// only Discord sets (`type`, always "rich" for a bot, `provider`, `video`)
+/// and unknown ones are ignored.
+#[derive(Deserialize)]
+struct MessageEmbed {
+    /// The author: `name`, and optionally `url` and `icon_url`.
+    author: Option<EmbedAuthor>,
+    /// An RGB color.
+    color: Option<u32>,
+    /// The text under the title.
+    description: Option<String>,
+    /// Fields: `name`, `value` and `inline`; `null` is the same as none.
+    fields: Option<Vec<EmbedField>>,
+    /// The footer: `text`, and optionally `icon_url`.
+    footer: Option<EmbedFooter>,
+    /// The image: `url`.
+    image: Option<EmbedImage>,
+    /// The thumbnail: `url`.
+    thumbnail: Option<EmbedThumbnail>,
+    /// When the embed's content happened: any RFC 3339 time.
+    #[serde(default, deserialize_with = "rfc3339")]
+    timestamp: Option<Timestamp>,
+    /// The title.
+    title: Option<String>,
+    /// The link of the title.
+    url: Option<String>,
+}
+
+impl From<MessageEmbed> for Embed {
+    fn from(embed: MessageEmbed) -> Self {
+        Self {
+            author: embed.author,
+            color: embed.color,
+            description: embed.description,
+            fields: embed.fields.unwrap_or_default(),
+            footer: embed.footer,
+            image: embed.image,
+            kind: "rich".to_owned(),
+            provider: None,
+            thumbnail: embed.thumbnail,
+            timestamp: embed.timestamp,
+            title: embed.title,
+            url: embed.url,
+            video: None,
+        }
+    }
+}
+
+/// An embed's `timestamp`, which may be any RFC 3339 time: twilight's own
+/// parser rejects JavaScript's `toISOString()` (`2026-01-01T00:00:00.000Z`).
+/// `null` is the same as missing.
+fn rfc3339<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Timestamp>, D::Error> {
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    parse_rfc3339(&text).map(Some).map_err(de::Error::custom)
+}
+
+/// An RFC 3339 time as a timestamp, to the microsecond.
+fn parse_rfc3339(text: &str) -> Result<Timestamp, String> {
+    let time = OffsetDateTime::parse(text, &Rfc3339).map_err(|err| format!("{err}: {text}"))?;
+    let micros = time.unix_timestamp_nanos() / 1000;
+    let micros = i64::try_from(micros).map_err(|err| format!("{err}: {text}"))?;
+    Timestamp::from_micros(micros).map_err(|err| format!("{err}: {text}"))
+}
+
+/// A message to post, validated by [`parse_message`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelMessage {
+    /// The channel to post in.
+    pub channel_id: Id<ChannelMarker>,
+    /// The text; empty for a message of embeds only.
+    pub content: String,
+    /// At most 10 embeds, all of type "rich".
+    pub embeds: Vec<Embed>,
+}
+
+/// Parse and validate a message delivery (one [`is_message`] accepts):
+/// `{"op": 2, "data": {"channel_id": "123", "content": "...", "embeds": [...]}}`.
+///
+/// `channel_id` is a snowflake (a string or a number), `content` text and
+/// `embeds` Discord embed objects; either may be missing or `null`. Other
+/// fields of `data` are rejected, and those of the delivery (a `shard`) are
+/// not read.
+///
+/// # Errors
+///
+/// [`InvalidCommand::Malformed`] when the body is not of that shape (no
+/// `data`, no `channel_id` or one that is not a snowflake, an unknown field,
+/// an embed field of the wrong type, a `timestamp` that is not an RFC 3339
+/// time...), [`InvalidCommand::EmptyMessage`] when there are no embeds and
+/// the content is missing, empty or only whitespace,
+/// [`InvalidCommand::ContentTooLong`] when the content is over 2000
+/// characters and [`InvalidCommand::InvalidEmbeds`] when the embeds are over
+/// Discord's limits.
+pub fn parse_message(body: &[u8]) -> Result<ChannelMessage, InvalidCommand> {
+    let malformed = |err: serde_json::Error| InvalidCommand::Malformed(err.to_string());
+    let delivery: MessageDelivery = serde_json::from_slice(body).map_err(malformed)?;
+    let data = delivery.data;
+    let content = data.content.unwrap_or_default();
+    let embeds = data.embeds.unwrap_or_default();
+    let embeds: Vec<Embed> = embeds.into_iter().map(Embed::from).collect();
+    if content.trim().is_empty() && embeds.is_empty() {
+        return Err(InvalidCommand::EmptyMessage);
+    }
+    if limits::content(&content).is_err() {
+        return Err(InvalidCommand::ContentTooLong(content.chars().count()));
+    }
+    if let Err(err) = limits::embeds(&embeds) {
+        let reason = format!("{err} ({:?})", err.kind());
+        return Err(InvalidCommand::InvalidEmbeds(reason));
+    }
+    Ok(ChannelMessage {
+        channel_id: data.channel_id,
+        content,
+        embeds,
+    })
+}
+
 /// What to do with a delivery.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Plan {
@@ -162,6 +364,9 @@ pub enum Plan {
     Run(u32, ShardCommand),
     /// Another process runs the shard: route the command there.
     Forward(u32),
+    /// Post the message from this process: it is for no shard, so it is
+    /// never forwarded.
+    Post(ChannelMessage),
     /// Malformed, not allowed or for a shard that does not exist: drop it.
     Drop,
 }
@@ -172,8 +377,12 @@ pub enum Plan {
 static DROP_WARNINGS: Throttle = Throttle::new(Duration::from_secs(5));
 
 /// Decide what to do with a delivery. `owned` says whether this process runs
-/// the shard; `total` is the shard count of the bot.
+/// the shard; `total` is the shard count of the bot. A message is posted by
+/// whichever process consumes it, whatever its `shard` says.
 pub fn plan(body: &[u8], owned: impl Fn(u32) -> bool, total: u32) -> Plan {
+    if is_message(body) {
+        return plan_message(body);
+    }
     let delivery = match parse(body) {
         Ok(delivery) => delivery,
         Err(err) => {
@@ -216,6 +425,89 @@ pub fn plan(body: &[u8], owned: impl Fn(u32) -> bool, total: u32) -> Plan {
     }
 }
 
+/// Rate limit for the warnings about dropped messages, as [`DROP_WARNINGS`]
+/// for commands: a producer of messages has a throttle of its own, so its
+/// mistakes are not hidden by those of a producer of commands.
+static MESSAGE_DROP_WARNINGS: Throttle = Throttle::new(Duration::from_secs(5));
+
+/// Decide what to do with a message delivery: post it, or drop it when it is
+/// invalid.
+fn plan_message(body: &[u8]) -> Plan {
+    match parse_message(body) {
+        Ok(message) => Plan::Post(message),
+        Err(err) => {
+            if let Some(suppressed) = MESSAGE_DROP_WARNINGS.check() {
+                tracing::warn!(
+                    "Dropping message delivery: {} ({} similar suppressed)",
+                    err,
+                    suppressed
+                );
+            }
+            Plan::Drop
+        }
+    }
+}
+
+/// How many messages may be posting at once. While that many wait for
+/// Discord the consumer waits too, so a burst of messages stays in the broker
+/// rather than in memory.
+const MAX_POSTING: usize = 8;
+
+/// The messages posting now, at most [`MAX_POSTING`].
+static POSTING: Semaphore = Semaphore::const_new(MAX_POSTING);
+
+/// Rate limit for the warnings about messages that could not be posted (a
+/// producer posting to channels the bot cannot see, a Discord outage). Every
+/// failure is still counted in `gateway_commands`.
+static POST_WARNINGS: Throttle = Throttle::new(Duration::from_secs(5));
+
+/// Post a message through Discord's REST API, with every mention suppressed
+/// (no `@everyone`, role or user is pinged whatever the content says), and
+/// count it in `gateway_commands` as `posted` or `failed`.
+///
+/// twilight-http waits for its rate limits. A failure (an error response such
+/// as Missing Access or Unknown Channel, a timeout, no connection) is logged
+/// at most once per 5 s and not retried: Discord may have posted the message
+/// anyway, and a message must never be posted twice.
+pub async fn post(client: &Client, message: &ChannelMessage) {
+    let mentions = AllowedMentions::default();
+    let mut request = client
+        .create_message(message.channel_id)
+        .allowed_mentions(Some(&mentions));
+    if !message.content.is_empty() {
+        request = request.content(&message.content);
+    }
+    if !message.embeds.is_empty() {
+        request = request.embeds(&message.embeds);
+    }
+    let Err(err) = request.await else {
+        GATEWAY_COMMANDS.with_label_values(&["", "posted"]).inc();
+        return;
+    };
+    GATEWAY_COMMANDS.with_label_values(&["", "failed"]).inc();
+    if let Some(suppressed) = POST_WARNINGS.check() {
+        tracing::warn!(
+            "Failed to post a message to channel {}: {} ({} similar suppressed)",
+            message.channel_id,
+            ErrorChain(&err),
+            suppressed
+        );
+    }
+}
+
+/// Post a message in a task of its own, so that the consumer moves on while
+/// Discord answers. Waits first while [`MAX_POSTING`] messages are posting.
+async fn post_in_background(client: &Arc<Client>, message: ChannelMessage) {
+    // POSTING is never closed, so this only waits for a permit.
+    if let Ok(permit) = POSTING.acquire().await {
+        let client = client.clone();
+        tokio::spawn(async move {
+            post(&client, &message).await;
+            drop(permit);
+        });
+    }
+}
+
 /// Time limit for acknowledging or forwarding one delivery.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -234,7 +526,7 @@ fn subscribe_timeout(shards: usize) -> Duration {
     ACK_TIMEOUT.saturating_add(SUBSCRIBE_PER_BINDING.saturating_mul(bindings))
 }
 
-/// Consume gateway commands until the connection is closed.
+/// Consume gateway commands and messages until the connection is closed.
 ///
 /// Producers publish to `gateway.send`, which every process consumes. A
 /// process runs commands for its own shards and forwards the others to the
@@ -244,11 +536,25 @@ fn subscribe_timeout(shards: usize) -> Duration {
 /// dropped by the broker if none does), though commands for one shard are not
 /// guaranteed to run in the order they were published.
 ///
+/// A message is posted through `client` by the process that consumes it (see
+/// [`post`]), in a task of its own, at most 8 at a time. It is posted only
+/// once its delivery was acknowledged, and never requeued after that, so it
+/// is not posted twice.
+///
 /// The consumer follows the AMQP supervisor's current link, so it moves to a
 /// new connection as soon as one is installed. Deliveries are acknowledged
 /// only after they were handled; one that could not be forwarded is requeued,
 /// and the connection is replaced.
-pub async fn run_consumer(amqp: Arc<Amqp>, registry: Arc<Registry>, total: u32) {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one loop that subscribes, then plans, runs and acknowledges each delivery"
+)]
+pub async fn run_consumer(
+    amqp: Arc<Amqp>,
+    registry: Arc<Registry>,
+    total: u32,
+    client: Arc<Client>,
+) {
     let shards: Vec<u32> = registry.handles().map(|handle| handle.id).collect();
     let mut links = amqp.subscribe();
     let mut backoff = Duration::from_millis(250);
@@ -306,6 +612,9 @@ pub async fn run_consumer(amqp: Arc<Amqp>, registry: Arc<Registry>, total: u32) 
             };
 
             let plan = plan(&delivery.data, |shard| registry.get(shard).is_some(), total);
+            // Posted once its delivery is acknowledged: a delivery that comes
+            // back after a failed acknowledgement was never posted.
+            let mut message = None;
             let forward_failed = match plan {
                 Plan::Run(shard, command) => {
                     run_on_shard(&registry, shard, command);
@@ -316,6 +625,10 @@ pub async fn run_consumer(amqp: Arc<Amqp>, registry: Arc<Registry>, total: u32) 
                 }
                 Plan::Forward(shard) => {
                     tracing::warn!("Dropping a command routed here for shard {}, which this process does not run", shard);
+                    false
+                }
+                Plan::Post(outgoing) => {
+                    message = Some(outgoing);
                     false
                 }
                 Plan::Drop => {
@@ -349,6 +662,9 @@ pub async fn run_consumer(amqp: Arc<Amqp>, registry: Arc<Registry>, total: u32) 
                 tracing::warn!("Failed to handle a gateway command; reconnecting");
                 amqp.mark_broken(Some(link.generation));
                 break;
+            }
+            if let Some(message) = message {
+                post_in_background(&client, message).await;
             }
         }
     }
@@ -533,6 +849,9 @@ mod tests {
             InvalidCommand::OpcodeNotAllowed(Some(2)),
             InvalidCommand::OpcodeNotAllowed(None),
             InvalidCommand::TooLarge(5000),
+            InvalidCommand::EmptyMessage,
+            InvalidCommand::ContentTooLong(2001),
+            InvalidCommand::InvalidEmbeds("message has too many embeds".into()),
         ]
         .iter()
         .map(ToString::to_string)
@@ -548,6 +867,11 @@ mod tests {
             reasons[5].contains("5000") && reasons[5].contains(&MAX_PAYLOAD_BYTES.to_string()),
             "{reasons:?}"
         );
+        assert!(
+            reasons[7].contains("2001") && reasons[7].contains("2000"),
+            "{reasons:?}"
+        );
+        assert!(reasons[8].ends_with("too many embeds"), "{reasons:?}");
     }
 
     #[test]
@@ -587,6 +911,218 @@ mod tests {
             .to_string()
             .into_bytes();
         assert_eq!(plan(&invalid, owned, 4), Plan::Drop);
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A message delivery with this `data`, parsed and validated.
+    fn parse_data(data: Value) -> Result<ChannelMessage, InvalidCommand> {
+        parse_message(json!({"op": 2, "data": data}).to_string().as_bytes())
+    }
+
+    /// The `data` of a message with only this embed.
+    fn with_embed(embed: Value) -> Value {
+        json!({"channel_id": "1", "embeds": [embed]})
+    }
+
+    fn is_malformed(data: Value) -> bool {
+        matches!(parse_data(data), Err(InvalidCommand::Malformed(_)))
+    }
+
+    fn invalid_embeds(data: Value) -> bool {
+        matches!(parse_data(data), Err(InvalidCommand::InvalidEmbeds(_)))
+    }
+
+    /// What the bot posts when it joins a guild: content and an embed as
+    /// discord.js builds it, without `type` and with a JavaScript timestamp.
+    /// The embed is posted as it was sent, as a rich embed, without the
+    /// fields only Discord sets.
+    #[test]
+    fn a_message_is_posted_as_it_was_sent() {
+        let mut embed = json!({
+            "title": "Thanks for inviting the bot",
+            "description": "Stats are on their way.",
+            "url": "https://example.com",
+            "color": 0x0058_65F2,
+            "fields": [{"name": "Docs", "value": "https://example.com/docs", "inline": true}],
+            "footer": {"text": "footer", "icon_url": "https://example.com/icon.png"},
+            "author": {"name": "author", "url": "https://example.com/author"},
+            "image": {"url": "https://example.com/image.png"},
+            "thumbnail": {"url": "https://example.com/thumbnail.png"},
+        });
+        let mut sent = embed.clone();
+        embed["timestamp"] = json!("2026-10-30T12:34:56.789Z");
+        embed["provider"] = json!({"name": "ignored"});
+        let data = json!({"channel_id": "123", "content": "Hi @everyone", "embeds": [embed]});
+        let message = parse_data(data).unwrap();
+        assert_eq!(message.channel_id, Id::new(123));
+        assert_eq!(message.content, "Hi @everyone");
+
+        sent["type"] = json!("rich");
+        sent["timestamp"] = json!("2026-10-30T12:34:56.789000+00:00");
+        let posted = serde_json::to_value(&message.embeds).unwrap();
+        assert_eq!(posted, json!([sent]));
+    }
+
+    /// A channel id is a snowflake, as a string or a number; zero, anything
+    /// else and none are malformed.
+    #[test]
+    fn channel_ids_are_snowflakes() {
+        let content = |channel: Value| json!({"channel_id": channel, "content": "hi"});
+        for channel in [json!("123"), json!(123)] {
+            let message = parse_data(content(channel)).unwrap();
+            assert_eq!(message.channel_id, Id::new(123));
+        }
+        for channel in [json!("0"), json!("x"), json!(-1), Value::Null] {
+            assert!(is_malformed(content(channel.clone())), "{channel}");
+        }
+        assert!(is_malformed(json!({"content": "hi"})));
+    }
+
+    /// A message is for no shard: one with a `shard`, valid or not, is posted
+    /// by the process that consumes it, which need not run any shard.
+    #[test]
+    fn the_shard_of_a_message_is_not_read() {
+        let data = json!({"channel_id": "123", "content": "hi"});
+        let expected = parse_data(data.clone()).unwrap();
+        for shard in [json!(0), json!(99), json!("x"), Value::Null] {
+            let body = json!({"op": 2, "shard": shard, "data": data}).to_string();
+            assert!(is_message(body.as_bytes()), "{body}");
+            let planned = plan(body.as_bytes(), |_| false, 1);
+            assert_eq!(planned, Plan::Post(expected.clone()), "{body}");
+        }
+    }
+
+    /// Only `op` 2 is a message; an invalid message is dropped.
+    #[test]
+    fn messages_are_told_apart_by_their_op() {
+        let body = json!({"op": 2, "data": {"channel_id": "1", "content": "hi"}}).to_string();
+        let posted = plan(body.as_bytes(), |_| true, 1);
+        assert!(matches!(posted, Plan::Post(_)), "{posted:?}");
+        let invalid = json!({"op": 2, "data": {"channel_id": "1"}}).to_string();
+        assert_eq!(plan(invalid.as_bytes(), |_| true, 1), Plan::Drop);
+        for body in [r#"{"op":0,"shard":0}"#, r#"{"op":"2"}"#, "2"] {
+            assert!(!is_message(body.as_bytes()), "{body}");
+        }
+    }
+
+    /// Discord refuses a message with nothing to show, and so does the
+    /// consumer: no embeds, and content that is missing, `null`, empty or
+    /// blank.
+    #[test]
+    fn a_message_needs_content_or_embeds() {
+        let empty = [
+            json!({"channel_id": "1"}),
+            json!({"channel_id": "1", "content": null, "embeds": null}),
+            json!({"channel_id": "1", "content": "", "embeds": []}),
+            json!({"channel_id": "1", "content": " \n\t"}),
+        ];
+        for data in empty {
+            let parsed = parse_data(data.clone());
+            assert_eq!(parsed, Err(InvalidCommand::EmptyMessage), "{data}");
+        }
+        let data = json!({"channel_id": "1", "content": " ", "embeds": [{"title": "t"}]});
+        assert!(parse_data(data).is_ok());
+        let data = json!({"channel_id": "1", "content": "hi"});
+        assert!(parse_data(data).unwrap().embeds.is_empty());
+    }
+
+    /// Content and embeds over Discord's limits are dropped before any
+    /// request is made; up to the limits they are posted.
+    #[test]
+    fn discords_limits_are_checked_before_posting() {
+        let content = |len: usize| json!({"channel_id": "1", "content": "é".repeat(len)});
+        assert!(parse_data(content(2000)).is_ok());
+        assert_eq!(
+            parse_data(content(2001)),
+            Err(InvalidCommand::ContentTooLong(2001))
+        );
+
+        let embeds = |count: usize| {
+            let embed = json!({"title": "t"});
+            json!({"channel_id": "1", "embeds": vec![embed; count]})
+        };
+        assert!(parse_data(embeds(10)).is_ok());
+        assert!(invalid_embeds(embeds(11)));
+
+        let field = |name: usize, value: usize| json!({"name": "n".repeat(name), "value": "v".repeat(value)});
+        let within = [
+            json!({"title": "t".repeat(256), "description": "d".repeat(4096)}),
+            json!({"fields": vec![field(1, 1); 25], "color": 0x00FF_FFFF}),
+            json!({"fields": [field(256, 1024)]}),
+            json!({"footer": {"text": "f".repeat(2048)}}),
+            json!({"author": {"name": "a".repeat(256)}}),
+        ];
+        for embed in within {
+            let parsed = parse_data(with_embed(embed));
+            assert!(parsed.is_ok(), "{parsed:?}");
+        }
+        let over = [
+            json!({"title": "t".repeat(257)}),
+            json!({"description": "d".repeat(4097)}),
+            json!({"fields": vec![field(1, 1); 26]}),
+            json!({"fields": [field(257, 1)]}),
+            json!({"fields": [field(1, 1025)]}),
+            json!({"footer": {"text": "f".repeat(2049)}}),
+            json!({"author": {"name": "a".repeat(257)}}),
+            json!({"color": 0x0100_0000}),
+        ];
+        for embed in over {
+            assert!(invalid_embeds(with_embed(embed.clone())), "{embed}");
+        }
+
+        // 6000 characters in all the embeds of a message.
+        let long = json!({"description": "d".repeat(4000)});
+        let data = json!({"channel_id": "1", "embeds": [long, long]});
+        assert!(invalid_embeds(data));
+    }
+
+    /// `data` must be of the documented shape. What the consumer does not
+    /// support (`tts`, `components`...) is rejected rather than ignored.
+    #[test]
+    fn other_shapes_are_malformed() {
+        let malformed = [
+            Value::Null,
+            json!("hi"),
+            json!({"channel_id": "1", "content": 5}),
+            json!({"channel_id": "1", "embeds": {"title": "t"}}),
+            json!({"channel_id": "1", "embeds": [{"fields": [{"name": "n"}]}]}),
+            json!({"channel_id": "1", "embeds": [{"timestamp": "yesterday"}]}),
+            json!({"channel_id": "1", "embeds": [{"color": -1}]}),
+        ];
+        for data in malformed {
+            assert!(is_malformed(data.clone()), "{data}");
+        }
+
+        let tts = json!({"channel_id": "1", "content": "hi", "tts": true});
+        let reason = parse_data(tts).unwrap_err().to_string();
+        assert!(reason.contains("unknown field `tts`"), "{reason}");
+        let missing = parse_message(br#"{"op":2,"shard":0}"#).unwrap_err();
+        let reason = missing.to_string();
+        assert!(reason.contains("missing field `data`"), "{reason}");
+    }
+
+    /// An embed's timestamp may be any RFC 3339 time, in any offset; `null`
+    /// is the same as none, and so are `null` fields.
+    #[test]
+    fn embed_timestamps_are_rfc3339_times() {
+        let at = |timestamp: Value| {
+            let data = with_embed(json!({"title": "t", "timestamp": timestamp}));
+            parse_data(data).unwrap().embeds[0].timestamp
+        };
+        let utc = Timestamp::parse("2026-10-30T12:34:56.789000+00:00").ok();
+        assert!(utc.is_some());
+        assert_eq!(at(json!("2026-10-30T12:34:56.789Z")), utc);
+        assert_eq!(at(json!("2026-10-30T14:34:56.789+02:00")), utc);
+        assert_eq!(at(json!("2026-10-30T12:34:56.789000+00:00")), utc);
+        assert_eq!(at(Value::Null), None);
+
+        let data = with_embed(json!({"title": "t", "fields": null}));
+        assert!(parse_data(data).unwrap().embeds[0].fields.is_empty());
     }
 }
 

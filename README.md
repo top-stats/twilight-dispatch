@@ -14,7 +14,9 @@ with the event name as the routing key. Gateway commands published to the
 Only the gateway opcodes 3, 4, 8, 31 and 43 may be sent, and `data` (as
 compact JSON) may be at most 4096 bytes; other commands, and commands for a
 shard the bot does not have, are dropped and counted in
-`gateway_commands{result="invalid"}`.
+`gateway_commands{result="invalid"}`. `{"op": 2, "data": {"channel_id": ...,
+"content": ..., "embeds": [...]}}` on `gateway.send` posts a message to a
+channel through Discord's REST API (see Operations).
 
 Configuration is read from environment variables (or `.env`); see
 [`.env.example`](.env.example).
@@ -163,6 +165,35 @@ Configuration is read from environment variables (or `.env`); see
   Commands for one shard are not guaranteed to run in the order they were
   published: one that the shard's own process consumes runs at once, while an
   earlier one that another process consumed is still being forwarded.
+- A delivery on `gateway.send` with `"op": 2` posts a message to a channel
+  through Discord's REST API, with the bot's token (create message,
+  `POST /channels/{id}/messages`; no other request can be made this way):
+  `{"op": 2, "data": {"channel_id": "123456789012345678", "content": "text",
+  "embeds": [{"title": "..."}]}}`. It is for no shard: the process that
+  consumes it posts it, and a `shard` it has is ignored. `channel_id` is a
+  snowflake (a string or a number). `content` and `embeds` (Discord embed
+  objects; `type`, `provider` and `video` are ignored, and `timestamp` may be
+  any RFC 3339 time) may be missing or `null`, but a message needs embeds or
+  content that is not blank. Any other field in `data` (`tts`, `components`,
+  ...) makes the delivery invalid. The content may be at most 2000
+  characters, and there may be at most 10 embeds within Discord's limits
+  (title 256 characters, description 4096, 25 fields, field name 256 and
+  value 1024, footer 2048, author name 256, 6000 in all the embeds of the
+  message, color at most `0xFFFFFF`), as twilight-http checks them. Mentions
+  are always suppressed (`"allowed_mentions": {"parse": []}`), so a message
+  never pings `@everyone`, a role or a user. Invalid messages are dropped
+  like invalid commands (a warning at most every 5 s,
+  `gateway_commands{result="invalid"}`). A valid one is acknowledged, then
+  posted by a task of its own (at most 8 post at once, and twilight-http
+  waits for Discord's rate limits; a delivery whose acknowledgement fails is
+  not posted, and comes back), and counted in
+  `gateway_commands{shard="",result="posted"}` or `{result="failed"}`. A
+  failure (Missing Access, Unknown Channel, a 5xx, a timeout) is logged at
+  most every 5 s and never retried, so a message is never posted twice but
+  can be lost, also when the process stops while it posts. Every request
+  Discord refuses with 401, 403 or 429 counts towards its limit of 10,000
+  invalid requests per 10 minutes, beyond which it bans the IP for a while,
+  so post only to channels the bot can send messages in.
 - Every second each process writes the status of its shards into
   `gateway_statuses` (a JSON array of `{"shard", "status", "latency",
   "last_ack"}`) and keeps the entries of the shards it does not run, so the

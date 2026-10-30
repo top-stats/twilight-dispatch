@@ -22,7 +22,7 @@ expression: families
     "type": "COUNTER"
   },
   {
-    "help": "Gateway commands from gateway.send by outcome (sent, forwarded, dropped, invalid)",
+    "help": "Commands from gateway.send by outcome (sent, forwarded, dropped, invalid, posted, failed)",
     "labels": [
       "shard",
       "result"

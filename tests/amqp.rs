@@ -37,6 +37,7 @@ use twilight_dispatch::{
     metrics::GATEWAY_COMMANDS,
 };
 use twilight_gateway::{Intents, Shard, ShardId};
+use twilight_http::Client;
 
 /// The tests share the `gateway.recv` and `gateway.send` queues and the
 /// command counters, so they run one at a time. The broker-side kills also
@@ -472,6 +473,12 @@ async fn wait_until(check: impl Fn() -> bool) {
     }
 }
 
+/// A REST client for the consumer; these tests post no message with it.
+fn client() -> Arc<Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(Client::builder().token("Bot test".to_owned()).build())
+}
+
 /// A shard that is never polled, so it never connects. Its sender accepts
 /// commands, which is all the consumer needs.
 fn idle_shard(id: u32, total: u32) -> Shard {
@@ -502,7 +509,7 @@ async fn the_command_consumer_follows_reconnects() {
         Some(shard.sender()),
         None,
     ))]));
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 1));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 1, client()));
     wait_for_consumers(&api, 1).await;
 
     let sent = commands("0", "sent");
@@ -587,7 +594,7 @@ async fn commands_for_a_stopped_shard_are_dropped_with_a_warning() {
         Arc::new(ShardHandle::new(0, Some(running.sender()), None)),
         Arc::new(ShardHandle::new(1, None, None)),
     ]));
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 2));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 2, client()));
     wait_for_consumers(&api, 1).await;
 
     let (sent, dropped) = (commands("0", "sent"), commands("1", "dropped"));
@@ -626,7 +633,7 @@ async fn commands_for_other_shards_are_forwarded_once() {
         Some(shard.sender()),
         None,
     ))]));
-    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 2));
+    let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, 2, client()));
     wait_for_consumers(&api, 1).await;
 
     // The process running shard 1.
@@ -729,7 +736,7 @@ async fn commands_reach_the_process_running_the_shard() {
             Some(shard.sender()),
             None,
         ))]));
-        let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, PROCESSES));
+        let consumer = tokio::spawn(run_consumer(amqp.clone(), registry, PROCESSES, client()));
         processes.push((amqp, consumer));
     }
     wait_for_consumers(&api, PROCESSES.into()).await;

@@ -230,11 +230,14 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     }
     drop(runner_ctx);
 
+    // Messages from gateway.send share the REST client, and so its rate
+    // limits, with the Discord log.
     let mut consumer = JoinSet::new();
     consumer.spawn(commands::run_consumer(
         amqp.clone(),
         registry.clone(),
         range.total,
+        http,
     ));
 
     Ok(Started {

@@ -326,7 +326,7 @@ counter!(
 counter_vec!(
     GATEWAY_COMMANDS,
     "gateway_commands",
-    "Gateway commands from gateway.send by outcome (sent, forwarded, dropped, invalid)",
+    "Commands from gateway.send by outcome (sent, forwarded, dropped, invalid, posted, failed)",
     &["shard", "result"]
 );
 gauge!(
