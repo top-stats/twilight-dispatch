@@ -1049,9 +1049,7 @@ mod message_tests {
         assert!(parse_data(embeds(10)).is_ok());
         assert!(invalid_embeds(embeds(11)));
 
-        let field = |name: usize, value: usize| {
-            json!({"name": "n".repeat(name), "value": "v".repeat(value)})
-        };
+        let field = |name: usize, value: usize| json!({"name": "n".repeat(name), "value": "v".repeat(value)});
         let within = [
             json!({"title": "t".repeat(256), "description": "d".repeat(4096)}),
             json!({"fields": vec![field(1, 1); 25], "color": 0x00FF_FFFF}),
